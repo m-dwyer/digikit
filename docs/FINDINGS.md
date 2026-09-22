@@ -2822,10 +2822,16 @@ mapped images are in `tools/machineprofile.py`.
   from SW `0x1c8034` with R12=`0x261a00`, `0x1c9f69` and the table at
   `0x269490`. `0x1c9fd5` is also reached from `0x1c7dae` with the index in
   M6 and R12=`0x261b18`, so it serves any instance. **[V]**
-- What happens to 2748 after the call is not known. One reading has
+- On 1.16, what happens to 2748 after the call is not yet known. One reading has
   `0x1c7bd4` copy R4 to R13 before it loads 2, and `0x1c9fd5` save and
   restore R13 without using it. No write to an SPI or DMA register has been
   found yet. **[D][O]**
+- A separately recovered 1.15C path continues through the four circular PDMA
+  descriptors, SPI2 RX completion callback, selector flip and active-image
+  copy. It accounts for `0xabc` as `0x55e` transfers with a two-byte stride;
+  see [the version-scoped cross-check](refs/dt2-1.15c-sharc-spi2-completion.md).
+  These 1.15C addresses are documented evidence here, not a relocation map
+  for 1.16. **[D]**
 - 1.16 SW `0x1c1496`-`0x1c149a` is `9b_abs` (a delayed jump), `17b`
   R0=`0xabc` and `25c_rframe`. The two instructions after a delayed jump
   execute before the jump (Core Programming Reference, Table 4-7), so this
