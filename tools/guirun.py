@@ -122,6 +122,8 @@ def parse_args(argv):
                    help='ADDR[=NAME]: print d0-d7/a0-a7 and the longs at (a3)/(a4)')
     p.add_argument('--rwatch', action='append', default=[],
                    help='ADDR:LEN[=NAME]: print the PC of the first --watch-max reads of a range')
+    p.add_argument('--free-dtcn', action='append', default=[], type=int,
+                   help='serve DTCN<ch> as a free-running counter (Syntakt: 2); see emu/dtcn.py')
     p.add_argument('--stack-at', action='append', default=[],
                     type=lambda s: int(s, 0))
     p.add_argument('--stack-depth', type=int, default=128)
@@ -727,6 +729,11 @@ def main():
             return pits.now + int(stepper.blocks * stepper.PER_BLOCK)
         return pits.now
 
+    dtcn_state = {}
+    if args.free_dtcn:
+        from emu.dtcn import install_free_counters
+        dtcn_state = install_free_counters(m, clock, channels=tuple(args.free_dtcn))
+
     button_names = {}
 
     def button_name(code):
@@ -912,6 +919,8 @@ def main():
                               for a, b in runs))
         print('[guirun] esdhc log tail: %s'
               % ' '.join('CMD%d@%#x' % (c, a) for c, a in esdhc.log[-12:]))
+    if dtcn_state:
+        print('[guirun] dtcn: %s' % {ch: (s['reads'], '%#x' % s['last']) for ch, s in dtcn_state.items()})
     if args.trace_ui_json:
         with open(args.trace_ui_json, 'w') as f:
             json.dump({

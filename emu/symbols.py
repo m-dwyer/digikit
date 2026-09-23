@@ -701,8 +701,13 @@ SYMBOLS = [
     # the return address of the very `jsr sem_pend` that pend_call names.
     # ----------------------------------------------------------------
     ('queue_recv', Fixed(0x40001946, verify='588f60f240c246fc2700'), False),
-    ('intro_park', Sig('588f60f42f0a2f3c40490fdb45f9401752042f2f000c4e92'
-                       '588f2ebc3f000000'), False),
+    # On Syntakt 1.41 the intro's park loop is the `pea sem; jsr (a2);
+    # addq.l #4,a7; bra.b` right after intro_done's exit sequence; the pend
+    # returns to intro_done+0x2c. The byte layout there is the same as DT2's,
+    # so the offset is a valid fallback wherever intro_done is.
+    ('intro_park', First(Sig('588f60f42f0a2f3c40490fdb45f9401752042f2f000c4e92'
+                             '588f2ebc3f000000'),
+                         Offset('intro_done', 0x2c)), False),
     ('display_wait', Sig('588f60ec48794029e1f82a3c000000804879'
                          '4029e274487800144878001f486e'), False),
 
@@ -762,6 +767,33 @@ SYMBOLS = [
     ('pump_wait', Sig('42002f43002849f94018c0a41f40002c2f034e96'
                       '7001266a002c1f4000304200'), False),
     ('sleep_pend', Offset('pend_call', 6), False),
+
+    # Syntakt 1.41 only (optional elsewhere): a second worker pump. The
+    # prio-7 task pends a job semaphore (`jsr (a6)`, a6 = sem_pend) and then
+    # drains its queues, re-checking their counts -- the same shape as
+    # pump_wait, on another pool. Anchored on the register setup right before
+    # the pend; the pend returns 0x1a bytes after the anchor.
+    ('_pump2_anchor', Sig('4df94000179245f94024216c48794449052c283c40102470'
+                          '4e96588f4879444905744e93', hi=DATA_HI), False),
+    ('pump_wait2', Offset('_pump2_anchor', 0x1a), False),
+
+    # Syntakt 1.41 only: three prio-5 hardware worker tasks (SPI NOR via GPIO
+    # 0xEC0940xx; a FlexBus device at 0x10000000; a copy worker) each pend an
+    # ISR-posted semaphore at the top of their loop. Faking those pends made
+    # them run jobs that were never posted and starve everything below prio 5.
+    # Each anchor is `pea sem; jsr (aN)` plus the first instruction after the
+    # pend; the pend returns at anchor+8. The display task's per-frame pend_b
+    # on display_sem right before it blits the 128x64 frame is posted by the
+    # display PIT3 ISR; faking it spins the task at 100% CPU.
+    ('_display_frame_anchor',
+     Sig('4879444b9d584eb94000171e4879444b9d682f39444ba1684878004048780080', hi=DATA_HI), False),
+    ('display_frame_wait', Offset('_display_frame_anchor', 0xc), False),
+    ('_hw1_anchor', Sig('487941bbe4384e9370ef42b941bb22b4', hi=DATA_HI), False),
+    ('hw1_wait', Offset('_hw1_anchor', 8), False),
+    ('_hw2_anchor', Sig('487941bbe4284e93720224394d84f2c1', hi=DATA_HI), False),
+    ('hw2_wait', Offset('_hw2_anchor', 8), False),
+    ('_hw3_anchor', Sig('487941bbe4304e94203caaaaaaaa23c010000000', hi=DATA_HI), False),
+    ('hw3_wait', Offset('_hw3_anchor', 8), False),
 
     # tick_dispatch is the RTOS tick-paced dispatcher loop: pend_b(tick_sem);
     # mutex_lock(m); run every due callback; mutex_unlock(m); repeat. The

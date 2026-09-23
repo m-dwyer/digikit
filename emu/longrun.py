@@ -312,9 +312,18 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
     #               is the same address, 0x40002a70, in both builds; the
     #               semaphore it pends differs per build. Resolved per build
     #               as profile.tick_pend.
+    # Syntakt 1.41 has more real pends of the same kind (a second worker pump,
+    # three ISR-fed hardware workers, the display task's per-frame wait). The
+    # hardware-worker signatures resolve on Syntakt only, so they gate the
+    # whole group: on DT2/DN2 the list stays exactly as it was, even where
+    # pump_wait2 or display_frame_wait happen to match.
+    syntakt_pends = ()
+    if profile.get('hw1_wait') is not None:
+        syntakt_pends = tuple(profile.get(k) for k in ('pump_wait2', 'hw1_wait', 'hw2_wait',
+                                                       'hw3_wait', 'display_frame_wait'))
     recheck = tuple(a for a in (profile.queue_recv, profile.intro_park,
                                 profile.display_wait, profile.pump_wait,
-                                profile.tick_pend)
+                                profile.tick_pend) + syntakt_pends
                     if a is not None)
     # Only correct when DTIM1 is actually delivered; see build(real_sleep=...).
     real_sleep_pends = tuple(a for a in (profile.sleep_pend,) if a is not None)
