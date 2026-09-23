@@ -366,6 +366,17 @@ def run(syx_path, main_img, limit=120_000_000, tick_vec=32, tick_every=20000,
         # cmd_sem/data_sem are per-image for the same reason drv_status is.
         m.esdhc = Esdhc(m, drv_status=profile.sd_status,
                         cmd_sem=profile.sd_cmd_sem, data_sem=profile.sd_data_sem)
+        # Esdhc._dma_out maps the EXT_CSD destination page from inside the
+        # XFERTYP write hook if the guest has not touched it yet. On Syntakt
+        # 1.41 that page (0x4D8xxxxx) is untouched at that point, and the
+        # mem_map inside the hook crashed Unicorn natively (SIGSEGV after the
+        # hook returned). The bring-up routine loads the buffer address with
+        # `move.l #imm,d0` (opcode 0x203C) 0x42C bytes in, so map it here,
+        # before execution starts.
+        if profile.sd_bringup is not None:
+            o = profile.sd_bringup - MAIN_LOAD + 0x42C
+            if main_img[o:o + 2] == b'\x20\x3c':
+                m.ensure(struct.unpack('>I', main_img[o + 2:o + 6])[0])
 
     m.install_mmio()
     m.install_exceptions()
