@@ -44,8 +44,7 @@ default 18720000 (4x INSTR_PER_SEC); 0 keeps the default rate; ignored when
 holding DTIM until handover.  `deliver` is `pit3` with DTIM3 delivered too:
 no hold on either timer while the intro is live, full PIT cadence at
 handover.  It is the policy an intro that paces its own frames off the
-timers needs (stock completes under it as well; measured 2026-09-19 in
-work/sharc-port/host/EMULATED_BOOT.md).  The historical default, `held`, keeps every
+timers needs (stock completes under it as well).  The historical default, `held`, keeps every
 timer held for exploratory runs that use semaphore unblocking.
 `--trace-ui` prints the firmware UI path (UI queue sends/pops with wait,
 key dispatch offers to views, view activate/close; see emu/uitrace.py) and
@@ -149,7 +148,8 @@ def parse_args(argv):
         '--intro-timers', choices=('held', 'pit3', 'all', 'deliver'), default='held',
         help='while the intro is active: hold PITs (historical default), '
              'drive only PIT3, or drive all PIT channels; DTIM stays held '
-             'until intro handover',
+             'until intro handover, except under deliver (PIT3 and DTIM3 '
+             'both run during the intro)',
     )
     p.add_argument('--trace-ui', action='store_true')
     p.add_argument('--trace-ui-verbose', action='store_true')
