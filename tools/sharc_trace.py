@@ -181,6 +181,7 @@ AZ_BIT, AV_BIT, AN_BIT, AC_BIT, AS_BIT, AI_BIT = 0, 1, 2, 3, 4, 5
 MN_BIT, MV_BIT, MU_BIT, MI_BIT = 6, 7, 8, 9
 AF_BIT = 10
 SV_BIT, SZ_BIT, SS_BIT = 11, 12, 13
+SF_BIT = 14  # Shifter Bit FIFO (PRM Table 28-2, REGF_ASTATX bit 14, all.txt:29659)
 BTF_BIT = 18
 ALUSAT_BIT = 13  # MODE1.ALUSAT
 TRUNCATE_BIT = 15  # MODE1.TRUNCATE (PRM Table 28-19, p.28-63): rounding mode
@@ -205,6 +206,9 @@ ALU_FLAGS_MASK = (
 # multiplier result format, so these are always left unknown except for the
 # MR data-move, which the PRM (p.493) documents as clearing all four.
 MULT_FLAGS_MASK = (1 << MN_BIT) | (1 << MV_BIT) | (1 << MU_BIT) | (1 << MI_BIT)
+# Shifter-result flags (SV/SZ/SS); forgotten (not guessed) for an
+# undocumented shifter opcode or an unrecognized compute unit.
+SHIFT_FLAGS_MASK = (1 << SV_BIT) | (1 << SZ_BIT) | (1 << SS_BIT)
 
 # Type3b's (l, x, w) ACCESS/BH/BHSE encode table (SHARC+ Core Programming
 # Reference rev. 1.4, pp. 13-16--13-19), used by this module's own "3b"
@@ -865,10 +869,45 @@ def _sync_pc_stack(state: State) -> None:
     )
 
 
+def _field_deposit_or(
+    dest: Value,
+    source: Value,
+    position: int,
+    length: int,
+    sign_extend: bool,
+    label: str,
+) -> Value:
+    """RN = RN or fdep RX by BIT6:LEN6[(SE)] (PGR p.11-70/11-74, cross-
+    checked against compute_table.json's shiftop_shiftimm rows 011011/
+    011101): deposits the low LENGTH bits of SOURCE at bit POSITION of DEST
+    -- sign-extending the deposited field's own top bit upward through bit
+    31 first when SIGN_EXTEND, mirroring the sign-extend convention the
+    already-implemented FEXT-SE (opcode 0x12) uses -- then ORs the result
+    into DEST (bits outside [POSITION, min(POSITION+LENGTH,32)) are left as
+    DEST already had them, unlike the plain, non-OR FDEP forms this tracer
+    does not implement)."""
+    if length == 0:
+        return dest
+    if not isinstance(source, Const) or not isinstance(dest, Const):
+        return Unknown(label)
+    field = source.value & ((1 << length) - 1)
+    if sign_extend and (field >> (length - 1)) & 1:
+        field |= (0xFFFFFFFF << length) & 0xFFFFFFFF
+    deposited = (field << position) & 0xFFFFFFFF
+    return Const((dest.value & 0xFFFFFFFF) | deposited)
+
+
 def _shift_immediate(
-    f: Mapping[str, int], values: Mapping[int, Value]
-) -> tuple[int, Value, str, "Callable[[Value], Value]"]:
-    """Execute the documented ShiftImm subset seen on qualifying paths."""
+    f: Mapping[str, int],
+    values: Mapping[int, Value],
+    special: Optional[Mapping[str, Value]] = None,
+) -> tuple[int | str | tuple, Value, str, "Callable[[Value], Value]"]:
+    """Execute the documented ShiftImm subset seen on qualifying paths.
+
+    SPECIAL is the same special-register mapping ``_compute`` reads MRF
+    from (currently just "BFFWRP", the bit-FIFO write pointer opcodes 0x14/
+    0x19/0x1f below read and update); it defaults to None for every caller
+    that does not need those opcodes."""
     field = (_field(f, "shiftimm[22:16]") << 16) | _field(f, "shiftimm[15:0]")
     opcode = (field >> 16) & 0x3F
     data8 = (field >> 8) & 0xFF
@@ -987,6 +1026,61 @@ def _shift_immediate(
         # form of the 11001100 register operation. It updates status only, so
         # RN keeps its value.
         return rn, source, "bit-test", _astatx_btst(source, Const(data8))
+    if opcode == 0x1D:
+        # compute_table.json shiftop_shiftimm row 011101 / PGR p.11-73/11-74
+        # (pgr.txt:22883): RN = RN or fdep RX by BIT6:LEN6 (SE). Same
+        # bit6/len6 packing as the FEXT-SE opcode (0x12) above.
+        position = data8 & 0x3F
+        length = (_field(f, "dataex[3:0]") << 2) | (data8 >> 6)
+        dest = _ureg(values, rn)
+        label = "R%d or fdep R%d by %d:%d (se)" % (rn, rx, position, length)
+        value = _field_deposit_or(dest, source, position, length, True, label)
+        return rn, value, "field-deposit-or-se", _astatx_fext(position + length, value)
+    if opcode == 0x1F:
+        # compute_table.json shiftop_shiftimm row 011111 / PGR p.11-89
+        # (pgr.txt:23379): BFFWRP = DATA7 -- the immediate form of cu=2
+        # opcode 0x7c above (writes the bit-FIFO write-pointer special
+        # register, not an RN).
+        new_wrp = Const(data8 & 0x7F)
+        updates: Dict[int, Optional[bool]] = {
+            SS_BIT: False,
+            SZ_BIT: False,
+            SV_BIT: new_wrp.value > 64,
+            SF_BIT: new_wrp.value >= 32,
+        }
+        return "BFFWRP", new_wrp, "bffwrp-write", _astatx_from_updates(updates)
+    if opcode in (0x14, 0x19):
+        # compute_table.json shiftop_shiftimm rows 010100/011001 / PGR
+        # p.11-86/11-90 (pgr.txt:23271-23336): RN = BITEXT RX|BITLEN12(,NU).
+        # Extracts the top BITLEN12 bits of the internal 64-bit bit FIFO
+        # into RN, left-shifts the FIFO by that amount, and decrements
+        # BFFWRP by the same amount; 0x19's NU modifier skips the FIFO/
+        # pointer update (and leaves SF untouched -- PGR: "the SF flag is
+        # not updated"). This tracer does not model the FIFO's 64-bit
+        # content (no instruction in this image's coverage scan writes it --
+        # BITDEP never appears), so RN is always Unknown; BFFWRP itself is
+        # still tracked from BFFWRP= writes (opcode 0x1f above / 0x7c in
+        # _compute) where known, so SF/SV stay meaningful even though RN
+        # does not.
+        no_update = opcode == 0x19
+        bitlen12 = (_field(f, "dataex[3:0]") << 8) | data8
+        value = Unknown("bitext by %d%s" % (bitlen12, " (nu)" if no_update else ""))
+        updates = {SS_BIT: False, SV_BIT: bitlen12 > 32, SZ_BIT: None}
+        if no_update:
+            return rn, value, "bit-extract-nu", _astatx_from_updates(updates)
+        old_wrp = (special or {}).get("BFFWRP")
+        new_wrp = (
+            Const(old_wrp.value - bitlen12)
+            if isinstance(old_wrp, Const)
+            else Unknown("uninitialized BFFWRP")
+        )
+        updates[SF_BIT] = new_wrp.value >= 32 if isinstance(new_wrp, Const) else None
+        return (
+            (rn, "BFFWRP"),
+            (value, new_wrp),
+            "bit-extract",
+            _astatx_from_updates(updates),
+        )
     raise ValueError("unsupported ShiftImm opcode %#x" % opcode)
 
 
@@ -1157,6 +1251,42 @@ def _float_mantissa(
     if exponent == 0:
         return Const(0), False, sign, False
     return Const((0x800000 | fraction) << 8), False, sign, False
+
+
+def _float_logb(
+    value: Value, mode1: Value, expression: str
+) -> tuple[Value, Optional[bool], bool]:
+    """RN = logb FX (PGR p.11-36, pgr.txt:21522): the unbiased two's-
+    complement exponent of FX as a fixed-point integer (biased_exp - 127).
+    A NAN input returns the all-1s sentinel. A +-infinity or +-zero input
+    (denormals flush to zero first, same general rule ``_float_mantissa``
+    already cites) returns a value gated on MODE1.ALUSAT exactly like
+    ``_float_to_fixed``'s saturation branches: unsaturated, PGR says these
+    return the *floating-point* +infinity/-infinity bit pattern verbatim in
+    the (nominally fixed-point) result register; saturated, the maximum
+    positive/negative fixed-point integer. Returns (result,
+    overflow=input-is-inf-or-zero, invalid=is-NAN); AV/AI feed AV/AI
+    directly, AN/AZ come from RESULT's own bits at the call site (RESULT is
+    a plain integer here, not a float, so ``_float_alu_updates`` does not
+    apply)."""
+    if not isinstance(value, Const):
+        return Unknown(expression), None, False
+    bits = value.value & 0xFFFFFFFF
+    sign = (bits >> 31) & 1
+    biased_exp = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    if biased_exp == 0xFF and mantissa != 0:
+        return _FLOAT_ALL_ONES, False, True
+    if biased_exp == 0xFF or biased_exp == 0:
+        saturating = _astatx_known_bit(mode1, ALUSAT_BIT)
+        if saturating is None:
+            return Unknown(expression), True, False
+        if biased_exp == 0xFF:
+            result = Const(0x7FFFFFFF) if saturating else Const(0x7F800000)
+        else:
+            result = Const(0x80000000) if saturating else Const(0xFF800000)
+        return result, True, False
+    return Const(_signed(biased_exp - 127, 32) & 0xFFFFFFFF), False, False
 
 
 def _float_scalb(
@@ -1581,6 +1711,50 @@ def _approx_recips(left: Value) -> tuple[Value, Dict[int, Optional[bool]]]:
     return Const(seed_bits), updates
 
 
+# PRM Table 18-29 MRDATAMOVE (p.438), cross-checked against
+# tools/sharcspec/compute_table.json's mrdatamove table (PGR Table 12-10,
+# pgr.txt:22827-22841): opcode[15:12] selects which of the six banked
+# multiplier-result registers a data move addresses.
+MR_DATAMOVE_REGISTERS = {
+    0x0: "MR0F",
+    0x1: "MR1F",
+    0x2: "MR2F",
+    0x4: "MR0B",
+    0x5: "MR1B",
+    0x6: "MR2B",
+}
+
+
+def _mr_data_move(
+    mr_name: str,
+    rn: int,
+    direction: int,
+    values: Mapping[int, Value],
+    special: Optional[Mapping[str, Value]],
+) -> tuple[int | str, Value, str, "Callable[[Value], Value]"]:
+    """PRM Table 18-29 MRDATAMOVE (p.438): moves a 32-bit value between the
+    register file and one of the six banked multiplier-result registers.
+    MR0F is the low 32 bits of the same 80-bit accumulator the
+    multiply-accumulate rows below call "MRF" (PRM p.3-10: "The REGF_MRF
+    register ... is comprised of the REGF_MR2F, REGF_MR1F, and REGF_MR0F
+    registers"), so it reuses that special-dict key; the other five (guard
+    bits and the alternate/background bank, PRM p.3-10/4-77, "Each
+    multiplier has a primary or foreground register ... and alternate or
+    background") get their own key since this tracer does not otherwise
+    model their contents. Flags: PRM p.493, MU/MN/MI/MV all cleared for
+    every direction and register.
+
+    The returned destination is MR_NAME itself (not the aliased key) so the
+    trace event names the register the instruction actually addresses;
+    ``_apply_compute`` applies the MR0F->"MRF" alias when it commits the
+    write to state.special."""
+    key = "MRF" if mr_name == "MR0F" else mr_name
+    if direction:  # register file -> MR register
+        return mr_name, _ureg(values, rn), "mr-data-move", _astatx_mult_clear
+    value = (special or {}).get(key, Unknown("uninitialized %s" % mr_name))
+    return rn, value, "mr-data-move", _astatx_mult_clear
+
+
 def _compute(
     f: Mapping[str, int],
     short: bool,
@@ -1608,9 +1782,10 @@ def _compute(
         direction = (field >> 16) & 1
         opcode = (field >> 12) & 0xF
         rn = (field >> 8) & 0xF
-        if direction != 1 or opcode != 0:
+        mr_name = MR_DATAMOVE_REGISTERS.get(opcode)
+        if mr_name is None:
             raise ValueError("unsupported MR data move %#x" % field)
-        return "MR0F", _ureg(values, rn), "mr-data-move", _astatx_mult_clear
+        return _mr_data_move(mr_name, rn, direction, values, special)
     # PRM multiplier compute table: MRF = MRF + RX * RY (MOD1).  Preserve
     # the accumulator separately from the UREG file so later MR transfers do
     # not masquerade as architectural UREGs.
@@ -1772,7 +1947,7 @@ def _compute(
         # for dual add/subtract), so the ALU half reuses
         # ``_float_alu_updates`` and the multiplier half stays forgotten via
         # ``_astatx_mult_forget`` exactly as the plain float multiply below.
-        if category in (0x18, 0x19, 0x1A, 0x1E, 0x1F):
+        if category in (0x18, 0x19, 0x1A, 0x1C, 0x1D, 0x1E, 0x1F):
             # The multiplier half uses ordinary IEEE NaN propagation like
             # the plain float multiply below, not the ALU's NaN-input
             # all-1s quirk, so it is computed directly rather than through
@@ -1832,6 +2007,72 @@ def _compute(
                     _float_alu_updates(fa_value, av=False, ai=fa_invalid),
                     "float-mul" + name,
                 )
+            # PGR Table 12-12 opcode 011100 (p.588): FM = FXM*FYM,
+            # FA = (FXA + FYA)/2 -- the ALU half is the single-function
+            # float average (PGR p.11-28: AV architecturally fixed 0, never
+            # data-dependent, unlike plain float add).
+            if category == 0x1C:
+                fa_value, _fa_overflow, fa_invalid = _float_binary(
+                    fxa, fya, "(F%d + F%d)/2" % (rxa_reg, rya_reg),
+                    lambda a, b: (a + b) / 2,
+                )
+                return with_mult(
+                    _float_alu_updates(fa_value, av=False, ai=fa_invalid),
+                    "float-mulalu-average",
+                )
+            # PGR Table 12-12 opcode 011101 (p.588): FM = FXM*FYM,
+            # FA = ABS FXA -- the ALU half is the same single-function float
+            # abs as 0xB0 above (AN fixed 0, AS carries FXA's own sign).
+            if category == 0x1D:
+                fa_value, _fa_overflow, fa_invalid = _float_unary(
+                    fxa, "abs F%d" % rxa_reg, abs
+                )
+                return with_mult(
+                    _float_alu_updates(
+                        fa_value, av=False, an_zero=True, as_source=fxa, ai=fa_invalid
+                    ),
+                    "float-mulalu-abs",
+                )
+        # PRM ch.24 p.528-529 "Floating-Point Multiplier and ALU (dual Add
+        # and Subtract)": Fm=F3-0*F7-4, Fa=F11-8+F15-12, Fs=F11-8-F15-12 --
+        # the multifunction twin of the single-function dual add/subtract
+        # above, for FFT butterflies. Neither PRM nor PGR prints this row's
+        # opcode bits (compute_table.json's multifn_mul_dual_addsub note),
+        # but tools/sharcdb.py's independently-built register-def/use table
+        # (_compute_regdef_reguse's is_dual_addsub branch) already extracts
+        # RS from bits 19:16 -- i.e. category's own low 4 bits, with only
+        # category's top 2 bits (here, "11") acting as the fixed selector --
+        # confirmed against this decoder's own database. FS shares FXA/FYA
+        # with FA (same operand pair, opposite sign), matching the
+        # single-function dual add/subtract's OR'd-flags convention.
+        if (category >> 4) == 0b11:
+            rs = category & 0xF
+            fm_a, fm_b = _float32(fxm), _float32(fym)
+            if fm_a is None or fm_b is None:
+                fm_value = Unknown("F%d * F%d" % (rxm_reg, rym_reg))
+            else:
+                fm_bits, _fm_overflowed = _float32_bits(fm_a * fm_b)
+                fm_value = Const(fm_bits)
+            add_value, add_overflow, add_invalid = _float_binary(
+                fxa, fya, "F%d + F%d" % (rxa_reg, rya_reg), lambda a, b: a + b
+            )
+            sub_value, sub_overflow, sub_invalid = _float_binary(
+                fxa, fya, "F%d - F%d" % (rxa_reg, rya_reg), lambda a, b: a - b
+            )
+            updates = _or_updates(
+                _float_alu_updates(add_value, av=add_overflow, ai=add_invalid),
+                _float_alu_updates(sub_value, av=sub_overflow, ai=sub_invalid),
+            )
+
+            def dual_astatx_update(astatx: Value, u=updates) -> Value:
+                return _astatx_mult_forget(_astatx_apply_bits(astatx, u))
+
+            return (
+                (rm, ra, rs),
+                (fm_value, add_value, sub_value),
+                "float-mul-dual-add-subtract",
+                dual_astatx_update,
+            )
         raise ValueError(
             "unsupported multifunction category=%#04x rm=%d ra=%d" % (category, rm, ra)
         )
@@ -1909,6 +2150,22 @@ def _compute(
             value = _add(base, Const(offset), label)
         operation = "subtract-with-borrow" if subtract else "add-with-carry"
         return rn, value, operation, _astatx_alu_arith_ci(left, right, subtract, carry_in)
+    # PGR p.11-9/11-10 (pgr.txt:20570/20606), opcodes 0010 0101/0010 0110:
+    # RN = RX + ci / RN = RX + ci - 1 -- the single-operand twins of
+    # 0x05/0x06 above (no RY; PGR's flag table is identical to the RY form),
+    # so they reuse the same value/flags formulas with RY forced to 0.
+    if cu == 0 and opcode in (0x25, 0x26):
+        subtract = opcode == 0x26
+        astatx = _ureg_raw(values, UREG_CODES["ASTATX"])
+        carry_in = _astatx_known_bit(astatx, AC_BIT)
+        label = "R%d + ci%s" % (rx, " - 1" if subtract else "")
+        if carry_in is None:
+            value = Unknown(label)
+        else:
+            offset = (1 if carry_in else 0) - (1 if subtract else 0)
+            value = _add(left, Const(offset), label)
+        operation = "subtract-with-borrow" if subtract else "add-with-carry"
+        return rn, value, operation, _astatx_alu_arith_ci(left, Const(0), subtract, carry_in)
     # PRM Table 18-5: ALUOP 00001010 is signed comp(RX, RY) and 00001011 is
     # unsigned compu(RX, RY). Both update status only, so the tracer records
     # the comparison without writing RN; the value carries the new flags.
@@ -1931,6 +2188,19 @@ def _compute(
     if cu == 0 and opcode == 0x2A:
         value = _add(left, Const(-1), "R%d - 1" % rx)
         return rn, value, "decrement", _astatx_alu_arith(left, Const(1), True)
+    # PGR p.11-13/11-14 (pgr.txt:20750), opcode 0011 0000: RN = ABS RX. Value
+    # and AC/AV/AN/AZ come from the same 0-RX adder as negate (0x22 above,
+    # "The ABS of the minimum negative number ... causes an overflow" only
+    # makes sense if ABS always runs the 0-RX path, even for a positive RX);
+    # unlike negate, AS is data-dependent here (RX's own sign) rather than
+    # architecturally cleared.
+    if cu == 0 and opcode == 0x30:
+        if isinstance(left, Const):
+            signed = _signed32(left.value)
+            value = left if signed >= 0 else _subtract(Const(0), left, "abs R%d" % rx)
+        else:
+            value = Unknown("abs R%d" % rx)
+        return rn, value, "abs", _astatx_abs(left)
     # PRM Table 18-5: ALUOP 01000000..01000010 are the integer logical
     # operations AND, OR, and XOR.
     if cu == 0 and opcode in (0x40, 0x41, 0x42):
@@ -1946,6 +2216,11 @@ def _compute(
             operation,
         )
         return rn, value, name, _astatx_alu_logical(value)
+    # PGR p.11-19 (pgr.txt:20918), opcode 0100 0011: RN = NOT RX. Same
+    # AZ/AN-from-result, AC/AV/AS/AI-cleared rule as pass/and/or/xor.
+    if cu == 0 and opcode == 0x43:
+        value = _not(left, "not R%d" % rx)
+        return rn, value, "not", _astatx_alu_logical(value)
     # PRM Table 18-5 (p.425-427), float rows; per-op flags cited at each
     # branch (PRM Table 3-3, pp.3-8/3-9, cross-checked against the classic
     # PGR's per-instruction pages, which spell out AZ/AN/AV/AI exactly where
@@ -1963,6 +2238,18 @@ def _compute(
         )
         return rn, value, "float-subtract", _astatx_from_updates(
             _float_alu_updates(value, av=overflow, ai=invalid)
+        )
+    # PGR p.11-27 (pgr.txt:21185), opcode 1001 0010: Fn = abs(Fx - Fy).
+    # Magnitude (and so AV/AZ) is identical to plain float-subtract above;
+    # only the sign bit changes (cleared) and AN is architecturally fixed 0
+    # rather than following the result's sign.
+    if cu == 0 and opcode == 0x92:
+        diff, overflow, invalid = _float_binary(
+            left, right, "F%d - F%d" % (rx, ry), lambda a, b: a - b
+        )
+        value = Const(diff.value & 0x7FFFFFFF) if isinstance(diff, Const) else diff
+        return rn, value, "float-abs-subtract", _astatx_from_updates(
+            _float_alu_updates(value, av=overflow, an_zero=True, ai=invalid)
         )
     # PGR p.11-29: comp(Fx, Fy).
     if cu == 0 and opcode == 0x8A:
@@ -2005,6 +2292,24 @@ def _compute(
             AZ_BIT: (value.value == 0) if isinstance(value, Const) else None,
         }
         return rn, value, "mant", _astatx_from_updates(updates)
+    # PGR p.11-36 (pgr.txt:21522), opcode 1100 0001: RN = LOGB FX. Bespoke
+    # flag dict like ``mant`` above: RESULT is a plain fixed-point integer
+    # (not float), so AN/AZ come from its own bits rather than through
+    # ``_float_alu_updates``, and AF is set (float-unit op with a
+    # fixed-point result, same convention as ``mant``/``fix``/``trunc``).
+    if cu == 0 and opcode == 0xC1:
+        mode1 = _ureg_raw(values, UREG_CODES["MODE1"])
+        value, overflow, invalid = _float_logb(left, mode1, "logb F%d" % rx)
+        updates = {
+            AC_BIT: False,
+            AF_BIT: True,
+            AS_BIT: False,
+            AV_BIT: overflow,
+            AI_BIT: invalid,
+            AZ_BIT: (value.value == 0) if isinstance(value, Const) else None,
+            AN_BIT: bool(value.value & 0x80000000) if isinstance(value, Const) else None,
+        }
+        return rn, value, "logb", _astatx_from_updates(updates)
     # PGR p.11-31: Fn = abs Fx. AN fixed 0; AS carries the *input*'s sign.
     if cu == 0 and opcode == 0xB0:
         value, overflow, invalid = _float_unary(left, "abs F%d" % rx, abs)
@@ -2236,6 +2541,17 @@ def _compute(
         return rn, Unknown(label), "shift-undocumented-b0", lambda astatx: _astatx_forget(
             astatx, ALU_FLAGS_MASK
         )
+    # Shifter opcode 0001 0100: absent from PRM Table 17-9, PGR Table 12-11
+    # and tools/sharcspec/compute_table.json's shiftop_shiftimm table alike
+    # (all three transcribed in full for this project; none has a 00010100
+    # row). Seen at `sw 0x1cadac`, between two otherwise-ordinary
+    # instructions, so not obviously misdecoded data -- decoded like the
+    # 0xb0 case above (so the walk does not desync) rather than guessed.
+    if cu == 2 and opcode == 0x14:
+        label = "shift opcode 0x14 R%d, R%d (undocumented; no public source)" % (rx, ry)
+        return rn, Unknown(label), "shift-undocumented-14", lambda astatx: _astatx_forget(
+            astatx, SHIFT_FLAGS_MASK
+        )
     # PRM Table 17-9: SHIFTOP 00000000 is RN = LSHIFT RX by RY. The signed
     # low byte of RY selects a left (positive) or logical right (negative)
     # shift; magnitudes of 32 or more produce zero.
@@ -2288,6 +2604,35 @@ def _compute(
             else:
                 value = Const(_signed32(left.value) >> -amount)
         return rn, value, "arithmetic-shift", _astatx_shift(amount, value, "clear")
+    # PRM Table 17-9 (compute_table.json shiftop_shiftimm row 00100000):
+    # SHIFTOP 00100000 is RN = RN OR LSHIFT RX by RY -- the register-operand
+    # twin of the already-implemented ShiftImm opcode 0x08 (OR-lshift by an
+    # 8-bit immediate). Same signed-low-byte amount/32-magnitude rule as
+    # plain lshift (0x00 above), computed independently here rather than
+    # shared, then ORed into RN instead of replacing it.
+    if cu == 2 and opcode == 0x20:
+        or_amount: Optional[int] = None
+        if not isinstance(right, Const):
+            shifted = Unknown("lshift R%d by R%d" % (rx, ry))
+        else:
+            or_amount = _signed(right.value & 0xFF, 8)
+            if or_amount == 0:
+                shifted = left
+            elif not isinstance(left, Const):
+                shifted = Unknown("lshift R%d by %d" % (rx, or_amount))
+            elif or_amount >= 32 or or_amount <= -32:
+                shifted = Const(0)
+            elif or_amount > 0:
+                shifted = Const(left.value << or_amount)
+            else:
+                shifted = Const(left.value >> -or_amount)
+        value = _bitwise(
+            _ureg(values, rn),
+            shifted,
+            "R%d or lshift R%d by R%d" % (rn, rx, ry),
+            lambda a, b: a | b,
+        )
+        return rn, value, "logical-shift-or", _astatx_shift(or_amount, shifted, "clear")
     # PRM Table 17-9: SHIFTOP 10001000 is RN = leftz RX.
     if cu == 2 and opcode == 0x88:
         value = (
@@ -2296,6 +2641,15 @@ def _compute(
             else Unknown("leftz R%d" % rx)
         )
         return rn, value, "leftz", _astatx_leftz(left, value)
+    # PGR p.11-83 (pgr.txt:23171): SHIFTOP 10001100 is RN = LEFTO RX --
+    # leading 1s, the complement of leftz above (leading 0s of ~RX).
+    if cu == 2 and opcode == 0x8C:
+        if isinstance(left, Const):
+            inverted = (~left.value) & 0xFFFFFFFF
+            value = Const(32 if inverted == 0 else 32 - inverted.bit_length())
+        else:
+            value = Unknown("lefto R%d" % rx)
+        return rn, value, "lefto", _astatx_lefto(left, value)
     # PRM Table 18-9: SHIFTOP 11000000/11000100 are variable bit set/clear.
     if cu == 2 and opcode in (0xC0, 0xC4):
         name = "bset" if opcode == 0xC0 else "bclr"
@@ -2339,6 +2693,50 @@ def _compute(
     # btst RX by RY. It changes status flags only and has no RN result.
     if cu == 2 and opcode == 0xCC:
         return rn, left, "bit-test", _astatx_btst(left, right)
+    # PGR p.11-88 (pgr.txt:23353), opcode 0111 0000: RN = BFFWRP -- reads
+    # the bit-FIFO write pointer this tracer tracks via ShiftImm opcode
+    # 0x1f/cu=2 opcode 0x7c below (special-dict key "BFFWRP"; Unknown until
+    # one of those has run). SF is documented "Not affected" so it is left
+    # out of UPDATES entirely (stays whatever it already was).
+    if cu == 2 and opcode == 0x70:
+        value = (special or {}).get("BFFWRP", Unknown("uninitialized BFFWRP"))
+        updates: Dict[int, Optional[bool]] = {SS_BIT: False, SZ_BIT: False, SV_BIT: False}
+        return rn, value, "bffwrp-read", _astatx_from_updates(updates)
+    # PGR p.11-89 (pgr.txt:23379), opcode 0111 1100: BFFWRP = RN|<data7> --
+    # the register-operand twin of ShiftImm opcode 0x1f below. The register
+    # form reads the RN-positioned field as its SOURCE, not a destination,
+    # per PGR's own text: "Updates write pointer from Rn ... Only 7 least
+    # significant bits of Rn are written."
+    if cu == 2 and opcode == 0x7C:
+        source = _ureg(values, rn)
+        new_wrp = Const(source.value & 0x7F) if isinstance(source, Const) else Unknown(
+            "BFFWRP = R%d" % rn
+        )
+        updates = {
+            SS_BIT: False,
+            SZ_BIT: False,
+            SV_BIT: (new_wrp.value > 64) if isinstance(new_wrp, Const) else None,
+            SF_BIT: (new_wrp.value >= 32) if isinstance(new_wrp, Const) else None,
+        }
+        return "BFFWRP", new_wrp, "bffwrp-write", _astatx_from_updates(updates)
+    # PRM top-level compute selector (tools/sharcspec/compute_table.json's
+    # top_level_structure.single_function_selector): cu=11 is "reserved
+    # (not used by SINGLEFN)" -- no compute unit is documented for it, in
+    # either public source. Only the one opcode this image's coverage scan
+    # actually found (0xd6, `sw 0x1c32ba`, sitting between two otherwise-
+    # ordinary instructions -- not an obvious data-as-code region) is
+    # decoded, like the cu=2 0xb0/0x14 undocumented cases above, rather than
+    # guessed at; every other cu=3 opcode still raises, since there is no
+    # evidence it is real or what it would mean.
+    if cu == 3 and opcode == 0xD6:
+        label = "reserved compute unit cu=3 opcode=%#x R%d, R%d (PRM: cu=11 not used by SINGLEFN)" % (
+            opcode,
+            rx,
+            ry,
+        )
+        return rn, Unknown(label), "compute-reserved-cu3", lambda astatx: _astatx_forget(
+            astatx, ALU_FLAGS_MASK | SHIFT_FLAGS_MASK
+        )
     raise ValueError("unsupported full compute cu=%#x opcode=%#x" % (cu, opcode))
 
 
@@ -2477,6 +2875,35 @@ def _astatx_alu_arith(
             )
         if isinstance(a, Const) and isinstance(b, Const):
             return _astatx_define(astatx, ALU_FLAGS_MASK, _arith_flag_bits(a, b, subtract))
+        return _astatx_forget(astatx, ALU_FLAGS_MASK)
+
+    return update
+
+
+def _astatx_abs(source: Value) -> "Callable[[Value], Value]":
+    """abs (PGR p.11-13/11-14): AC/AV/AN/AZ come from the same adder the
+    value itself is computed with -- 0-RX (subtract) when RX is negative,
+    0+RX (add, i.e. an ordinary passthrough) when it is not -- so AN/AZ
+    always agree with the actual returned value, and AC/AV are trivially 0
+    on the positive branch (adding 0 cannot carry or overflow) but can be
+    set on the negative branch (ABS(INT_MIN) overflows, matching the PGR
+    text, exactly like negate(INT_MIN)). AS is set from RX's own sign
+    (unlike negate, whose AS is always cleared); AI cleared."""
+
+    def update(astatx: Value) -> Value:
+        if isinstance(source, Const):
+            negative = bool(source.value & 0x80000000)
+            bits = _arith_flag_bits(Const(0), source, negative)
+            updates: Dict[int, Optional[bool]] = {
+                AZ_BIT: bool(bits & (1 << AZ_BIT)),
+                AV_BIT: bool(bits & (1 << AV_BIT)),
+                AN_BIT: bool(bits & (1 << AN_BIT)),
+                AC_BIT: bool(bits & (1 << AC_BIT)),
+                AS_BIT: negative,
+                AI_BIT: False,
+                AF_BIT: False,  # every fixed-point ALU op clears AF (PRM p.439)
+            }
+            return _astatx_apply_bits(astatx, updates)
         return _astatx_forget(astatx, ALU_FLAGS_MASK)
 
     return update
@@ -2640,6 +3067,22 @@ def _astatx_leftz(source: Value, result: Value) -> "Callable[[Value], Value]":
     return update
 
 
+def _astatx_lefto(source: Value, result: Value) -> "Callable[[Value], Value]":
+    """lefto (PGR p.11-83): SS cleared; SZ = MSB of RX is 0; SV = result ==
+    32. The mirror image of ``_astatx_leftz``'s SZ polarity (leading 1s are
+    zero in count exactly when RX starts with a 0 bit)."""
+
+    def update(astatx: Value) -> Value:
+        updates: Dict[int, Optional[bool]] = {SS_BIT: False}
+        updates[SZ_BIT] = (
+            not bool(source.value & 0x80000000) if isinstance(source, Const) else None
+        )
+        updates[SV_BIT] = (result.value == 32) if isinstance(result, Const) else None
+        return _astatx_apply_bits(astatx, updates)
+
+    return update
+
+
 def _astatx_btst(source: Value, position: Value) -> "Callable[[Value], Value]":
     """btst reg (PRM p.513): SS cleared; SZ set if the tested bit is 0 or the
     position is out of range, cleared if the tested bit is 1; SV = position >
@@ -2706,13 +3149,20 @@ def _apply_compute(
             result_register=rn,
             value=value,
         )
-        state.special["MRF"] = value
+        # "MR0F" (PRM Table 18-29 MRDATAMOVE) is the same physical register
+        # the multiply-accumulate rows call "MRF" (PRM p.3-10); every other
+        # string key (other MR registers, "BFFWRP") is its own special-dict
+        # slot, keyed by the name the caller returned.
+        state.special["MRF" if rn == "MR0F" else rn] = value
         return
     if isinstance(rn, tuple):
-        # Dual-result compute (dual add/subtract, MUL/ALU multifunction):
-        # two destination registers sharing one ASTATX update, already
-        # combined by the caller (PRM p.3-21/3-22).
-        names = ["R%d" % reg for reg in rn]
+        # Dual/triple-result compute (dual add/subtract, MUL/ALU
+        # multifunction, MUL dual add/subtract, BITEXT's paired RN+BFFWRP
+        # write): destinations sharing one ASTATX update, already combined
+        # by the caller (PRM p.3-21/3-22). A string destination is a
+        # special-dict slot (as in the single-string case above); an int is
+        # an ordinary register.
+        names = [reg if isinstance(reg, str) else "R%d" % reg for reg in rn]
         _event(
             state,
             insn,
@@ -2722,7 +3172,10 @@ def _apply_compute(
             value=[_json_value(v) for v in value],
         )
         for reg, val in zip(rn, value):
-            state.uregs[reg] = val
+            if isinstance(reg, str):
+                state.special["MRF" if reg == "MR0F" else reg] = val
+            else:
+                state.uregs[reg] = val
         return
     if operation in ("compare", "bit-test", "float-compare"):
         _event(state, insn, "compute", operation=operation, status_only=True)
@@ -3101,7 +3554,7 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         if _field(f, "cond") != 0x1F:
             return [_stop(state, insn, "unsupported Type6b predicate")]
         try:
-            result = _shift_immediate(f, dict(state.uregs))
+            result = _shift_immediate(f, dict(state.uregs), state.special)
         except ValueError as error:
             return [_stop(state, insn, str(error))]
         _apply_compute(state, insn, result)
@@ -3113,7 +3566,7 @@ def _execute(state: State, insn: Instruction) -> List[State]:
             return [_stop(state, insn, "unsupported Type6a predicate")]
         old = dict(state.uregs)
         try:
-            result = _shift_immediate(f, old)
+            result = _shift_immediate(f, old, state.special)
         except ValueError as error:
             return [_stop(state, insn, str(error))]
         bank = 8 if _field(f, "g") else 0
