@@ -44,6 +44,7 @@ from unicorn import UcError  # noqa: E402
 from unicorn.m68k_const import UC_M68K_REG_A7, UC_M68K_REG_D0, UC_M68K_REG_PC  # noqa: E402
 
 import framelink  # noqa: E402
+from emu import dspiframe  # noqa: E402
 
 
 def restore(snapshot, syx):
@@ -66,7 +67,7 @@ def capture(m, at, prof, passes, limit):
 
     def driver(uc, addr, size, user):
         sp = uc.reg_read(UC_M68K_REG_A7)
-        ret, tx_len, tx, rx_len, rx = struct.unpack('>IIIII', uc.mem_read(sp, 20))
+        ret, tx_len, tx, rx_len, rx = dspiframe.read_driver_call(uc, sp)
         data = bytes(uc.mem_read(tx, tx_len)) if tx and tx_len else b''
         calls.append({'caller': ret, 'tx_len': tx_len, 'tx': tx,
                       'rx_len': rx_len, 'rx': rx, 'data': data})

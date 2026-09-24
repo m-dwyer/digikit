@@ -9,23 +9,25 @@ this is a single fixed-length full-duplex exchange, not two independently
 sized transfers: the `0x802`-byte figure quoted elsewhere is how many of
 those 2748 TX bytes are real payload, the rest tag entries. See
 docs/findings/04-coldfire-dsp-link.md, "The ColdFire tells the SHARC through
-a periodic DSPI2 frame" and "eDMA and DSPI transfer inventory".
+a periodic DSPI2 frame" and "eDMA and DSPI transfer inventory". The frame's
+constants (register block, channel/vector numbers, sizes, per-track layout)
+are defined once in `emu/dspiframe.py` and imported here; see that module's
+docstring for how the several partial copies of these facts were unified.
 
-**Channel roles, corrected here.** That finding's "eDMA and DSPI transfer
-inventory" table has channel 28 as TX (destination PUSHR). Disassembling
-`FUN_400cd2bc` directly (1.16, `sections/section_3_MAIN_OS.bin`,
-`0x400cd2bc`-`0x400cd482`) shows the opposite: TCD **29**'s fields are
-programmed with `DADDR = 0xec038034` (PUSHR) and `SADDR = 0x80001bc0`
-(SRAM staging, rebuilt per call) -- that is channel 29 is TX. TCD **28** gets
-`SADDR = 0xec03803a` (a POPR-area hardware address) and `DADDR = 0x80001000`
-(a *different* SRAM buffer from the TX staging one) -- channel 28 is RX. Both
-are armed by `EDMA_CERQ` (`0xfc044019`, disabling first) then `EDMA_SERQ`
-(`0xfc044018`), each written with channel 29 then channel 28, in that order.
-`TX_CHAN, RX_CHAN = 29, 28` below follow this reading; `docs/findings/04...`'s
-table needs the same correction, which this worktree's report flags for a
-second agent to check against the image bytes before editing it there (see
-this project's rule that a finding needs independent confirmation before
-`[V]`).
+**Channel roles.** TCD **29**'s fields are programmed with `DADDR =
+0xec038034` (PUSHR) and `SADDR = 0x80001bc0` (SRAM staging, rebuilt per
+call) -- channel 29 is TX. TCD **28** gets `SADDR = 0xec03803a` (a POPR-area
+hardware address) and `DADDR = 0x80001000` (a *different* SRAM buffer from
+the TX staging one) -- channel 28 is RX. Both are armed by `EDMA_CERQ`
+(`0xfc044019`, disabling first) then `EDMA_SERQ` (`0xfc044018`), each
+written with channel 29 then channel 28, in that order. `TX_CHAN, RX_CHAN =
+29, 28` below follow this reading, confirmed two ways independently -- the
+Ghidra decompile/disassembly dump and a raw-byte scan of
+`sections/section_3_MAIN_OS.bin` at `0x400cd2bc`-`0x400cd482` -- and cross-
+checked against Digitone II 1.11's driver (`FUN_400cf7be`), which programs
+the same two TCDs the same way at the same offsets. `docs/findings/04-
+coldfire-dsp-link.md`'s "eDMA and DSPI transfer inventory" table is corrected
+to match, citing both checks.
 
 ## The real mechanism: a polled status bit, not an interrupt
 
@@ -194,6 +196,17 @@ import struct
 from unicorn import UC_HOOK_MEM_WRITE
 from unicorn.m68k_const import UC_M68K_REG_SR
 
+from emu.dspiframe import (
+    E_SG,
+    INT_MAJOR,
+    RX_CHAN,
+    RX_VECTOR,
+    TX_CHAN,
+    TX_VECTOR,
+)
+from emu.dspiframe import (
+    SR_LINK_IDLE as SR_LINK_IDLE,  # re-exported: emu.longrun imports it from here
+)
 from emu.edma import (
     ATTR,
     BITER,
@@ -213,28 +226,6 @@ from emu.edma import (
 from emu.pit import interrupt_level
 
 CINT = EDMA_BASE + 0x1C
-
-DSPI2_BASE = 0xEC038000
-DSPI2_MCR = DSPI2_BASE + 0x00
-DSPI2_TCR = DSPI2_BASE + 0x08
-DSPI2_CTAR0 = DSPI2_BASE + 0x0C
-DSPI2_SR = DSPI2_BASE + 0x2C
-DSPI2_RSER = DSPI2_BASE + 0x30
-DSPI2_PUSHR = DSPI2_BASE + 0x34
-DSPI2_POPR = DSPI2_BASE + 0x38
-
-# Channel roles, corrected from docs/findings/04-coldfire-dsp-link.md's
-# "eDMA and DSPI transfer inventory" table: disassembling FUN_400cd2bc
-# directly (1.16) shows TCD *29*'s DADDR set to `0xec038034` = PUSHR (SRAM
-# staging at 0x80001bc0 -> PUSHR, i.e. TX), and TCD *28*'s SADDR set to
-# `0xec03803a` (a POPR-area hardware address) with DADDR in SRAM at
-# 0x80001000 (i.e. RX) -- the opposite of that table's channel 28 row. See
-# the module docstring and the worktree report for the disassembly.
-TX_CHAN, RX_CHAN = 29, 28
-TX_VECTOR, RX_VECTOR = TX_CHAN + 120, RX_CHAN + 120  # 149, 148; see module docstring
-SR_LINK_IDLE = 1 << 28  # DSPI2_SR bit FUN_400cd2bc polls; see module docstring
-INT_MAJOR = 0x0002
-E_SG = 0x0010
 
 
 def _signed(value, bits):

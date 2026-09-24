@@ -14,6 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 CLEAN = [
     "emu/dspi2.py",
+    "emu/dspiframe.py",
     "tests/test_dspi2.py",
     "tests/test_lint.py",
     "tests/test_sharc_compute_table.py",

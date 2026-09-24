@@ -74,7 +74,15 @@ for p in (DIGI_REPO, os.path.join(DIGI_REPO, 'tools')):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-TX_BASE = 0x80005348
+from emu import dspiframe  # noqa: E402
+
+# The frame's constants (guest address, per-track stride, the machine-type
+# special case) are defined once in emu/dspiframe.py; see that module's
+# docstring. This tool only knows Digitakt II (--machine-count defaults to
+# 7, DT2's stock machine count), so TX_BASE is DT2's fixed address, not
+# resolved per image -- emu.dspiframe.tx_base_for() is how a caller that does
+# have an image/profile gets the equivalent address for another device.
+TX_BASE = dspiframe.TX_BASE_DT2
 
 # The stock seven-machine display order every current Digitakt-family image
 # shares (machinepatch.ORIGINAL_TABLE). Kept as a local constant, not an
@@ -128,17 +136,13 @@ def parse_frame_words(text):
 def frame_addr(offset, track):
     """-> the absolute TX-frame address for `offset` on `track`.
 
-    Offset 0x94 is the per-track MACHINE-TYPE word array, addressed
-    `TX_BASE + 0x94 + 2*track` -- a flat, 2-byte-per-track table, separate
-    from the per-track parameter block. Every other offset is inside the
-    0x60-byte-per-track SRC/filter/amp/FX block, addressed
-    `TX_BASE + track*0x60 + offset` (docs/findings/04-coldfire-dsp-link.md,
-    "The mirror index to TX frame map, and the 17-word header": mirror index
-    27 (CFADE) -> +0xde, 31 (SLICE) -> +0xe6, 32 (LEN) -> +0xe8, 33 -> +0xea).
+    A thin wrapper around emu.dspiframe.frame_addr bound to this tool's
+    TX_BASE; see that function's docstring for the machine-type special case
+    and the per-track stride (docs/findings/04-coldfire-dsp-link.md, "The
+    mirror index to TX frame map, and the 17-word header": mirror index 27
+    (CFADE) -> +0xde, 31 (SLICE) -> +0xe6, 32 (LEN) -> +0xe8, 33 -> +0xea).
     """
-    if offset == 0x94:
-        return TX_BASE + 0x94 + 2 * track
-    return TX_BASE + track * 0x60 + offset
+    return dspiframe.frame_addr(TX_BASE, offset, track)
 
 
 def build_func_src_chord():
@@ -248,7 +252,7 @@ def capture_frame(m, prof, limit=8_000_000):
 
     def driver_hook(uc_, addr, size, user):
         sp = uc.reg_read(UC_M68K_REG_A7)
-        ret, tx_len, tx, rx_len, rx = struct.unpack('>IIIII', bytes(uc.mem_read(sp, 20)))
+        ret, tx_len, tx, rx_len, rx = dspiframe.read_driver_call(uc, sp)
         driver_calls.append((tx, tx_len))
         uc.reg_write(UC_M68K_REG_D0, 0)
         uc.reg_write(UC_M68K_REG_A7, sp + 4)
