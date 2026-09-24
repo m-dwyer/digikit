@@ -313,6 +313,12 @@ class State:
     # whether it actually did so at least once (calibration, like above).
     approx_recips: bool = False
     approx_recips_used: bool = False
+    # Concrete single-path execution (tools/sharc_run.py) sets this False to
+    # skip the per-step trace log. _event() still appends a minimal dict so
+    # the few call sites that immediately do trace[-1].update(...)/[...] =
+    # (the predicate-resolved Type3a/etc. idiom) keep working; only the
+    # pc_sw/form/_json_value bookkeeping is skipped.
+    record_events: bool = True
 
 
 def _signed(value: int, bits: int) -> int:
@@ -381,6 +387,13 @@ def _json_value(value: Value | int) -> int | dict:
 
 
 def _event(state: State, insn: Instruction, action: str, **extra) -> None:
+    if not state.record_events:
+        # A few call sites (the predicate-resolved Type3a/2a/5a_move/9a_abs
+        # idiom) do trace[-1].update(...) or trace[-1][...] = ... right
+        # after this call, on the non-forking, always-taken path -- so this
+        # must still append one dict, just not the full one.
+        state.trace.append({"action": action})
+        return
     for key in ("address", "value", "concrete_value"):
         if key in extra:
             extra[key] = _json_value(extra[key])
@@ -427,6 +440,7 @@ def _copy(state: State) -> State:
         state.provisional_used,
         state.approx_recips,
         state.approx_recips_used,
+        state.record_events,
     )
 
 
