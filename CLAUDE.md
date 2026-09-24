@@ -30,6 +30,10 @@ current state and next steps in the newest `HANDOVER-*.md` in the repo root.
 - coder applies fully specified edits (exact before/after text or full file
   content). Check `git diff` afterwards.
 - general-purpose agents run processes: tests, Ghidra, the emulator.
+- An agent in a git worktree runs `tools/worktree-setup.sh` first: it
+  fast-forwards to `work/sharc-emulator` and links `out/`, `sections/`,
+  `snapshots/`, `.venv` and the generated language files from the main tree.
+  Do not change dependencies there (the virtualenv is shared).
 
 ## Ghidra
 
@@ -87,6 +91,9 @@ current state and next steps in the newest `HANDOVER-*.md` in the repo root.
 - Lint: rules are in `pyproject.toml`. `tests/test_lint.py` runs `ruff check`
   and `ruff format --check` on its `CLEAN` list; new files start clean and go
   on the list, and a file joins it when you clean it.
+- Behaviour: `tests/test_sharc_golden.py` hashes six SHARC core outputs on
+  DT2 1.16. A refactor keeps them; an intended change updates them with
+  `uv run python tests/test_sharc_golden.py --update` and says why.
 - Types: `tests/test_types.py` runs mypy (config in `pyproject.toml`, checked
   as Python 3.11) on its `TYPED` list. The SHARC core must also run under
   PyPy 3.11: `tests/test_pypy.py` (slow) runs its tests there.

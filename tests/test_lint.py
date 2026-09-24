@@ -18,6 +18,7 @@ CLEAN = [
     "tests/test_lint.py",
     "tests/test_sharc_compute_table.py",
     "tests/test_sharc_contract.py",
+    "tests/test_sharc_golden.py",
     "tests/test_sharc_run.py",
     "tests/test_sharc_trace_alu.py",
     "tests/test_sharc_trace_forms.py",
