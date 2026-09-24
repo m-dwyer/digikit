@@ -846,6 +846,30 @@ def _access_modifier_scale(access_width: str, assume_nw32: bool) -> int:
     return 1
 
 
+def _circular_wrap_const(index: int, base: int, length: int, delta: int) -> Optional[int]:
+    """Concrete DAG circular-buffer wrap: the true I in [B, B+L) advances by
+    DELTA and is corrected by one +-length step when it leaves the buffer
+    (SHARC+ Core Programming Reference, out/refs/sharc-plus-prm, Sec. 6
+    "Circular Buffering": "If the index pointer falls outside the buffer,
+    the DAG subtracts or adds the buffer length to the index value,
+    wrapping the index pointer back within the start and end boundaries of
+    the buffer"). Valid for a modifier magnitude up to and including LENGTH
+    (an exact-L step lands back on INDEX, which is correct: a full lap of a
+    circular buffer is the identity). Returns None when |delta| exceeds
+    LENGTH, since a single +-length correction is no longer guaranteed to
+    land back in range and this module does not model multi-lap modifies.
+    """
+    if length <= 0 or abs(delta) > length:
+        return None
+    candidate = (index + delta) & 0xFFFFFFFF
+    lower, upper = base, base + length
+    if candidate < lower:
+        candidate += length
+    elif candidate >= upper:
+        candidate -= length
+    return candidate
+
+
 def _bitwise(left: Value, right: Value, expression: str, operation) -> Value:
     if isinstance(left, Const) and isinstance(right, Const):
         return Const(operation(left.value, right.value))
@@ -4080,11 +4104,43 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         source, destination = source_low + bank, destination_low + bank
         modifier = _field(f, "m") + bank
         conditional = cond == 0x17
+        circular_wrap: Optional[Const] = None
         if conditional:
             if _field(f, "compute[22:16]") or _field(f, "compute[15:0]"):
                 return [_stop(state, insn, "unsupported Type7a conditional compute")]
             length = _ureg(state.uregs, UREG_CODES["L%d" % source])
-            if not isinstance(length, Const) or length.value != 0:
+            if isinstance(length, Const) and length.value != 0:
+                # The MODIFY instruction wraps whenever L is nonzero,
+                # independent of MODE1.CBUFEN (out/refs/sharc-plus-prm
+                # lines 9344-9346, 10410-10412): unlike an ordinary
+                # load/store post-modify, this is not gated by CBUFEN.
+                base = _ureg(state.uregs, UREG_CODES["B%d" % source])
+                index_now = _ureg(state.uregs, 16 + source)
+                modifier_now = _ureg(state.uregs, 32 + modifier)
+                scale_now = _access_modifier_scale("normal-word", state.assume_nw32)
+                if (
+                    isinstance(base, Const)
+                    and isinstance(index_now, Const)
+                    and isinstance(modifier_now, Const)
+                ):
+                    wrapped_value = _circular_wrap_const(
+                        index_now.value,
+                        base.value,
+                        length.value,
+                        modifier_now.value * scale_now,
+                    )
+                    if wrapped_value is None:
+                        return [
+                            _stop(
+                                state,
+                                insn,
+                                "circular modifier is not smaller than L%d" % source,
+                            )
+                        ]
+                    circular_wrap = Const(wrapped_value)
+                else:
+                    return [_stop(state, insn, "unsupported Type7a circular modify")]
+            elif not isinstance(length, Const):
                 return [_stop(state, insn, "unsupported Type7a circular modify")]
             predicate = _predicate(state, cond)
             mode1 = _ureg(state.uregs, UREG_CODES["MODE1"])
@@ -4124,29 +4180,136 @@ def _execute(state: State, insn: Instruction) -> List[State]:
             )
         except ValueError as error:
             return [_stop(state, insn, str(error))]
-        index_value = _ureg(state.uregs, 16 + source)
-        modifier_value = _ureg(state.uregs, 32 + modifier)
-        scale = _access_modifier_scale("normal-word", state.assume_nw32)
-        scaled_modifier = _multiply(
-            modifier_value, Const(scale), "M%d * %d" % (modifier, scale)
-        )
-        state.uregs[16 + destination] = _add(
-            index_value,
-            scaled_modifier,
-            "I%d + M%d * %d" % (source, modifier, scale),
-        )
-        _event(
-            state,
-            insn,
-            "i-modify",
-            source="I%d" % source,
-            destination="I%d" % destination,
-            modifier="M%d" % modifier,
-            **({"scale_assumption": "assume_nw32"} if conditional and state.assume_nw32 else {}),
-        )
+        if circular_wrap is not None:
+            state.uregs[16 + destination] = circular_wrap
+            _event(
+                state,
+                insn,
+                "i-modify",
+                source="I%d" % source,
+                destination="I%d" % destination,
+                modifier="M%d" % modifier,
+                circular=True,
+            )
+        else:
+            index_value = _ureg(state.uregs, 16 + source)
+            modifier_value = _ureg(state.uregs, 32 + modifier)
+            scale = _access_modifier_scale("normal-word", state.assume_nw32)
+            scaled_modifier = _multiply(
+                modifier_value, Const(scale), "M%d * %d" % (modifier, scale)
+            )
+            state.uregs[16 + destination] = _add(
+                index_value,
+                scaled_modifier,
+                "I%d + M%d * %d" % (source, modifier, scale),
+            )
+            _event(
+                state,
+                insn,
+                "i-modify",
+                source="I%d" % source,
+                destination="I%d" % destination,
+                modifier="M%d" % modifier,
+                **({"scale_assumption": "assume_nw32"} if conditional and state.assume_nw32 else {}),
+            )
         if compute is not None:
             _apply_compute(state, insn, compute)
         return _advance(state, insn)
+    if name == "7b":
+        # Type 7b VISA MODIFY (out/refs/sharc-plus-prm pp.13-49/13-50): the
+        # same index-register update as Type7a's MODIFY, minus the parallel
+        # compute option, over the full condition-code range (not just
+        # Type7a's 0x1F/0x17). "If the DAG's Lx and Bx registers that
+        # correspond to Ia or Ic are set up for circular buffering, the
+        # modify operation always executes circular buffer wraparound,
+        # independent of the state of the CBUFEN bit" (same page), so --
+        # unlike an ordinary load/store post-modify -- this form is not
+        # gated by MODE1.CBUFEN.
+        cond = _field(f, "cond")
+        bank = 8 if _field(f, "g") else 0
+        source_low = _field(f, "is[2:2]") << 2 | _field(f, "is[1:0]")
+        destination_low = source_low ^ _field(f, "idis")
+        source, destination = source_low + bank, destination_low + bank
+        modifier = _field(f, "m") + bank
+
+        def modify7b(executed: State) -> None:
+            length = _ureg(executed.uregs, UREG_CODES["L%d" % source])
+            index_value = _ureg(executed.uregs, 16 + source)
+            modifier_value = _ureg(executed.uregs, 32 + modifier)
+            scale = _access_modifier_scale("normal-word", executed.assume_nw32)
+            if (
+                isinstance(length, Const)
+                and length.value != 0
+                and isinstance(index_value, Const)
+                and isinstance(modifier_value, Const)
+            ):
+                base = _ureg(executed.uregs, UREG_CODES["B%d" % source])
+                if isinstance(base, Const):
+                    wrapped = _circular_wrap_const(
+                        index_value.value,
+                        base.value,
+                        length.value,
+                        modifier_value.value * scale,
+                    )
+                    executed.uregs[16 + destination] = (
+                        Const(wrapped)
+                        if wrapped is not None
+                        else Unknown(
+                            "circular modifier is not smaller than L%d" % source
+                        )
+                    )
+                    _event(
+                        executed,
+                        insn,
+                        "i-modify",
+                        source="I%d" % source,
+                        destination="I%d" % destination,
+                        modifier="M%d" % modifier,
+                        circular=True,
+                    )
+                    return
+            scaled_modifier = _multiply(
+                modifier_value, Const(scale), "M%d * %d" % (modifier, scale)
+            )
+            executed.uregs[16 + destination] = _add(
+                index_value,
+                scaled_modifier,
+                "I%d + M%d * %d" % (source, modifier, scale),
+            )
+            _event(
+                executed,
+                insn,
+                "i-modify",
+                source="I%d" % source,
+                destination="I%d" % destination,
+                modifier="M%d" % modifier,
+            )
+
+        predicate = _predicate(state, cond)
+        if predicate is True:
+            modify7b(state)
+            return _advance(state, insn)
+        if predicate is False:
+            _event(
+                state,
+                insn,
+                "i-modify-skipped",
+                source="I%d" % source,
+                destination="I%d" % destination,
+                condition=cond,
+            )
+            return _advance(state, insn)
+        executed, skipped = _copy(state), _copy(state)
+        modify7b(executed)
+        _event(
+            skipped,
+            insn,
+            "i-modify-skipped",
+            source="I%d" % source,
+            destination="I%d" % destination,
+            condition=cond,
+        )
+        return _advance(executed, insn) + _advance(skipped, insn)
     if name == "7d":
         # SHARC+ Core Programming Reference (out/refs/sharc-plus-prm), ACONV
         # (Type 7d), Figure 13-21 p.352 and its Encode Table (same page):
@@ -5140,17 +5303,18 @@ def _execute(state: State, insn: Instruction) -> List[State]:
             ):
                 circular = True
                 byte_length = length.value * scale
-                if byte_length <= abs(delta):
+                # PRM Sec. 6 "Circular Buffering": the modifier's magnitude
+                # may be up to and including the buffer length L -- a step
+                # of exactly L is a full lap and lands back on the start
+                # value. Only a magnitude greater than L is out of the
+                # single-correction case this tracer models.
+                if byte_length < abs(delta):
                     result = Unknown("circular modifier is not smaller than L%d" % src)
                 else:
-                    candidate = (v.value + delta) & 0xFFFFFFFF
-                    lower, upper = base.value, base.value + byte_length
-                    if candidate < lower:
-                        candidate += byte_length
-                        wrapped = True
-                    elif candidate >= upper:
-                        candidate -= byte_length
-                        wrapped = True
+                    candidate = _circular_wrap_const(
+                        v.value, base.value, byte_length, delta
+                    )
+                    wrapped = candidate != (v.value + delta) & 0xFFFFFFFF
                     result = Const(candidate)
             else:
                 bounded = _stack_bounded_symbol(v)
@@ -5280,6 +5444,346 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         delayed = name.startswith("25a") or bool(_field(f, "j"))
         transfer = _transfer if delayed else _immediate_transfer
         return transfer(state, insn, target, call, cond)
+    if name == "1a":
+        # SHARC+ Core Programming Reference (out/refs/sharc-plus-prm)
+        # pp.13-3--13-6, Figure 13-1: an unconditional compute in parallel
+        # with a DM transfer (fixed to DAG1, I0-7/M0-7) and a PM transfer
+        # (fixed to DAG2, I8-15/M8-15). "The I values are post-modified and
+        # updated by the specified M registers. Pre-modify offset
+        # addressing is not supported" (p.13-4) -- unlike Type3a/3b/4a/4b,
+        # there is no pre/post "u" bit; both accesses are always
+        # post-modify. This tracer does not model the SIMD Y-element
+        # (PEy/Sn) companion access the same page describes.
+        old = dict(state.uregs)
+        try:
+            compute = _compute(
+                f, False, old, state.special, approx_recips=state.approx_recips
+            )
+        except ValueError as error:
+            return [_stop(state, insn, str(error))]
+        scale = _access_modifier_scale("normal-word", state.assume_nw32)
+
+        def access1a(space: str, index: int, modifier: int, dreg: int, store: bool) -> None:
+            iv, mv = _ureg(old, 16 + index), _ureg(old, 32 + modifier)
+            scaled_mv = _multiply(mv, Const(scale), "M%d * %d" % (modifier, scale))
+            address = iv
+            if store:
+                value = _ureg(old, dreg)
+                _event(
+                    state,
+                    insn,
+                    "store",
+                    space=space,
+                    dreg="R%d" % dreg,
+                    value=value,
+                    address=address,
+                    expression=_render(address),
+                    concrete_write=_dm_write(state, address, 4, value)
+                    if space == "DM"
+                    else False,
+                    addressing_mode="post-modify",
+                    access_width="normal-word",
+                )
+            else:
+                loaded = _load_normal_ureg(state, space, address, dreg)
+                _event(
+                    state,
+                    insn,
+                    "load",
+                    space=space,
+                    dreg="R%d" % dreg,
+                    address=address,
+                    expression=_render(address),
+                    concrete_value=loaded,
+                    addressing_mode="post-modify",
+                    access_width="normal-word",
+                )
+            state.uregs[16 + index] = _add(
+                iv, scaled_mv, "I%d + M%d * %d" % (index, modifier, scale)
+            )
+
+        dm_index, dm_modifier = _field(f, "dmi[2:0]"), _field(f, "dmm[2:0]")
+        pm_index = ((_field(f, "pmi[2:2]") << 2) | _field(f, "pmi[1:0]")) + 8
+        pm_modifier = _field(f, "pmm[2:0]") + 8
+        access1a("DM", dm_index, dm_modifier, _field(f, "dmdreg[3:0]"), bool(_field(f, "dmd")))
+        access1a("PM", pm_index, pm_modifier, _field(f, "pmdreg[3:0]"), bool(_field(f, "pmd")))
+        if compute is not None:
+            _apply_compute(state, insn, compute)
+        return _advance(state, insn)
+    if name == "22c":
+        # SHARC+ Core Programming Reference pp.16-13/16-14, Figure 16-8:
+        # idle/emuidle. "The processor remains in the low power state
+        # until an interrupt occurs. On return from the interrupt,
+        # execution continues at the instruction following the Idle
+        # instruction." This tracer does not model interrupts arriving, so
+        # it advances straight to that following instruction -- the state
+        # the manual says execution reaches -- rather than stopping on an
+        # unmodeled halt.
+        emu = bool(_field(f, "emu"))
+        _event(state, insn, "idle", mode="emuidle" if emu else "idle")
+        return _advance(state, insn)
+    if name == "26a":
+        # SHARC+ Core Programming Reference p.16-19/16-20, Figure 16-13:
+        # SYNC, a fully fixed 48-bit word with no operand fields.
+        # "Ensures completion of all pending writes on the system
+        # interface as well as the internal memory (L1) interface. The
+        # core pipeline is stalled until SYNC completes." This tracer does
+        # not model write buffering or pipeline timing, so SYNC has no
+        # register or memory effect to apply; it just advances.
+        _event(state, insn, "sync")
+        return _advance(state, insn)
+    if name == "5a_swap":
+        # SHARC+ Core Programming Reference pp.13-37/13-38, Figure 13-14:
+        # Dreg <-> CDreg (the PEx Rn register swaps with its PEy
+        # complementary Sn register), with an optional condition and a
+        # parallel compute. This tracer's register file models only PEx
+        # (Rn); the PEy companion (Sn) is not tracked at all (see the
+        # "18a" ASTATY handling above for the same limitation on flags).
+        # Since Rn's new value after the swap is whatever untracked value
+        # was in Sn, that new value is Unknown -- there is nothing to
+        # concretely compute -- but the parallel compute and the
+        # condition/predicate-fork machinery are still modeled exactly
+        # like Type5a (move) above.
+        cond = _field(f, "cond")
+        old = dict(state.uregs)
+        try:
+            compute = _compute(
+                f, False, old, state.special, approx_recips=state.approx_recips
+            )
+        except ValueError as error:
+            return [_stop(state, insn, str(error))]
+        dreg = _field(f, "dreg")
+        cdreg = _field(f, "cdreg")
+        predicate = _predicate(state, cond)
+        if predicate is False:
+            _event(
+                state,
+                insn,
+                "dreg-swap-skipped",
+                dreg="R%d" % dreg,
+                condition=cond,
+                predicate_assumption=False,
+            )
+            return _advance(state, insn)
+        executed = state if predicate is True else _copy(state)
+        executed.uregs[dreg] = Unknown(
+            "Type5a swap from untracked complementary S%d" % cdreg
+        )
+        if compute is not None:
+            _apply_compute(executed, insn, compute)
+        _event(
+            executed,
+            insn,
+            "dreg-swap",
+            dreg="R%d" % dreg,
+            cdreg="S%d" % cdreg,
+            condition=cond,
+            predicate_assumption=True,
+        )
+        if predicate is True:
+            return _advance(executed, insn)
+        skipped = _copy(state)
+        _event(
+            skipped,
+            insn,
+            "dreg-swap-skipped",
+            dreg="R%d" % dreg,
+            condition=cond,
+            predicate_assumption=False,
+        )
+        return _advance(executed, insn) + _advance(skipped, insn)
+    if name == "4d":
+        # SHARC+ Core Programming Reference pp.13-32--13-35, Figure 13-12:
+        # a 48-bit re-encoding of Type4a's index+6-bit-immediate transfer
+        # that adds the byte/short access-width options Type4a itself does
+        # not support ("does not support compute option", p.13-32 NOTE),
+        # so unlike Type4a there is no compute field here. Same u/g/d/i
+        # layout and index arithmetic as Type4a and Type4b; the l/w/x
+        # width table is Type3b/4b's shared ACCESS_WIDTHS (l, x, w).
+        width_fields = (_field(f, "l"), _field(f, "x"), _field(f, "w"))
+        access_width = ACCESS_WIDTHS.get(width_fields)
+        if access_width is None:
+            return [_stop(state, insn, "unsupported Type4d access width")]
+        store = bool(_field(f, "d"))
+        if store and access_width.endswith("sign-extended"):
+            return [_stop(state, insn, "unsupported Type4d sign-extended store")]
+        if _field(f, "cond") != 0x1F:
+            return [_stop(state, insn, "unsupported Type4d predicate")]
+        widths = {
+            "normal-word": 4,
+            "byte": 1,
+            "byte-sign-extended": 1,
+            "short-word": 2,
+            "short-word-sign-extended": 2,
+            "long-word": 8,
+        }
+        width = widths[access_width]
+        bank = 8 if _field(f, "g") else 0
+        index = _field(f, "i") + bank
+        offset = _signed((_field(f, "data[5:5]") << 5) | _field(f, "data[4:0]"), 6)
+        offset *= _access_modifier_scale(access_width, state.assume_nw32)
+        post_modify = bool(_field(f, "u"))
+        space = "PM" if bank else "DM"
+        code = _field(f, "dreg")
+        iv = _ureg(state.uregs, 16 + index)
+        address = (
+            iv if post_modify else _add(iv, Const(offset), "I%d + %d" % (index, offset))
+        )
+        if store:
+            value = _ureg(state.uregs, code)
+            _event(
+                state,
+                insn,
+                "store",
+                space=space,
+                dreg="R%d" % code,
+                value=value,
+                address=address,
+                expression=_render(address),
+                concrete_write=_dm_write(state, address, width, value)
+                if space == "DM"
+                else False,
+                addressing_mode="post-modify" if post_modify else "pre-modify",
+                access_width=access_width,
+            )
+        else:
+            loaded = (
+                _load_normal_ureg(state, space, address, code)
+                if access_width == "normal-word"
+                else (
+                    _dm_read(state, address, width, access_width.endswith("sign-extended"))
+                    if space == "DM"
+                    else None
+                )
+            )
+            if access_width != "normal-word":
+                state.uregs[code] = loaded or Unknown("memory-address " + _render(address))
+            _event(
+                state,
+                insn,
+                "load",
+                space=space,
+                dreg="R%d" % code,
+                address=address,
+                expression=_render(address),
+                concrete_value=loaded,
+                addressing_mode="post-modify" if post_modify else "pre-modify",
+                access_width=access_width,
+            )
+        if post_modify:
+            state.uregs[16 + index] = _add(iv, Const(offset), "I%d + %d" % (index, offset))
+        return _advance(state, insn)
+    if name == "3d":
+        # SHARC+ Core Programming Reference pp.13-22--13-25, Figure 13-9: a
+        # 48-bit re-encoding of Type3a's index+M-register transfer that
+        # adds byte/short and exclusive-access options Type3a does not
+        # support ("extension to 3a instruction (exclusive access without
+        # compute option)", p.13-22 NOTE), so there is no compute field.
+        # w selects the ACCESS (0) vs WACCESS (1) group and ex marks an
+        # exclusive-access monitor this tracer does not model, matching
+        # the existing "14d" handler's ex=1 stop above; both are left
+        # unsupported here rather than guessed. The w=0/ex=0 ACCESS group
+        # is a plain normal-word transfer (l/x unused); w=0/ex=1 is
+        # BH/BHSE, the same (l, x, 0) slice of ACCESS_WIDTHS as Type3b/4d
+        # use, but always exclusive, so it also stops.
+        if _field(f, "w"):
+            return [_stop(state, insn, "unsupported Type3d WACCESS")]
+        if _field(f, "ex"):
+            return [_stop(state, insn, "unsupported Type3d exclusive access")]
+        access_width = "normal-word"
+        store = bool(_field(f, "d"))
+        bank = 8 if _field(f, "g") else 0
+        index, modifier = _field(f, "i") + bank, _field(f, "m") + bank
+        post_modify = bool(_field(f, "u"))
+        space = "PM" if bank else "DM"
+        ureg = _field(f, "ureg")
+        cond = _field(f, "cond")
+
+        def access3d(executed: State) -> None:
+            old = dict(executed.uregs)
+            iv, mv = _ureg(old, 16 + index), _ureg(old, 32 + modifier)
+            scale = _access_modifier_scale(access_width, executed.assume_nw32)
+            scaled_mv = _multiply(mv, Const(scale), "M%d * %d" % (modifier, scale))
+            address = (
+                iv
+                if post_modify
+                else _add(iv, scaled_mv, "I%d + M%d * %d" % (index, modifier, scale))
+            )
+            if store:
+                value = _ureg(old, ureg)
+                _event(
+                    executed,
+                    insn,
+                    "store",
+                    space=space,
+                    ureg=UREG_NAMES[ureg],
+                    value=value,
+                    address=address,
+                    expression=_render(address),
+                    concrete_write=_dm_write(executed, address, 4, value)
+                    if space == "DM"
+                    else False,
+                    addressing_mode="post-modify" if post_modify else "pre-modify",
+                    access_width=access_width,
+                )
+            else:
+                loaded = _load_normal_ureg(executed, space, address, ureg)
+                _event(
+                    executed,
+                    insn,
+                    "load",
+                    space=space,
+                    ureg=UREG_NAMES[ureg],
+                    address=address,
+                    expression=_render(address),
+                    concrete_value=loaded,
+                    addressing_mode="post-modify" if post_modify else "pre-modify",
+                    access_width=access_width,
+                )
+            if post_modify:
+                executed.uregs[16 + index] = _add(
+                    iv, scaled_mv, "I%d + M%d * %d" % (index, modifier, scale)
+                )
+
+        predicate = _predicate(state, cond)
+        if predicate is True:
+            access3d(state)
+            return _advance(state, insn)
+        if predicate is False:
+            _event(
+                state,
+                insn,
+                "type3d-skipped",
+                condition=cond,
+                predicate_assumption=False,
+            )
+            return _advance(state, insn)
+        executed, skipped = _copy(state), _copy(state)
+        access3d(executed)
+        _event(
+            skipped, insn, "type3d-skipped", condition=cond, predicate_assumption=False
+        )
+        return _advance(executed, insn) + _advance(skipped, insn)
+    if name in ("8p_undoc48", "21p_undoc16", "22p_undoc48"):
+        # Confirmed real (non-misaligned) code in places, but with no
+        # known semantics: docs/findings/05-sharc-isa-and-decoding.md
+        # marks what Type8p/Type22p words do as "Open" (lines 330, 528-
+        # 530), and this session's own sample of 21p_undoc16/22p_undoc48
+        # instances off the chosen render path (SW 0x16b8f1-0x16b930)
+        # found them clustered with other undecoded/gap forms and a
+        # garbage-offset "15a" (PM(I14 + 0xb8bd4a)), i.e. inside a run
+        # that looks like misaligned data, not confirmed instructions.
+        # Guessing an execution semantics for a jump/call-shaped
+        # (8p_undoc48) or fully unknown (21p/22p) opcode risks silently
+        # mistracing control flow, so this stops with the specific reason
+        # instead of the generic fallback below.
+        return [
+            _stop(
+                state,
+                insn,
+                "undocumented form %s has no confirmed semantics" % name,
+            )
+        ]
     return [_stop(state, insn, "unsupported form " + str(name))]
 
 
