@@ -1,0 +1,29 @@
+"""mypy check for the SHARC core and its concrete/symbolic entry points.
+
+The SHARC core (tools/sharc_core) also runs under PyPy 3.11
+(tests/test_pypy.py), so it is checked against Python 3.11 here too (see
+[tool.mypy] in pyproject.toml). Add a path here once it passes cleanly; the
+list should only grow.
+"""
+
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+TYPED = [
+    "tools/sharc_core",
+    "tools/sharc_run.py",
+    "tools/sharc_trace.py",
+]
+
+
+def test_mypy():
+    result = subprocess.run(
+        [sys.executable, "-m", "mypy", *TYPED],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

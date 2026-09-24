@@ -202,6 +202,8 @@ def _type_9a_abs(
             error = apply_compute(state)
             if error:
                 return [_stop(state, insn, error)]
+        if insn.length_bytes is None:
+            raise ValueError("cannot return from an instruction without a length")
         _event(state, insn, "return-branch", index="I12", modifier="M14")
         state.steps += 1
         state.pc_sw = state.pc_sw + insn.length_bytes // 2
@@ -270,6 +272,8 @@ def _type_9b_abs(
         mismatch = _check_return_target(state)
         if mismatch:
             return [_stop(state, insn, mismatch)]
+        if insn.length_bytes is None:
+            raise ValueError("cannot return from an instruction without a length")
         _event(state, insn, "return-branch", index="I12", modifier="M14")
         state.steps += 1
         state.pc_sw = state.pc_sw + insn.length_bytes // 2

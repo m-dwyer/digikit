@@ -362,7 +362,7 @@ def _type_19a(
     # register number (Table 17-2 and Figure 17-2).
     dst_low = src_low ^ _field(f, "idis")
     src, dst = src_low + bank, dst_low + bank
-    v = state.uregs.get(16 + src, Unknown("uninitialized I%d" % src))
+    v = _ureg(state.uregs, 16 + src)
     delta = _signed(_wide(f, "data"), 32)
     scale = 1
     scaled_width = None
@@ -401,15 +401,26 @@ def _type_19a(
                 candidate = _circular_wrap_const(
                     v.value, base.value, byte_length, delta
                 )
-                wrapped = candidate != (v.value + delta) & 0xFFFFFFFF
-                result = Const(candidate)
+                # byte_length >= abs(delta) and byte_length > 0 (the
+                # length==0 case already returned above), exactly
+                # _circular_wrap_const's own precondition for a non-None
+                # result -- but state that explicitly, matching how the
+                # other two call sites in this file (Type7a/7b MODIFY)
+                # handle its documented None case, rather than assuming it.
+                if candidate is None:
+                    result = Unknown("circular modifier is not smaller than L%d" % src)
+                else:
+                    wrapped = candidate != (v.value + delta) & 0xFFFFFFFF
+                    result = Const(candidate)
         else:
             bounded = _stack_bounded_symbol(v)
-            byte_length = length.value * scale if isinstance(length, Const) else None
+            known_byte_length = (
+                length.value * scale if isinstance(length, Const) else None
+            )
             if (
                 bounded is not None
-                and byte_length is not None
-                and abs(bounded[1]) < byte_length
+                and known_byte_length is not None
+                and abs(bounded[1]) < known_byte_length
             ):
                 # v has no proof yet of its own concrete value, but it
                 # is a symbol some caller has already bounded (an

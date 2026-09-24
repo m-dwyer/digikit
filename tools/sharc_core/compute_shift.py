@@ -32,31 +32,40 @@ from .flags import (
     _astatx_shift,
 )
 from .state import _ureg
-from .values import Const, Unknown, Value, _bitwise, _signed, _signed32
+from .values import (
+    ComputeResult,
+    Const,
+    Operand,
+    Unknown,
+    Value,
+    _bitwise,
+    _signed,
+    _signed32,
+)
 
 Handler = Callable[
     [
         int,
         int,
         int,
-        Value,
-        Value,
+        Operand,
+        Operand,
         Mapping[int, Value],
-        Mapping[str, Value] | None,
+        Mapping[str, Operand] | None,
         bool,
     ],
-    tuple,
+    ComputeResult,
 ]
 
 
 def _field_deposit_or(
-    dest: Value,
-    source: Value,
+    dest: Operand,
+    source: Operand,
     position: int,
     length: int,
     sign_extend: bool,
     label: str,
-) -> Value:
+) -> Operand:
     """RN = RN or fdep RX by BIT6:LEN6[(SE)] (PGR p.11-70/11-74, cross-
     checked against compute_table.json's shiftop_shiftimm rows 011011/
     011101): deposits the low LENGTH bits of SOURCE at bit POSITION of DEST
@@ -80,8 +89,8 @@ def _field_deposit_or(
 def _shift_immediate(
     f: Mapping[str, int],
     values: Mapping[int, Value],
-    special: Mapping[str, Value] | None = None,
-) -> tuple[int | str | tuple, Value, str, Callable[[Value], Value]]:
+    special: Mapping[str, Operand] | None = None,
+) -> ComputeResult:
     """Execute the documented ShiftImm subset seen on qualifying paths.
 
     SPECIAL is the same special-register mapping ``_compute`` reads MRF
@@ -261,15 +270,17 @@ def _shift_immediate(
         if no_update:
             return rn, value, "bit-extract-nu", _astatx_from_updates(updates)
         old_wrp = (special or {}).get("BFFWRP")
-        new_wrp = (
+        wrp_after: Operand = (
             Const(old_wrp.value - bitlen12)
             if isinstance(old_wrp, Const)
             else Unknown("uninitialized BFFWRP")
         )
-        updates[SF_BIT] = new_wrp.value >= 32 if isinstance(new_wrp, Const) else None
+        updates[SF_BIT] = (
+            wrp_after.value >= 32 if isinstance(wrp_after, Const) else None
+        )
         return (
             (rn, "BFFWRP"),
-            (value, new_wrp),
+            (value, wrp_after),
             "bit-extract",
             _astatx_from_updates(updates),
         )
@@ -281,6 +292,7 @@ def _shift_immediate(
 # shift; magnitudes of 32 or more produce zero.
 def shift_logical(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
     amount: int | None = None
+    value: Operand
     if not isinstance(right, Const):
         value = Unknown("lshift R%d by R%d" % (rx, ry))
     else:
@@ -309,6 +321,7 @@ def shift_logical(rn, rx, ry, left, right, values, special, approx_recips) -> tu
 # task only; not part of the tracked tool.
 def shift_arithmetic(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
     amount = None
+    value: Operand
     if not isinstance(right, Const):
         value = Unknown("ashift R%d by R%d" % (rx, ry))
     else:
@@ -336,6 +349,7 @@ def shift_arithmetic(rn, rx, ry, left, right, values, special, approx_recips) ->
 # shared, then ORed into RN instead of replacing it.
 def shift_logical_or(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
     or_amount: int | None = None
+    shifted: Operand
     if not isinstance(right, Const):
         shifted = Unknown("lshift R%d by R%d" % (rx, ry))
     else:
@@ -372,6 +386,7 @@ def shift_leftz(rn, rx, ry, left, right, values, special, approx_recips) -> tupl
 # PGR p.11-83 (pgr.txt:23171): SHIFTOP 10001100 is RN = LEFTO RX --
 # leading 1s, the complement of leftz above (leading 0s of ~RX).
 def shift_lefto(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    value: Operand
     if isinstance(left, Const):
         inverted = (~left.value) & 0xFFFFFFFF
         value = Const(32 if inverted == 0 else 32 - inverted.bit_length())
@@ -383,6 +398,7 @@ def shift_lefto(rn, rx, ry, left, right, values, special, approx_recips) -> tupl
 # PRM Table 18-9: SHIFTOP 11000000/11000100 are variable bit set/clear.
 def _shift_bitset_impl(rn, rx, ry, left, right, opcode: int) -> tuple:
     name = "bset" if opcode == 0xC0 else "bclr"
+    value: Operand
     if not isinstance(right, Const):
         value = Unknown("%s R%d by R%d" % (name, rx, ry))
     elif right.value > 31:
@@ -412,6 +428,7 @@ def shift_bclr(rn, rx, ry, left, right, values, special, approx_recips) -> tuple
 # RN = btgl RX by RY.  Positions outside the 32-bit field leave RX
 # unchanged.
 def shift_btgl(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    value: Operand
     if not isinstance(right, Const):
         value = Unknown("btgl R%d by R%d" % (rx, ry))
     elif right.value > 31:

@@ -21,20 +21,29 @@ from .flags import (
 )
 from .floats import _float32, _float32_bits
 from .state import _ureg
-from .values import Const, Unknown, Value, _add, _multiply, _multiply_fractional
+from .values import (
+    ComputeResult,
+    Const,
+    Operand,
+    Unknown,
+    Value,
+    _add,
+    _multiply,
+    _multiply_fractional,
+)
 
 Handler = Callable[
     [
         int,
         int,
         int,
-        Value,
-        Value,
+        Operand,
+        Operand,
         Mapping[int, Value],
-        Mapping[str, Value] | None,
+        Mapping[str, Operand] | None,
         bool,
     ],
-    tuple,
+    ComputeResult,
 ]
 
 
@@ -57,8 +66,8 @@ def _mr_data_move(
     rn: int,
     direction: int,
     values: Mapping[int, Value],
-    special: Mapping[str, Value] | None,
-) -> tuple[int | str, Value, str, Callable[[Value], Value]]:
+    special: Mapping[str, Operand] | None,
+) -> ComputeResult:
     """PRM Table 18-29 MRDATAMOVE (p.438): moves a 32-bit value between the
     register file and one of the six banked multiplier-result registers.
     MR0F is the low 32 bits of the same 80-bit accumulator the
@@ -83,7 +92,7 @@ def _mr_data_move(
 
 
 def multiply_accumulate_mrf(
-    rx: int, ry: int, values: Mapping[int, Value], special: Mapping[str, Value] | None
+    rx: int, ry: int, values: Mapping[int, Value], special: Mapping[str, Operand] | None
 ) -> tuple:
     """PRM multiplier compute table: MRF = MRF + RX * RY (MOD1). Preserve
     the accumulator separately from the UREG file so later MR transfers do
@@ -103,7 +112,7 @@ def multiply_add_mrf(
     rx: int,
     ry: int,
     values: Mapping[int, Value],
-    special: Mapping[str, Value] | None,
+    special: Mapping[str, Operand] | None,
 ) -> tuple:
     accumulator = (special or {}).get("MRF", Unknown("uninitialized MRF"))
     product = _multiply(_ureg(values, rx), _ureg(values, ry), "R%d * R%d" % (rx, ry))
@@ -142,6 +151,7 @@ def mult_raw_ssi(rn, rx, ry, left, right, values, special, approx_recips) -> tup
 # IEEE NaN propagation applies.
 def mult_float(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
     a, b = _float32(left), _float32(right)
+    value: Operand
     if a is None or b is None:
         value = Unknown("F%d * F%d" % (rx, ry))
     else:

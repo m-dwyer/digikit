@@ -339,16 +339,16 @@ def trace(
             if child.stopped:
                 done.append(child)
                 continue
-            key = _dedupe_key(child)
-            existing = active.get(key)
+            dedupe_key = _dedupe_key(child)
+            existing = active.get(dedupe_key)
             if existing is not None:
                 # Keep the copy that has used less of --max-steps.
                 if child.steps < existing.steps:
-                    active[key] = child
+                    active[dedupe_key] = child
             elif len(active) + len(done) >= max_states:
                 done.append(_stop(child, None, "max-states"))
             else:
-                active[key] = child
+                active[dedupe_key] = child
     return done
 
 
@@ -636,7 +636,7 @@ def main(argv=None) -> int:
         )
     except ValueError as error:
         p.error(str(error))
-    result = [
+    result: list[dict[str, Any]] = [
         {
             "stopped": s.stopped,
             "steps": s.steps,

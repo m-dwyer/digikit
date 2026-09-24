@@ -25,6 +25,7 @@ from .state import (
 )
 from .values import (
     Const,
+    Operand,
     Unknown,
     Value,
     _add,
@@ -81,8 +82,8 @@ def _dm_read(
         concrete in CORE_MMR_RESET_VALUES or name_address(concrete) is not None
     )
     if width == 4 and fixed_width_mmr and concrete in state.mmrs:
-        value = state.mmrs[concrete]
-        return value if isinstance(value, Const) else None
+        mmr_value = state.mmrs[concrete]
+        return mmr_value if isinstance(mmr_value, Const) else None
     if width == 4 and fixed_width_mmr and state.data_memory_tainted:
         return None
     if (
@@ -250,8 +251,8 @@ _SIMD_COMPANION_WIDTHS = frozenset({"normal-word"})
 
 
 def _simd_ureg_mem_companion(
-    state: State, code: int, address: Value, access_width: str = "normal-word"
-) -> tuple[int, Value] | None:
+    state: State, code: int, address: Operand, access_width: str = "normal-word"
+) -> tuple[int, Operand] | None:
     """The SIMD companion (Cureg code, companion address) for a single
     UREG<->memory transfer, or None when no companion transfer applies
     (SISD mode, or a UREG with no SIMD complement -- SHARC+ PRM p.15-12's

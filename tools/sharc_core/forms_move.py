@@ -193,11 +193,13 @@ def _type_14a(
                 simd_companion_possible=False,
             )
         else:
-            values = tuple(
+            loaded_values = tuple(
                 _dm_read(state, address + 4 * offset, 4) for offset in range(2)
             )
-            for item, value, offset in zip(pair, values, range(2), strict=True):
-                state.uregs[item] = value or Unknown(
+            for item, mem_value, offset in zip(
+                pair, loaded_values, range(2), strict=True
+            ):
+                state.uregs[item] = mem_value or Unknown(
                     "memory-address " + _render(Const(address + 4 * offset))
                 )
             _event(
@@ -212,7 +214,7 @@ def _type_14a(
                     _json_value(value)
                     if value is not None
                     else {"unknown": "unavailable memory"}
-                    for value in values
+                    for value in loaded_values
                 ],
                 access_width="long-word",
                 simd_companion_possible=False,
@@ -419,8 +421,16 @@ def _type_5a_move(
     executed = state if predicate is True else _copy(state)
     # The Type 5a data move and compute both consume the pre-instruction file.
     executed.uregs[dst] = copied
+    simd_companion = None
     if simd_companion_source is not None:
+        # simd_companion_source is only ever set inside the "cureg_dst is
+        # not None" branch above, so this implies cureg_dst is not None too.
+        assert cureg_dst is not None
         executed.uregs[cureg_dst] = _ureg(old, simd_companion_source)
+        simd_companion = {
+            "source": UREG_NAMES[simd_companion_source],
+            "destination": UREG_NAMES[cureg_dst],
+        }
     if compute is not None:
         _apply_compute(executed, insn, compute)
     _event(
@@ -431,14 +441,7 @@ def _type_5a_move(
         destination=UREG_NAMES[dst],
         condition=cond,
         predicate_assumption=True,
-        simd_companion=(
-            {
-                "source": UREG_NAMES[simd_companion_source],
-                "destination": UREG_NAMES[cureg_dst],
-            }
-            if simd_companion_source is not None
-            else None
-        ),
+        simd_companion=simd_companion,
     )
     if predicate is True:
         return _advance(executed, insn)
@@ -879,7 +882,7 @@ def _type_15b(
     # unqualified (non-LW) displacement four bytes wide.
     if state.assume_nw32 and not _field(f, "l"):
         offset *= 4
-    iv = state.uregs.get(16 + index, Unknown("uninitialized I%d" % index))
+    iv = _ureg(state.uregs, 16 + index)
     address = _add(iv, Const(offset), "I%d + %d" % (index, offset))
     code = _field(f, "ureg")
     width = 8 if _field(f, "l") else 4
@@ -976,12 +979,12 @@ def _type_15a(
                 simd_companion_possible=False,
             )
         else:
-            values = tuple(
+            loaded_values = tuple(
                 _dm_read(state, offset_address, 4) if space == "DM" else None
                 for offset_address in offsets
             )
-            for item, value in zip(pair, values, strict=True):
-                state.uregs[item] = value or Unknown("memory-address " + rendered)
+            for item, mem_value in zip(pair, loaded_values, strict=True):
+                state.uregs[item] = mem_value or Unknown("memory-address " + rendered)
             _event(
                 state,
                 insn,
@@ -994,7 +997,7 @@ def _type_15a(
                     _json_value(value)
                     if value is not None
                     else {"unknown": "unavailable memory"}
-                    for value in values
+                    for value in loaded_values
                 ],
                 access_width="long-word",
                 simd_companion_possible=False,
@@ -1272,6 +1275,10 @@ def _type_4d(
             )
         )
         if access_width != "normal-word":
+            # The dict[str, int] PX1/PX2 summary only comes back from the
+            # access_width == "normal-word" branch above (_load_normal_ureg's
+            # combined-PX case), which this guard excludes.
+            assert not isinstance(loaded, dict)
             state.uregs[code] = loaded or Unknown("memory-address " + _render(address))
         _event(
             state,

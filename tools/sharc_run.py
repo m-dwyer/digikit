@@ -108,7 +108,7 @@ def reset_uregs(
     unseeded UREG as ``Unknown`` -- exactly the thing a concrete, single-path
     run cannot tolerate, since it is what forces a fork or a stop.
     """
-    uregs = {
+    uregs: dict[int, st.Value] = {
         code: st.Const(st.CORE_UREG_RESET_VALUES.get(name, 0))
         for code, name in enumerate(st.UREG_NAMES)
     }
@@ -136,9 +136,9 @@ def make_state(
             "sharc_run needs a LoadedMemory image; concrete execution has "
             "nothing else to read memory from"
         )
-    combined_regs: dict[str | int, int | str] = dict(DEFAULT_REGS)
+    combined_regs: dict[str | int, int | str] = dict(DEFAULT_REGS.items())
     combined_regs.update(regs or {})
-    mmrs = {
+    mmrs: dict[int, st.Value] = {
         address: st.Const(value) for address, value in st.CORE_MMR_RESET_VALUES.items()
     }
     state = st.State(
@@ -266,6 +266,10 @@ class Runner:
         if state.stopped:
             raise Halt(state.stopped, state.pc_sw, insn.type_name, insn.note)
         self.instructions += 1
+        # sharc_disasm.disassemble() always sets type_name to a decode-table
+        # name or the literal string "unknown", never None (see the same
+        # assertion in sharc_core/forms.py's _execute).
+        assert insn.type_name is not None, "instruction with no type_name"
         self.form_counts[insn.type_name] += 1
         depth = len(state.call_stack)
         if depth > self.max_call_depth_reached:
@@ -370,7 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             int(value, 0) if value.lower().startswith("0x") else int(value, 16)
         )
 
-    regs: dict[str, int] = {}
+    regs: dict[str | int, int | str] = {}
     for name, value in _parse_kv(a.regs, "--reg").items():
         regs[name] = int(value, 0)
 

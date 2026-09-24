@@ -21,6 +21,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "mypy==2.3.1",
     "pytest>=8",
     "ruff==0.16.9",
 ]
@@ -44,3 +45,13 @@ ignore = [
     "E501",   # line length is the formatter's job
     "UP031",  # %-formatting is the house style
 ]
+
+# tests/test_types.py runs mypy on the files listed there. The SHARC core
+# also runs under PyPy, which supports Python 3.11, so check against 3.11.
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "tools"
+ignore_missing_imports = true
+check_untyped_defs = true
+follow_imports = "silent"
+warn_unused_ignores = true

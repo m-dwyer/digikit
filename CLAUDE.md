@@ -87,6 +87,9 @@ current state and next steps in the newest `HANDOVER-*.md` in the repo root.
 - Lint: rules are in `pyproject.toml`. `tests/test_lint.py` runs `ruff check`
   and `ruff format --check` on its `CLEAN` list; new files start clean and go
   on the list, and a file joins it when you clean it.
+- Types: `tests/test_types.py` runs mypy (config in `pyproject.toml`, checked
+  as Python 3.11) on its `TYPED` list. The SHARC core must also run under
+  PyPy 3.11: `tests/test_pypy.py` (slow) runs its tests there.
 - The shell is zsh: an unquoted `$VAR` is one word, not split. There is no
   `timeout` binary.
 - The rtk hook shortens some output: use `rtk proxy git log` for the full log.

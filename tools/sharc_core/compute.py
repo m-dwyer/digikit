@@ -63,7 +63,7 @@ from .compute_shift import SHIFT_OPS, _field_deposit_or, _shift_immediate
 from .encoding import ALU_FLAGS_MASK, SHIFT_FLAGS_MASK, UREG_CODES, _field
 from .flags import _astatx_forget
 from .state import State, _event, _json_value, _simd_active, _ureg, _ureg_raw
-from .values import Unknown, Value
+from .values import ComputeResult, Operand, Unknown, Value
 
 __all__ = [
     "MR_DATAMOVE_REGISTERS",
@@ -123,10 +123,10 @@ def _compute(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Mapping[str, Value] | None = None,
+    special: Mapping[str, Operand] | None = None,
     *,
     approx_recips: bool = False,
-) -> tuple[int | str, Value, str, Callable[[Value], Value]] | None:
+) -> ComputeResult | None:
     """Decode the small public-table subset, reading every operand from VALUES.
 
     The 4th element of a non-None result is an ASTATX updater: a function
@@ -162,10 +162,10 @@ def _compute(
     if short:
         opcode, rn, rx = (field >> 8) & 0xF, (field >> 4) & 0xF, field & 0xF
         left, right = _ureg(values, rn), _ureg(values, rx)
-        handler = SHORT_OPS.get(opcode)
-        if handler is None:
+        short_handler = SHORT_OPS.get(opcode)
+        if short_handler is None:
             raise ValueError("unsupported short compute opcode %#x" % opcode)
-        return handler(rn, rx, left, right)
+        return short_handler(rn, rx, left, right)
     # PRM Table 18-1/Figure 18-1 (p.423): bit22 is MF, the multifunction
     # selector. A multifunction op's register sub-fields (PRM Table
     # 18-15..18-19, p.434-435) do not line up with the SINGLEFN rn/rx/ry
@@ -187,9 +187,9 @@ def _compute(
         operands = MultifnOperands(
             rm, ra, rxm_reg, rym_reg, rxa_reg, rya_reg, fxm, fym, fxa, fya
         )
-        handler = MULTIFN_MUL_ALU_OPS.get(category)
-        if handler is not None:
-            return handler(category, operands)
+        multifn_handler = MULTIFN_MUL_ALU_OPS.get(category)
+        if multifn_handler is not None:
+            return multifn_handler(category, operands)
         if (category >> 4) == 0b11:
             return multifn_dual_mul_add_subtract(category, operands)
         raise ValueError(
@@ -209,21 +209,26 @@ def _compute(
         rs = opcode & 0xF
         return dual_add_subtract(rn, rs, rx, ry, left, right, float_form)
     table = _SINGLE_FUNCTION_TABLES.get(cu)
-    handler = table.get(opcode) if table else None
-    if handler is None:
+    single_handler = table.get(opcode) if table else None
+    if single_handler is None:
         raise ValueError("unsupported full compute cu=%#x opcode=%#x" % (cu, opcode))
-    return handler(rn, rx, ry, left, right, values, special, approx_recips)
+    return single_handler(rn, rx, ry, left, right, values, special, approx_recips)
 
 
 def _apply_compute(
     state: State,
     insn: Instruction,
-    result: tuple[int | str, Value, str, Callable[[Value], Value]],
+    result: ComputeResult,
 ) -> None:
     rn, value, operation, astatx_update = result
     astatx_code = UREG_CODES["ASTATX"]
     state.uregs[astatx_code] = astatx_update(_ureg_raw(state.uregs, astatx_code))
     if isinstance(rn, str):
+        # A string RN never pairs with a tuple VALUE (see the tuple-RN
+        # branch below for the only case that returns more than one
+        # value); state this real correlation explicitly since ComputeDest
+        # and ComputeValue vary independently in the type system.
+        assert not isinstance(value, tuple), "string RN with tuple value"
         _event(
             state,
             insn,
@@ -245,6 +250,7 @@ def _apply_compute(
         # by the caller (PRM p.3-21/3-22). A string destination is a
         # special-dict slot (as in the single-string case above); an int is
         # an ordinary register.
+        assert isinstance(value, tuple), "tuple RN without tuple value"
         names = [reg if isinstance(reg, str) else "R%d" % reg for reg in rn]
         _event(
             state,
@@ -260,6 +266,7 @@ def _apply_compute(
             else:
                 state.uregs[reg] = val
         return
+    assert not isinstance(value, tuple), "int RN with tuple value"
     if operation in ("compare", "bit-test", "float-compare"):
         _event(state, insn, "compute", operation=operation, status_only=True)
     else:
@@ -298,10 +305,10 @@ def _compute_pey(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Mapping[str, Value] | None = None,
+    special: Mapping[str, Operand] | None = None,
     *,
     approx_recips: bool = False,
-) -> tuple[int | str, Value, str, Callable[[Value], Value]] | None:
+) -> ComputeResult | None:
     """PEy's half of a SIMD compute (SHARC+ PRM p.101, "SIMD Mode":
     "Executes the same instruction simultaneously in both processing
     elements"), decoded against the S/SF register file and the PEy
@@ -326,7 +333,7 @@ def _compute_pey(
 def _apply_compute_pey(
     state: State,
     insn: Instruction,
-    result: tuple[int | str, Value, str, Callable[[Value], Value]],
+    result: ComputeResult,
 ) -> None:
     """PEy's half of _apply_compute: the identical shape, redirected to the
     S/SF register file, REGF_ASTATY, and the PEy multiplier accumulator
@@ -336,6 +343,9 @@ def _apply_compute_pey(
     astaty_code = UREG_CODES["ASTATY"]
     state.uregs[astaty_code] = astatx_update(_ureg_raw(state.uregs, astaty_code))
     if isinstance(rn, str):
+        # A string RN never pairs with a tuple VALUE, matching
+        # _apply_compute's own invariant (see its comment there).
+        assert not isinstance(value, tuple), "string RN with tuple value"
         _event(
             state,
             insn,
@@ -347,7 +357,15 @@ def _apply_compute_pey(
         state.special["MSF"] = value
         return
     if isinstance(rn, tuple):
-        names = ["S%d" % reg for reg in rn]
+        assert isinstance(value, tuple), "tuple RN without tuple value"
+        # Unlike _apply_compute, no PEy result names a special-dict
+        # (string) destination in a tuple result: only the multifunction
+        # dual/triple ALU rows produce a tuple RN here, and their
+        # destinations are always ordinary S-register numbers.
+        names = []
+        for reg in rn:
+            assert isinstance(reg, int), "PEy tuple RN must be int-only"
+            names.append("S%d" % reg)
         _event(
             state,
             insn,
@@ -357,8 +375,10 @@ def _apply_compute_pey(
             value=[_json_value(v) for v in value],
         )
         for reg, val in zip(rn, value, strict=True):
+            assert isinstance(reg, int), "PEy tuple RN must be int-only"
             state.uregs[80 + reg] = val
         return
+    assert not isinstance(value, tuple), "int RN with tuple value"
     if operation in ("compare", "bit-test", "float-compare"):
         _event(state, insn, "compute-pey", operation=operation, status_only=True)
     else:
@@ -381,12 +401,12 @@ def _compute_simd(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Mapping[str, Value] | None = None,
+    special: Mapping[str, Operand] | None = None,
     *,
     approx_recips: bool = False,
 ) -> tuple[
-    tuple[int | str, Value, str, Callable[[Value], Value]] | None,
-    tuple[int | str, Value, str, Callable[[Value], Value]] | None,
+    ComputeResult | None,
+    ComputeResult | None,
 ]:
     """Decode a compute for PEx, and for PEy too when MODE1.PEYEN is
     concretely set (SHARC+ PRM p.101, "SIMD Mode": "Dispatches a single
@@ -404,8 +424,8 @@ def _compute_simd(
 def _apply_compute_simd(
     state: State,
     insn: Instruction,
-    result_x: tuple[int | str, Value, str, Callable[[Value], Value]] | None,
-    result_y: tuple[int | str, Value, str, Callable[[Value], Value]] | None,
+    result_x: ComputeResult | None,
+    result_y: ComputeResult | None,
 ) -> None:
     if result_x is not None:
         _apply_compute(state, insn, result_x)

@@ -6,6 +6,7 @@ Moved verbatim from tools/sharc_trace.py.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -73,6 +74,27 @@ class PartialConst:
 
 
 Value = Const | Affine | Unknown | PartialConst
+# The generic arithmetic below (_add/_negate/_subtract/_multiply/_bitwise/
+# _not/_terms) must never see a PartialConst: per state.py's _ureg/_ureg_raw
+# docstrings, PartialConst is only ever stored at ASTATX/ASTATY and _ureg
+# (the function every arithmetic/addressing call site uses to read a UREG)
+# already converts it to Const or Unknown before it can reach here. _terms
+# would raise AttributeError on a PartialConst (it has no .value/.constant),
+# so Operand states that invariant in the type system instead of leaving it
+# only as a comment.
+Operand = Const | Affine | Unknown
+# A ``_compute`` handler's result shape (compute.py's ``_apply_compute`` and
+# friends): most handlers name one destination and one value, but a handful
+# -- dual add/subtract, the MUL/ALU multifunction rows, ShiftImm's paired
+# RN+BFFWRP bit-extract -- name two or three of each at once, sharing one
+# ASTATX/ASTATY update between them. Both shapes flow through the same
+# tuple position, so the position's type is the union of the two.
+ComputeDest = int | str | tuple[int | str, ...]
+ComputeValue = Operand | tuple[Operand, ...]
+# A handler's 4th element is an ASTATX/ASTATY updater: a function from the
+# old (possibly PartialConst) flag value to the new one, so it stays in
+# terms of the full Value, unlike ComputeValue above.
+ComputeResult = tuple[ComputeDest, ComputeValue, str, Callable[[Value], Value]]
 _SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -136,7 +158,7 @@ def _stack_bounded_symbol(value: Value) -> tuple[str, int] | None:
     return None
 
 
-def _add(left: Value, right: Value, expression: str) -> Value:
+def _add(left: Operand, right: Operand, expression: str) -> Operand:
     if isinstance(left, Unknown) or isinstance(right, Unknown):
         return Unknown(expression)
     constant, terms = _terms(left)
@@ -144,7 +166,7 @@ def _add(left: Value, right: Value, expression: str) -> Value:
     return _affine(constant + other_constant, terms + other_terms)
 
 
-def _negate(value: Value, expression: str) -> Value:
+def _negate(value: Operand, expression: str) -> Operand:
     if isinstance(value, Unknown):
         return Unknown(expression)
     constant, terms = _terms(value)
@@ -154,8 +176,8 @@ def _negate(value: Value, expression: str) -> Value:
 
 
 def _subtract(
-    left: Value, right: Value, expression: str, *, same_source: bool = False
-) -> Value:
+    left: Operand, right: Operand, expression: str, *, same_source: bool = False
+) -> Operand:
     """LEFT - RIGHT, with an explicit fold for the self-subtract idiom.
 
     SAME_SOURCE=True is the caller's promise that LEFT and RIGHT are two
@@ -172,7 +194,7 @@ def _subtract(
     return _add(left, _negate(right, expression), expression)
 
 
-def _multiply(left: Value, right: Value, expression: str) -> Value:
+def _multiply(left: Operand, right: Operand, expression: str) -> Operand:
     if isinstance(left, Unknown) or isinstance(right, Unknown):
         return Unknown(expression)
     if isinstance(left, Const) and isinstance(right, Const):
@@ -193,8 +215,8 @@ def _multiply(left: Value, right: Value, expression: str) -> Value:
 
 
 def _multiply_fractional(
-    left: Value, right: Value, signed_x: bool, signed_y: bool, expression: str
-) -> Value:
+    left: Operand, right: Operand, signed_x: bool, signed_y: bool, expression: str
+) -> Operand:
     """RX * RY MOD1 in 1.31/0.32 fractional format (PRM "Fixed-Point
     Formats", p.27-3/27-4): a 32-bit fractional operand's value is its raw
     bit pattern scaled by 2**-31 (signed) or 2**-32 (unsigned), so the
@@ -248,13 +270,13 @@ def _aconv(value: Value, w2b: bool, source_code: int, pc_sw: int) -> Value:
     return _aconv_symbol(value, "b2w", source_code, pc_sw)
 
 
-def _bitwise(left: Value, right: Value, expression: str, operation) -> Value:
+def _bitwise(left: Operand, right: Operand, expression: str, operation) -> Operand:
     if isinstance(left, Const) and isinstance(right, Const):
         return Const(operation(left.value, right.value))
     return Unknown(expression)
 
 
-def _not(value: Value, expression: str) -> Value:
+def _not(value: Operand, expression: str) -> Operand:
     return Const(~value.value) if isinstance(value, Const) else Unknown(expression)
 
 

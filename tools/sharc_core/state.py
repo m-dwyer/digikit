@@ -18,6 +18,7 @@ from .encoding import (
 from .values import (
     Affine,
     Const,
+    Operand,
     PartialConst,
     Unknown,
     Value,
@@ -75,7 +76,7 @@ class State:
     core_reset_state: bool = False
     mmrs: dict[int, Value] = field(default_factory=dict)
     data_memory_tainted: bool = False
-    special: dict[str, Value] = field(default_factory=dict)
+    special: dict[str, Operand] = field(default_factory=dict)
     # Forms this run may execute although the table marks them unconfirmed,
     # and the ones it actually did. A state that used any is calibration.
     provisional_forms: tuple[str, ...] = ()
@@ -211,7 +212,7 @@ def _ureg_raw(values: Mapping[int, Value], code: int) -> Value:
     return values.get(code, Unknown("uninitialized " + UREG_NAMES[code]))
 
 
-def _ureg(values: Mapping[int, Value], code: int) -> Value:
+def _ureg(values: Mapping[int, Value], code: int) -> Operand:
     """Read UREG CODE as a value any generic consumer can handle.
 
     A PartialConst (only ever stored at ASTATX/ASTATY) never escapes this

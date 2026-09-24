@@ -56,6 +56,7 @@ from .floats import (
 from .state import _ureg_raw
 from .values import (
     Const,
+    Operand,
     Unknown,
     Value,
     _add,
@@ -86,8 +87,8 @@ def dual_add_subtract(
     rs: int,
     rx: int,
     ry: int,
-    left: Value,
-    right: Value,
+    left: Operand,
+    right: Operand,
     float_form: bool,
 ) -> tuple:
     """PRM Table 18-10 (p.433) / Table 18-13 (p.434): Dual Add/Subtract is a
@@ -157,6 +158,7 @@ def _alu_carry_impl(rn, rx, ry, left, right, values, subtract: bool) -> tuple:
         ry,
         " - 1" if subtract else "",
     )
+    value: Operand
     if carry_in is None:
         value = Unknown(label)
     else:
@@ -196,6 +198,7 @@ def _alu_carry_noy_impl(rn, rx, left, values, subtract: bool) -> tuple:
     astatx = _ureg_raw(values, UREG_CODES["ASTATX"])
     carry_in = _astatx_known_bit(astatx, AC_BIT)
     label = "R%d + ci%s" % (rx, " - 1" if subtract else "")
+    value: Operand
     if carry_in is None:
         value = Unknown(label)
     else:
@@ -481,6 +484,7 @@ def alu_float_scalb(rn, rx, ry, left, right, values, special, approx_recips) -> 
 # for pass/not/and/or/xor.
 def _alu_minmax_fixed_impl(rn, rx, ry, left, right, minimum: bool) -> tuple:
     name = "min" if minimum else "max"
+    value: Operand
     if isinstance(left, Const) and isinstance(right, Const):
         a, b = _signed32(left.value), _signed32(right.value)
         pick_left = (a <= b) if minimum else (a >= b)

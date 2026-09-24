@@ -46,6 +46,11 @@ def _execute(state: State, insn: Instruction) -> list[State]:
             )
     state.at_loaded_entry = False
     f, name = insn.fields, insn.type_name
+    # sharc_disasm.disassemble() only ever sets type_name to a decode-table
+    # entry's name or the literal string "unknown" -- never None -- despite
+    # the field's wider declared type (Instruction's own docstring: "the
+    # TYPES name ..., or 'unknown'").
+    assert name is not None, "instruction with no type_name"
     handler = FORMS.get(name)
     if handler is not None:
         return handler(state, insn, f, name)
