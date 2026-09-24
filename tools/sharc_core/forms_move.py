@@ -8,22 +8,29 @@ family tables.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import List, Optional
 
 from sharc_disasm import Instruction
 
+from .compute import (
+    _apply_compute,
+    _compute,
+)
 from .encoding import (
     ACCESS_WIDTHS,
     UREG_NAMES,
     _field,
     _wide,
 )
-from .values import (
-    Const,
-    Unknown,
-    _add,
-    _multiply,
-    _signed,
+from .memory import (
+    _access_modifier_scale,
+    _dm_read,
+    _dm_write,
+    _load_normal_ureg,
+    _simd_ureg_mem_companion,
+)
+from .sequencer import (
+    _advance,
+    _predicate,
 )
 from .state import (
     State,
@@ -36,26 +43,18 @@ from .state import (
     _stop,
     _ureg,
 )
-from .memory import (
-    _access_modifier_scale,
-    _dm_read,
-    _dm_write,
-    _load_normal_ureg,
-    _simd_ureg_mem_companion,
-)
-from .compute import (
-    _apply_compute,
-    _compute,
-)
-from .sequencer import (
-    _advance,
-    _predicate,
+from .values import (
+    Const,
+    Unknown,
+    _add,
+    _multiply,
+    _signed,
 )
 
 
 def _type_17a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """17a, 17b."""
     value = _wide(f, "data") if name == "17a" else _signed(_field(f, "data[15:0]"), 16)
     code = _field(f, "ureg")
@@ -66,7 +65,7 @@ def _type_17a(
 
 def _type_3a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """3a."""
     # PRM Type 3a is a conditional compute plus one normal-word DM/PM
     # transfer. Table 13-1's syntax row is "IF cond compute, DM(Ia,Mb)
@@ -162,7 +161,7 @@ def _type_3a(
 
 def _type_14a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """14a."""
     if _field(f, "l"):
         code = _field(f, "ureg")
@@ -197,7 +196,7 @@ def _type_14a(
             values = tuple(
                 _dm_read(state, address + 4 * offset, 4) for offset in range(2)
             )
-            for item, value, offset in zip(pair, values, range(2)):
+            for item, value, offset in zip(pair, values, range(2), strict=True):
                 state.uregs[item] = value or Unknown(
                     "memory-address " + _render(Const(address + 4 * offset))
                 )
@@ -290,7 +289,7 @@ def _type_14a(
 
 def _type_14d(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """14d."""
     # SHARC+ Core Programming Reference (out/refs/sharc-plus-prm)
     # pp.384-387, Figure 15-2 ("Type14d Instruction Opcode"): a direct-
@@ -366,7 +365,7 @@ def _type_14d(
 
 def _type_5a_move(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """5a_move, 5b_move."""
     cond = _field(f, "cond")
     old = dict(state.uregs)
@@ -458,7 +457,7 @@ def _type_5a_move(
 
 def _type_4a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """4a."""
     if _field(f, "cond") != 0x1F:
         return [_stop(state, insn, "unsupported predicate")]
@@ -519,7 +518,7 @@ def _type_4a(
 
 def _type_4b(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """4b."""
     # SHARC+ Core Programming Reference rev. 1.4, pp. 13-29--13-32:
     # conditional DM/PM transfer with a signed six-bit immediate modifier.
@@ -625,7 +624,7 @@ def _type_4b(
 
 def _type_3b(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """3b."""
     # SHARC+ Core Programming Reference rev. 1.4, pp. 13-16--13-19.
     # Validate and decode the complete access before making a predicate
@@ -645,7 +644,7 @@ def _type_3b(
     ureg = _field(f, "ureg")
     cond = _field(f, "cond")
 
-    def access(executed: State) -> Optional[str]:
+    def access(executed: State) -> str | None:
         old = dict(executed.uregs)
         iv, mv = _ureg(old, 16 + index), _ureg(old, 32 + modifier)
         widths = {
@@ -704,7 +703,7 @@ def _type_3b(
                 )
         else:
             if access_width == "normal-word":
-                loaded: Optional[Const | dict[str, int]] = _load_normal_ureg(
+                loaded: Const | dict[str, int] | None = _load_normal_ureg(
                     executed, space, address, ureg
                 )
             else:
@@ -788,7 +787,7 @@ def _type_3b(
 
 def _type_3c(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """3c."""
     index, modifier = _field(f, "dmi"), _field(f, "dmm")
     old = dict(state.uregs)
@@ -831,7 +830,7 @@ def _type_3c(
 
 def _type_16a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """16a, 16b."""
     if name == "16a" and (_field(f, "by") or _field(f, "sl")):
         return [_stop(state, insn, "unsupported Type16a by/sl")]
@@ -871,7 +870,7 @@ def _type_16a(
 
 def _type_15b(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """15b."""
     index = _field(f, "i") + (8 if _field(f, "g") else 0)
     offset = _signed(_field(f, "data[6:0]"), 7)
@@ -914,7 +913,7 @@ def _type_15b(
 
 def _type_15a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """15a."""
     # SHARC+ Core Programming Reference (out/refs/sharc-plus-prm)
     # pp.387-390, Figure 15-3 p.390 ("Type15a Instruction Opcode"):
@@ -960,7 +959,7 @@ def _type_15a(
             values = tuple(_ureg(state.uregs, item) for item in pair)
             writes = tuple(
                 _dm_write(state, offset_address, 4, value) if space == "DM" else False
-                for offset_address, value in zip(offsets, values)
+                for offset_address, value in zip(offsets, values, strict=True)
             )
             concrete_write = all(writes)
             _event(
@@ -981,7 +980,7 @@ def _type_15a(
                 _dm_read(state, offset_address, 4) if space == "DM" else None
                 for offset_address in offsets
             )
-            for item, value in zip(pair, values):
+            for item, value in zip(pair, values, strict=True):
                 state.uregs[item] = value or Unknown("memory-address " + rendered)
             _event(
                 state,
@@ -1067,7 +1066,7 @@ def _type_15a(
 
 def _type_1a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """1a."""
     # SHARC+ Core Programming Reference (out/refs/sharc-plus-prm)
     # pp.13-3--13-6, Figure 13-1: an unconditional compute in parallel
@@ -1142,7 +1141,7 @@ def _type_1a(
 
 def _type_5a_swap(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """5a_swap."""
     # SHARC+ Core Programming Reference pp.13-37/13-38, Figure 13-14:
     # Dreg <-> CDreg (the PEx Rn register swaps with its PEy
@@ -1207,7 +1206,7 @@ def _type_5a_swap(
 
 def _type_4d(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """4d."""
     # SHARC+ Core Programming Reference pp.13-32--13-35, Figure 13-12:
     # a 48-bit re-encoding of Type4a's index+6-bit-immediate transfer
@@ -1293,7 +1292,7 @@ def _type_4d(
 
 def _type_3d(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """3d."""
     # SHARC+ Core Programming Reference pp.13-22--13-25, Figure 13-9: a
     # 48-bit re-encoding of Type3a's index+M-register transfer that

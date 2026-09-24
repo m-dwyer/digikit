@@ -5,8 +5,6 @@ Moved verbatim from tools/sharc_trace.py.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from sharcimm import name_address
 from sharcldr import SW_ALIAS_BASE, sw_to_byte
 
@@ -18,12 +16,6 @@ from .encoding import (
     UREG_CODES,
     UREG_NAMES,
 )
-from .values import (
-    Const,
-    Unknown,
-    Value,
-    _add,
-)
 from .state import (
     State,
     _cureg_code,
@@ -31,9 +23,15 @@ from .state import (
     _render,
     _simd_active,
 )
+from .values import (
+    Const,
+    Unknown,
+    Value,
+    _add,
+)
 
 
-def _concrete_address(value: Value | int) -> Optional[int]:
+def _concrete_address(value: Value | int) -> int | None:
     return (
         value.value
         if isinstance(value, Const)
@@ -43,7 +41,7 @@ def _concrete_address(value: Value | int) -> Optional[int]:
 
 def _canonical_dm_address(
     state: State, address: int, width: int, *, for_write: bool = False
-) -> Optional[int]:
+) -> int | None:
     """Resolve a DSP DM address to the loader's byte-address alias.
 
     Application code uses unaliased DM pointers such as ``0x26968c`` whereas
@@ -74,7 +72,7 @@ def _canonical_dm_address(
 
 def _dm_read(
     state: State, address: Value | int, width: int, signed: bool = False
-) -> Optional[Const]:
+) -> Const | None:
     """Read little-endian loader-backed DM bytes plus this path's overlay."""
     concrete = _concrete_address(address)
     if state.concrete is None or concrete is None or width not in (1, 2, 4, 8):
@@ -119,7 +117,7 @@ def _dm_read(
     return Const(value) if width <= 4 else None
 
 
-def _read_px48(state: State, address: Value | int) -> Optional[tuple[Const, Const]]:
+def _read_px48(state: State, address: Value | int) -> tuple[Const, Const] | None:
     """Read a loader-backed 48-bit normal word into the PX1/PX2 halves.
 
     A combined-PX DM or PM transfer without ``LW`` is 48 bits.  L1 block 3's
@@ -150,7 +148,7 @@ def _read_px48(state: State, address: Value | int) -> Optional[tuple[Const, Cons
 
 def _load_normal_ureg(
     state: State, space: str, address: Value | int, code: int
-) -> Optional[Const | dict[str, int]]:
+) -> Const | dict[str, int] | None:
     """Load one normal-word UREG value, including combined-PX DM/PM reads."""
     if code == UREG_CODES["PX"]:
         halves = _read_px48(state, address)
@@ -198,7 +196,7 @@ def _dm_write(state: State, address: Value | int, width: int, value: Value) -> b
     if concrete is None:
         return False
     raw = (value.value & 0xFFFFFFFF).to_bytes(4, "little")[:width]
-    state.overlay.update(zip(range(concrete, concrete + width), raw))
+    state.overlay.update(zip(range(concrete, concrete + width), raw, strict=False))
     return True
 
 
@@ -253,7 +251,7 @@ _SIMD_COMPANION_WIDTHS = frozenset({"normal-word"})
 
 def _simd_ureg_mem_companion(
     state: State, code: int, address: Value, access_width: str = "normal-word"
-) -> Optional[tuple[int, Value]]:
+) -> tuple[int, Value] | None:
     """The SIMD companion (Cureg code, companion address) for a single
     UREG<->memory transfer, or None when no companion transfer applies
     (SISD mode, or a UREG with no SIMD complement -- SHARC+ PRM p.15-12's
@@ -302,7 +300,7 @@ def _access_modifier_scale(access_width: str, assume_nw32: bool) -> int:
     return 1
 
 
-def _circular_wrap_const(index: int, base: int, length: int, delta: int) -> Optional[int]:
+def _circular_wrap_const(index: int, base: int, length: int, delta: int) -> int | None:
     """Concrete DAG circular-buffer wrap: the true I in [B, B+L) advances by
     DELTA and is corrected by one +-length step when it leaves the buffer
     (SHARC+ Core Programming Reference, out/refs/sharc-plus-prm, Sec. 6

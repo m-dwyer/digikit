@@ -8,17 +8,27 @@ family tables.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import List
 
 from sharc_disasm import Instruction
 
+from .compute import (
+    _apply_compute,
+    _apply_compute_simd,
+    _compute,
+    _compute_simd,
+    _shift_immediate,
+)
 from .encoding import (
     _field,
 )
-from .values import (
-    Const,
-    _add,
-    _multiply,
+from .memory import (
+    _access_modifier_scale,
+    _dm_write,
+    _load_normal_ureg,
+)
+from .sequencer import (
+    _advance,
+    _predicate,
 )
 from .state import (
     State,
@@ -28,27 +38,16 @@ from .state import (
     _stop,
     _ureg,
 )
-from .memory import (
-    _access_modifier_scale,
-    _dm_write,
-    _load_normal_ureg,
-)
-from .compute import (
-    _apply_compute,
-    _apply_compute_simd,
-    _compute,
-    _compute_simd,
-    _shift_immediate,
-)
-from .sequencer import (
-    _advance,
-    _predicate,
+from .values import (
+    Const,
+    _add,
+    _multiply,
 )
 
 
 def _type_6b_shiftimm(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """6b_shiftimm."""
     if _field(f, "cond") != 0x1F:
         return [_stop(state, insn, "unsupported Type6b predicate")]
@@ -62,7 +61,7 @@ def _type_6b_shiftimm(
 
 def _type_6a_mem(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """6a_mem."""
     # PRM Type 6a performs a ShiftImm and a normal-word memory transfer
     # in parallel, then post-modifies the selected I register by M.
@@ -118,7 +117,7 @@ def _type_6a_mem(
 
 def _type_2c(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """2c."""
     # Unconditional (no cond field): a SIMD-active MODE1 duplicates
     # this onto PEy's S register file too (PRM p.101, p.3-39).
@@ -134,7 +133,7 @@ def _type_2c(
 
 def _type_2a_short(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """2a_short, 2b."""
     # Both are 32-bit unconditional full-compute forms with no
     # condition field (Type2b: PRM prefix 0xc0, decode_table.json
@@ -159,7 +158,7 @@ def _type_2a_short(
 
 def _type_2a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """2a."""
     # Type 2a conditionally executes a full compute.  Decode against the
     # pre-instruction register file before either predicate assumption mutates it.

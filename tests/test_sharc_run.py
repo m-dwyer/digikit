@@ -89,7 +89,9 @@ class MakeStateTest(unittest.TestCase):
         # Not an MMR and not in the 32-bit-normal-word external range, and
         # nothing loaded to alias against: _dm_write() cannot place it.
         with self.assertRaises(ValueError):
-            sr.make_state(loader_memory(), 0x10, pokes={0x1000000: 1}, assume_nw32=False)
+            sr.make_state(
+                loader_memory(), 0x10, pokes={0x1000000: 1}, assume_nw32=False
+            )
 
 
 class RunnerStepTest(unittest.TestCase):
@@ -131,7 +133,9 @@ class RunnerStepTest(unittest.TestCase):
         runner = sr.Runner(loader_memory(), 0x10)
         first_insn = insn("21c", {}, length=2)
         second_insn = insn("21a", {}, length=6)
-        with patch.object(sr.st, "decode_at", side_effect=[first_insn, second_insn]) as mock_decode:
+        with patch.object(
+            sr.st, "decode_at", side_effect=[first_insn, second_insn]
+        ) as mock_decode:
             got = runner._decode(0x10)
             runner.invalidate(0x10)
             got_after = runner._decode(0x10)
@@ -241,7 +245,9 @@ class RunnerRunTest(unittest.TestCase):
 
 class ParseKvTest(unittest.TestCase):
     def test_parses_name_value_pairs(self):
-        self.assertEqual(sr._parse_kv(["R4=0x10", "I0=5"], "--reg"), {"R4": "0x10", "I0": "5"})
+        self.assertEqual(
+            sr._parse_kv(["R4=0x10", "I0=5"], "--reg"), {"R4": "0x10", "I0": "5"}
+        )
 
     def test_rejects_missing_equals(self):
         with self.assertRaises(SystemExit):

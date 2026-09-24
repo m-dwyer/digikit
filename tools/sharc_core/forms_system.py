@@ -8,7 +8,6 @@ family tables.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import List
 
 from sharc_disasm import Instruction
 
@@ -19,9 +18,12 @@ from .encoding import (
     _field,
     _wide,
 )
-from .values import (
-    Const,
-    _bitwise,
+from .flags import (
+    _astatx_define,
+    _astatx_forget,
+)
+from .sequencer import (
+    _advance,
 )
 from .state import (
     State,
@@ -32,25 +34,22 @@ from .state import (
     _ureg,
     _ureg_raw,
 )
-from .flags import (
-    _astatx_define,
-    _astatx_forget,
-)
-from .sequencer import (
-    _advance,
+from .values import (
+    Const,
+    _bitwise,
 )
 
 
 def _type_21a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """21a, 21c."""
     return _advance(state, insn)
 
 
 def _type_18a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """18a."""
     bop = _field(f, "bop")
     sreg = _field(f, "sreg")
@@ -150,7 +149,7 @@ def _type_18a(
 
 def _type_20a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """20a."""
     push_fields = ("lpu", "spu", "ppu")
     pop_fields = ("lpo", "spo", "ppo")
@@ -257,7 +256,7 @@ def _type_20a(
 
 def _type_22c(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """22c."""
     # SHARC+ Core Programming Reference pp.16-13/16-14, Figure 16-8:
     # idle/emuidle. "The processor remains in the low power state
@@ -274,7 +273,7 @@ def _type_22c(
 
 def _type_26a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """26a."""
     # SHARC+ Core Programming Reference p.16-19/16-20, Figure 16-13:
     # SYNC, a fully fixed 48-bit word with no operand fields.
@@ -289,7 +288,7 @@ def _type_26a(
 
 def _type_8p_undoc48(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """8p_undoc48, 21p_undoc16, 22p_undoc48."""
     # Confirmed real (non-misaligned) code in places, but with no
     # known semantics: docs/findings/05-sharc-isa-and-decoding.md

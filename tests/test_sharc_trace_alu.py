@@ -100,7 +100,10 @@ class AluOpcodesTest(ComputeHelperMixin, unittest.TestCase):
 
     def test_add_with_carry_no_y_carry_out_and_zero(self):
         # RX=0xFFFFFFFF, carry-in=1 -> wraps to 0: AZ and AC set.
-        values = {1: T.Const(0xFFFFFFFF), T.UREG_CODES["ASTATX"]: T.Const(1 << T.AC_BIT)}
+        values = {
+            1: T.Const(0xFFFFFFFF),
+            T.UREG_CODES["ASTATX"]: T.Const(1 << T.AC_BIT),
+        }
         _, value, _, astatx = self.astatx_after(
             full_compute(0, 0x25, 0, 1, 0), False, values, T.Unknown("start")
         )
@@ -282,12 +285,13 @@ class ShifterOpcodesTest(ComputeHelperMixin, unittest.TestCase):
         self.assertEqual(T._astatx_known_bit(astatx, T.SZ_BIT), True)
 
     def test_lefto_counts_leading_ones(self):
+        # (RX, count, SZ): SZ is set when the MSB of RX is 0; SV when count == 32.
         cases = (
-            (0xFFFFFFFF, 32, True, False),  # SZ: MSB==0? no -> False
-            (0x7FFFFFFF, 0, False, True),  # MSB=0 -> SZ true; result 0 -> SV false
-            (0xF0000000, 4, False, False),
+            (0xFFFFFFFF, 32, False),
+            (0x7FFFFFFF, 0, True),
+            (0xF0000000, 4, False),
         )
-        for rx_value, expected_result, expected_sz, expected_sv_when_32 in cases:
+        for rx_value, expected_result, expected_sz in cases:
             with self.subTest(rx=hex(rx_value)):
                 _, value, op, astatx = self.astatx_after(
                     full_compute(2, 0x8C, 0, 1, 0),
@@ -298,6 +302,7 @@ class ShifterOpcodesTest(ComputeHelperMixin, unittest.TestCase):
                 self.assertEqual(op, "lefto")
                 self.assertEqual(value, T.Const(expected_result))
                 self.assertEqual(T._astatx_known_bit(astatx, T.SS_BIT), False)
+                self.assertEqual(T._astatx_known_bit(astatx, T.SZ_BIT), expected_sz)
                 self.assertEqual(
                     T._astatx_known_bit(astatx, T.SV_BIT), expected_result == 32
                 )
@@ -344,7 +349,10 @@ class ShifterOpcodesTest(ComputeHelperMixin, unittest.TestCase):
         # RN-positioned field is the SOURCE here (unusual for this opcode),
         # value=0x85 -> masked to 7 bits = 5 -> SV clear (<=64), SF clear (<32).
         rn, value, op, astatx = self.astatx_after(
-            full_compute(2, 0x7C, 0, 1, 0), False, {0: T.Const(0x85)}, T.Unknown("start")
+            full_compute(2, 0x7C, 0, 1, 0),
+            False,
+            {0: T.Const(0x85)},
+            T.Unknown("start"),
         )
         self.assertEqual(op, "bffwrp-write")
         self.assertEqual(rn, "BFFWRP")
@@ -355,7 +363,10 @@ class ShifterOpcodesTest(ComputeHelperMixin, unittest.TestCase):
     def test_bffwrp_write_register_form_overflow_and_half_full(self):
         # 0xFF & 0x7F = 127: > 64 (SV set), >= 32 (SF set).
         _, value, _, astatx = self.astatx_after(
-            full_compute(2, 0x7C, 0, 1, 0), False, {0: T.Const(0xFF)}, T.Unknown("start")
+            full_compute(2, 0x7C, 0, 1, 0),
+            False,
+            {0: T.Const(0xFF)},
+            T.Unknown("start"),
         )
         self.assertEqual(value, T.Const(127))
         self.assertEqual(T._astatx_known_bit(astatx, T.SV_BIT), True)
@@ -433,7 +444,10 @@ class MrDataMoveTest(ComputeHelperMixin, unittest.TestCase):
     def test_other_mr_registers_get_their_own_key(self):
         state = T.State(0x10, {2: T.Const(0x66)})
         result = T._compute(
-            mrdatamove_fields(1, 1, 2), False, dict(state.uregs), state.special  # MR1F
+            mrdatamove_fields(1, 1, 2),
+            False,
+            dict(state.uregs),
+            state.special,  # MR1F
         )
         T._apply_compute(state, insn("2a", {}), result)
         self.assertEqual(state.special.get("MR1F"), T.Const(0x66))
@@ -446,8 +460,12 @@ class MrDataMoveTest(ComputeHelperMixin, unittest.TestCase):
 class MultifnMulAluTest(ComputeHelperMixin, unittest.TestCase):
     def test_average_category(self):
         # FM = 2.0*3.0 = 6.0; FA = (5.0+3.0)/2 = 4.0.
-        values = {0: T.Const(f32(2.0)), 4: T.Const(f32(3.0)),
-                  8: T.Const(f32(5.0)), 12: T.Const(f32(3.0))}
+        values = {
+            0: T.Const(f32(2.0)),
+            4: T.Const(f32(3.0)),
+            8: T.Const(f32(5.0)),
+            12: T.Const(f32(3.0)),
+        }
         rn, value, op, astatx = self.astatx_after(
             mulalu_fields(0x1C, 1, 2, 0, 0, 0, 0), False, values, T.Unknown("start")
         )
@@ -457,8 +475,12 @@ class MultifnMulAluTest(ComputeHelperMixin, unittest.TestCase):
         self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), False)
 
     def test_abs_category_carries_input_sign_and_clears_an(self):
-        values = {0: T.Const(f32(2.0)), 4: T.Const(f32(3.0)),
-                  8: T.Const(f32(-5.0)), 12: T.Const(f32(0.0))}
+        values = {
+            0: T.Const(f32(2.0)),
+            4: T.Const(f32(3.0)),
+            8: T.Const(f32(-5.0)),
+            12: T.Const(f32(0.0)),
+        }
         rn, value, op, astatx = self.astatx_after(
             mulalu_fields(0x1D, 1, 2, 0, 0, 0, 0), False, values, T.Unknown("start")
         )
@@ -474,8 +496,12 @@ class MultifnMulAluTest(ComputeHelperMixin, unittest.TestCase):
 class MultifnDualAddSubtractTest(ComputeHelperMixin, unittest.TestCase):
     def test_three_way_result_fm_fa_fs(self):
         # category = 0x30 | rs; rs=3 here (category=0x33).
-        values = {0: T.Const(f32(2.0)), 4: T.Const(f32(3.0)),
-                  8: T.Const(f32(5.0)), 12: T.Const(f32(2.0))}
+        values = {
+            0: T.Const(f32(2.0)),
+            4: T.Const(f32(3.0)),
+            8: T.Const(f32(5.0)),
+            12: T.Const(f32(2.0)),
+        }
         rn, value, op, astatx = self.astatx_after(
             mulalu_fields(0x33, 1, 2, 0, 0, 0, 0), False, values, T.Unknown("start")
         )
@@ -487,8 +513,12 @@ class MultifnDualAddSubtractTest(ComputeHelperMixin, unittest.TestCase):
         self.assertEqual(T._astatx_known_bit(astatx, T.AN_BIT), False)
 
     def test_writes_all_three_registers_through_apply_compute(self):
-        values = {0: T.Const(f32(2.0)), 4: T.Const(f32(3.0)),
-                  8: T.Const(f32(5.0)), 12: T.Const(f32(2.0))}
+        values = {
+            0: T.Const(f32(2.0)),
+            4: T.Const(f32(3.0)),
+            8: T.Const(f32(5.0)),
+            12: T.Const(f32(2.0)),
+        }
         state = T.State(0x10, dict(values))
         result = T._compute(
             mulalu_fields(0x38, 1, 2, 0, 0, 0, 0), False, state.uregs, state.special

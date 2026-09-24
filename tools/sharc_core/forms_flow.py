@@ -8,34 +8,19 @@ family tables.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import List, Optional
 
 from sharc_disasm import Instruction
 
+from .compute import (
+    _apply_compute,
+    _compute,
+)
 from .encoding import (
     UREG_CODES,
     _field,
 )
-from .values import (
-    Const,
-    Unknown,
-    _signed,
-)
-from .state import (
-    Pending,
-    State,
-    _copy,
-    _event,
-    _json_value,
-    _stop,
-    _ureg,
-)
 from .memory import (
     _dm_read,
-)
-from .compute import (
-    _apply_compute,
-    _compute,
 )
 from .sequencer import (
     _advance,
@@ -47,11 +32,25 @@ from .sequencer import (
     _start_counted_loop,
     _transfer,
 )
+from .state import (
+    Pending,
+    State,
+    _copy,
+    _event,
+    _json_value,
+    _stop,
+    _ureg,
+)
+from .values import (
+    Const,
+    Unknown,
+    _signed,
+)
 
 
 def _type_12a_imm(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """12a_imm."""
     count = (_field(f, "data[15:8]") << 8) | _field(f, "data[7:0]")
     return _start_counted_loop(state, insn, count)
@@ -59,7 +58,7 @@ def _type_12a_imm(
 
 def _type_12a_ureg(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """12a_ureg."""
     count = _ureg(state.uregs, _field(f, "ureg"))
     if not isinstance(count, Const):
@@ -69,7 +68,7 @@ def _type_12a_ureg(
 
 def _type_11c(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """11c."""
     if _field(f, "x"):
         return [_stop(state, insn, "unsupported Type11c RTI")]
@@ -85,7 +84,7 @@ def _type_11c(
 
 def _type_11a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """11a."""
     # PGR "Type 11a ISA/VISA (cond + branch return + comp/else comp)"
     # (out/refs/adsp-2136x_2137x_214xx_pgr_rev2.4/all.txt lines
@@ -114,7 +113,7 @@ def _type_11a(
     delayed = bool(_field(f, "j"))
     compute_when_taken = not bool(_field(f, "e"))
 
-    def apply_compute(executed: State) -> Optional[str]:
+    def apply_compute(executed: State) -> str | None:
         try:
             compute = _compute(
                 f,
@@ -158,7 +157,7 @@ def _type_11a(
 
 def _type_9a_abs(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """9a_abs."""
     # PRM Type 9a (pp. 14-5, 14-8): JUMP/CALL (Md, Ic) with an optional
     # compute. I pre-modified by M gives the target; I is unchanged.
@@ -171,7 +170,7 @@ def _type_9a_abs(
     cond = _field(f, "cond")
     compute_when_taken = not bool(_field(f, "e"))
 
-    def apply_compute(executed: State) -> Optional[str]:
+    def apply_compute(executed: State) -> str | None:
         try:
             compute = _compute(
                 f,
@@ -255,7 +254,7 @@ def _type_9a_abs(
 # register-indirect jump as a return.
 def _type_9b_abs(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """9b_abs."""
     pmi = (_field(f, "pmi[2:2]") << 2) | _field(f, "pmi[1:0]")
     pmm = _field(f, "pmm")
@@ -304,7 +303,7 @@ def _type_9b_abs(
 
 def _type_25c_rframe(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """25c_rframe."""
     if state.pending and state.pending.return_from_call:
         frame = _ureg(state.uregs, UREG_CODES["I6"])
@@ -334,7 +333,7 @@ def _type_25c_rframe(
 
 def _type_9a_rel(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """9a_rel."""
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
@@ -344,7 +343,7 @@ def _type_9a_rel(
     target = (state.pc_sw + _signed(relative, 6)) & 0xFFFFFF
     predicate = _predicate(state, _field(f, "cond"))
 
-    def apply_compute(executed: State) -> Optional[str]:
+    def apply_compute(executed: State) -> str | None:
         try:
             compute = _compute(
                 f,
@@ -393,7 +392,7 @@ def _type_9a_rel(
 
 def _type_25a_direct(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """25a_direct, 25a_pcrel, 8a_abs, 8a_rel."""
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]

@@ -75,7 +75,14 @@ class Type7bTest(unittest.TestCase):
     def test_linear_modify_real_instance(self):
         # real SW 0x120bff (1183327): L1 unset (Unknown, not Const 0), so
         # this exercises the "length not a known nonzero Const" linear path.
-        fields = {"cond[4:0]": 31, "g": 0, "idis[2:0]": 2, "is[1:0]": 1, "is[2:2]": 0, "m[2:0]": 4}
+        fields = {
+            "cond[4:0]": 31,
+            "g": 0,
+            "idis[2:0]": 2,
+            "is[1:0]": 1,
+            "is[2:2]": 0,
+            "m[2:0]": 4,
+        }
         state = T.State(
             0x10,
             {T.UREG_CODES["I1"]: T.Const(0x100), T.UREG_CODES["M4"]: T.Const(5)},
@@ -93,7 +100,14 @@ class Type7bTest(unittest.TestCase):
         # the state of the CBUFEN bit". MODE1 is left at Unknown (default)
         # here, i.e. CBUFEN's state is deliberately unknown, and the wrap
         # still happens.
-        fields = {"cond[4:0]": 31, "g": 0, "idis[2:0]": 0, "is[1:0]": 0, "is[2:2]": 0, "m[2:0]": 0}
+        fields = {
+            "cond[4:0]": 31,
+            "g": 0,
+            "idis[2:0]": 0,
+            "is[1:0]": 0,
+            "is[2:2]": 0,
+            "m[2:0]": 0,
+        }
         state = T.State(
             0x10,
             {
@@ -110,7 +124,14 @@ class Type7bTest(unittest.TestCase):
         self.assertTrue(result.trace[-1]["circular"])
 
     def test_predicate_false_skips(self):
-        fields = {"cond[4:0]": 0x03, "g": 0, "idis[2:0]": 0, "is[1:0]": 0, "is[2:2]": 0, "m[2:0]": 0}
+        fields = {
+            "cond[4:0]": 0x03,
+            "g": 0,
+            "idis[2:0]": 0,
+            "is[1:0]": 0,
+            "is[2:2]": 0,
+            "m[2:0]": 0,
+        }
         state = T.State(
             0x10,
             {
@@ -157,7 +178,13 @@ class Type5aSwapTest(unittest.TestCase):
     def test_unconditional_swap_real_instance_no_compute(self):
         # real SW 0x16ba03 (1489092 uses cond 0x14; this one, 1839651, is
         # unconditional). Compute zeroed to isolate the swap from _compute.
-        fields = {"cdreg[3:0]": 5, "compute[15:0]": 0, "compute[22:16]": 0, "cond[4:0]": 31, "dreg[3:0]": 5}
+        fields = {
+            "cdreg[3:0]": 5,
+            "compute[15:0]": 0,
+            "compute[22:16]": 0,
+            "cond[4:0]": 31,
+            "dreg[3:0]": 5,
+        }
         state = T.State(0x10, {T.UREG_CODES["R5"]: T.Const(0x42)})
         [result] = T._execute(state, insn("5a_swap", fields, length=6))
         self.assertIsNone(result.stopped)
@@ -167,7 +194,13 @@ class Type5aSwapTest(unittest.TestCase):
         self.assertEqual(result.trace[-1]["action"], "dreg-swap")
 
     def test_predicate_false_skips_and_leaves_dreg_untouched(self):
-        fields = {"cdreg[3:0]": 9, "compute[15:0]": 0, "compute[22:16]": 0, "cond[4:0]": 0x03, "dreg[3:0]": 14}
+        fields = {
+            "cdreg[3:0]": 9,
+            "compute[15:0]": 0,
+            "compute[22:16]": 0,
+            "cond[4:0]": 0x03,
+            "dreg[3:0]": 14,
+        }
         state = T.State(
             0x10,
             {
@@ -186,8 +219,17 @@ class Type4dTest(unittest.TestCase):
         # real SW 0x1c4b91 (1856721): d=1 store, l=x=w=0 -> byte, u=0
         # pre-modify, data=29|1<<5 (six-bit signed -3).
         fields = {
-            "cond[4:0]": 31, "d": 1, "data[4:0]": 29, "data[5:5]": 1,
-            "dreg[3:0]": 4, "g": 0, "i[2:0]": 4, "l": 0, "u": 0, "w": 0, "x": 0,
+            "cond[4:0]": 31,
+            "d": 1,
+            "data[4:0]": 29,
+            "data[5:5]": 1,
+            "dreg[3:0]": 4,
+            "g": 0,
+            "i[2:0]": 4,
+            "l": 0,
+            "u": 0,
+            "w": 0,
+            "x": 0,
         }
         state = T.State(
             0x10,
@@ -208,8 +250,17 @@ class Type4dTest(unittest.TestCase):
         # real SW 0x1c5127 (1846396): d=0 load, l=1,x=1,w=0 ->
         # short-word-sign-extended, u=1 post-modify, data=2.
         fields = {
-            "cond[4:0]": 31, "d": 0, "data[4:0]": 2, "data[5:5]": 0,
-            "dreg[3:0]": 2, "g": 0, "i[2:0]": 4, "l": 1, "u": 1, "w": 0, "x": 1,
+            "cond[4:0]": 31,
+            "d": 0,
+            "data[4:0]": 2,
+            "data[5:5]": 0,
+            "dreg[3:0]": 2,
+            "g": 0,
+            "i[2:0]": 4,
+            "l": 1,
+            "u": 1,
+            "w": 0,
+            "x": 1,
         }
         state = T.State(0x10, {T.UREG_CODES["I4"]: T.Const(0x3000)})
         [result] = T._execute(state, insn("4d", fields, length=6))
@@ -224,10 +275,21 @@ class Type4dTest(unittest.TestCase):
 
     def test_unsupported_predicate_stops(self):
         fields = {
-            "cond[4:0]": 0x03, "d": 1, "data[4:0]": 0, "data[5:5]": 0,
-            "dreg[3:0]": 0, "g": 0, "i[2:0]": 0, "l": 0, "u": 0, "w": 0, "x": 0,
+            "cond[4:0]": 0x03,
+            "d": 1,
+            "data[4:0]": 0,
+            "data[5:5]": 0,
+            "dreg[3:0]": 0,
+            "g": 0,
+            "i[2:0]": 0,
+            "l": 0,
+            "u": 0,
+            "w": 0,
+            "x": 0,
         }
-        state = T.State(0x10, {T.UREG_CODES["I0"]: T.Const(0), T.UREG_CODES["R0"]: T.Const(0)})
+        state = T.State(
+            0x10, {T.UREG_CODES["I0"]: T.Const(0), T.UREG_CODES["R0"]: T.Const(0)}
+        )
         [result] = T._execute(state, insn("4d", fields, length=6))
         self.assertEqual(result.stopped, "unsupported Type4d predicate")
 
@@ -237,8 +299,17 @@ class Type3dTest(unittest.TestCase):
         # real SW 0xb7febf (12059647): d=0 load into R2 (ureg 2), ex=0,
         # w=0 -> plain normal-word ACCESS, u=0 pre-modify.
         fields = {
-            "cond[4:0]": 31, "d": 0, "ex": 0, "g": 0, "i[2:0]": 5,
-            "l": 0, "m[2:0]": 5, "u": 0, "ureg[6:0]": 2, "w": 0, "x": 0,
+            "cond[4:0]": 31,
+            "d": 0,
+            "ex": 0,
+            "g": 0,
+            "i[2:0]": 5,
+            "l": 0,
+            "m[2:0]": 5,
+            "u": 0,
+            "ureg[6:0]": 2,
+            "w": 0,
+            "x": 0,
         }
         state = T.State(
             0x10,
@@ -260,8 +331,17 @@ class Type3dTest(unittest.TestCase):
         # real SW 0xb7fec8 (12059656): d=1 store of ureg 45 (M13), cond
         # 0x01 (LT); this test only checks the predicate-false skip path.
         fields = {
-            "cond[4:0]": 1, "d": 1, "ex": 0, "g": 0, "i[2:0]": 5,
-            "l": 0, "m[2:0]": 5, "u": 0, "ureg[6:0]": 45, "w": 0, "x": 0,
+            "cond[4:0]": 1,
+            "d": 1,
+            "ex": 0,
+            "g": 0,
+            "i[2:0]": 5,
+            "l": 0,
+            "m[2:0]": 5,
+            "u": 0,
+            "ureg[6:0]": 45,
+            "w": 0,
+            "x": 0,
         }
         state = T.State(
             0x10,
@@ -280,8 +360,16 @@ class Type3dTest(unittest.TestCase):
 
     def test_exclusive_and_waccess_are_unsupported(self):
         base = {
-            "cond[4:0]": 31, "d": 0, "g": 0, "i[2:0]": 0, "l": 0,
-            "m[2:0]": 0, "u": 0, "ureg[6:0]": 0, "w": 0, "x": 0,
+            "cond[4:0]": 31,
+            "d": 0,
+            "g": 0,
+            "i[2:0]": 0,
+            "l": 0,
+            "m[2:0]": 0,
+            "u": 0,
+            "ureg[6:0]": 0,
+            "w": 0,
+            "x": 0,
         }
         state = T.State(0x10, {T.UREG_CODES["I0"]: T.Const(0)})
         [result] = T._execute(state, insn("3d", dict(base, ex=1), length=6))
@@ -301,7 +389,19 @@ class UndocumentedFormsStopWithReasonTest(unittest.TestCase):
     def test_stops_name_the_form_and_do_not_touch_state(self):
         cases = (
             # real SW 0x1c32b4 (1847988).
-            ("8p_undoc48", {"a": 0, "b": 0, "ci": 0, "cond[4:0]": 0, "imm[15:0]": 0, "imm[23:16]": 62, "j": 0, "r": 1}),
+            (
+                "8p_undoc48",
+                {
+                    "a": 0,
+                    "b": 0,
+                    "ci": 0,
+                    "cond[4:0]": 0,
+                    "imm[15:0]": 0,
+                    "imm[23:16]": 62,
+                    "j": 0,
+                    "r": 1,
+                },
+            ),
             # real SW 0x16b8f7 (1489143).
             ("21p_undoc16", {"operand[6:0]": 0}),
             # real SW 0x16b8fb (1489147).
@@ -355,8 +455,11 @@ class Type19aScaledCircularFixTest(unittest.TestCase):
 
     def test_modifier_equal_to_length_now_wraps_instead_of_unknown(self):
         fields = {
-            "g": 0, "is": 0, "idis": 0,
-            "data[31:16]": 0, "data[15:0]": 0x10,  # delta = +0x10
+            "g": 0,
+            "is": 0,
+            "idis": 0,
+            "data[31:16]": 0,
+            "data[15:0]": 0x10,  # delta = +0x10
             "w": 1,
         }
         state = T.State(
@@ -376,8 +479,11 @@ class Type19aScaledCircularFixTest(unittest.TestCase):
 
     def test_modifier_one_more_than_length_is_still_unknown(self):
         fields = {
-            "g": 0, "is": 0, "idis": 0,
-            "data[31:16]": 0xFFFF, "data[15:0]": 0xFFFC,  # delta = -1 word; scaled below
+            "g": 0,
+            "is": 0,
+            "idis": 0,
+            "data[31:16]": 0xFFFF,
+            "data[15:0]": 0xFFFC,  # delta = -1 word; scaled below
             "w": 1,
         }
         # Use a length of 4 bytes (L=1 word * scale 4) and a delta whose
@@ -405,8 +511,14 @@ class Type7aCircularModifyTest(unittest.TestCase):
 
     def test_conditional_modify_wraps_when_predicate_true(self):
         fields = {
-            "cond[4:0]": 0x17, "g": 0, "idis[2:0]": 0, "is[1:0]": 0, "is[2:2]": 0,
-            "m[2:0]": 0, "compute[22:16]": 0, "compute[15:0]": 0,
+            "cond[4:0]": 0x17,
+            "g": 0,
+            "idis[2:0]": 0,
+            "is[1:0]": 0,
+            "is[2:2]": 0,
+            "m[2:0]": 0,
+            "compute[22:16]": 0,
+            "compute[15:0]": 0,
         }
         state = T.State(
             0x10,
@@ -426,8 +538,14 @@ class Type7aCircularModifyTest(unittest.TestCase):
 
     def test_nonconcrete_bound_with_nonzero_length_still_stops(self):
         fields = {
-            "cond[4:0]": 0x17, "g": 0, "idis[2:0]": 0, "is[1:0]": 0, "is[2:2]": 0,
-            "m[2:0]": 0, "compute[22:16]": 0, "compute[15:0]": 0,
+            "cond[4:0]": 0x17,
+            "g": 0,
+            "idis[2:0]": 0,
+            "is[1:0]": 0,
+            "is[2:2]": 0,
+            "m[2:0]": 0,
+            "compute[22:16]": 0,
+            "compute[15:0]": 0,
         }
         state = T.State(
             0x10,

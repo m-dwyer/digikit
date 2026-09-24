@@ -62,9 +62,7 @@ class MultiplierFractionalHelperTest(unittest.TestCase):
         self.assertEqual(value, T.Const(0xE0000000))
 
     def test_unknown_operand_stays_unknown(self):
-        value = T._multiply_fractional(
-            T.Unknown("x"), T.Const(1), True, True, "expr"
-        )
+        value = T._multiply_fractional(T.Unknown("x"), T.Const(1), True, True, "expr")
         self.assertEqual(value, T.Unknown("expr"))
 
     def test_symbolic_affine_operand_stays_unknown(self):
@@ -170,9 +168,7 @@ class MultiplierComputeOpcodeTest(unittest.TestCase):
     # -- 0x09: RN = sat mrf MOD2, SF (PRM p.17-7/17-9; unmodeled 80-bit) ----
 
     def test_0x09_saturate_mrf_sf_stays_unknown_with_documented_flags(self):
-        rn, value, op, astatx_update = self.compute(
-            full_compute(1, 0x09, 3, 0, 0), {}
-        )
+        rn, value, op, astatx_update = self.compute(full_compute(1, 0x09, 3, 0, 0), {})
         self.assertEqual(rn, 3)
         self.assertIsInstance(value, T.Unknown)
         self.assertEqual(op, "saturate-mrf")

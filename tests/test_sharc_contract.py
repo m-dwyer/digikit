@@ -24,7 +24,9 @@ import sharc_contract as C  # noqa: E402
 DT2_116_DB = pathlib.Path("out/sharcdb/dt2-1.16.sqlite")
 
 
-@unittest.skipUnless(DT2_116_DB.exists(), "out/sharcdb/dt2-1.16.sqlite is not available")
+@unittest.skipUnless(
+    DT2_116_DB.exists(), "out/sharcdb/dt2-1.16.sqlite is not available"
+)
 class ContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -103,8 +105,8 @@ class ContractTest(unittest.TestCase):
 
     def test_peripheral_windows(self):
         self.assertTrue(C.is_peripheral(0x31000004))
-        self.assertTrue(C.is_peripheral(0x300c0))
-        self.assertFalse(C.is_peripheral(0x2412c8))
+        self.assertTrue(C.is_peripheral(0x300C0))
+        self.assertFalse(C.is_peripheral(0x2412C8))
         self.assertFalse(C.is_peripheral(0x40000000))
 
 

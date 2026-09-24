@@ -5,8 +5,6 @@ Moved verbatim from tools/sharc_trace.py.
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 from sharc_disasm import Instruction, decode_loaded_at, disassemble
 from sharcldr import LoadedMemory
 
@@ -20,12 +18,8 @@ from .encoding import (
     UREG_CODES,
     _field,
 )
-from .values import (
-    Const,
-    Unknown,
-    _astatx_known_bit,
-    _bitwise,
-    _signed,
+from .memory import (
+    _dossier,
 )
 from .state import (
     AFTER_DELAY_SLOTS,
@@ -40,13 +34,17 @@ from .state import (
     _ureg,
     _ureg_raw,
 )
-from .memory import (
-    _dossier,
+from .values import (
+    Const,
+    Unknown,
+    _astatx_known_bit,
+    _bitwise,
+    _signed,
 )
 
 
 def decode_at(
-    data: bytes | LoadedMemory, base_sw: Optional[int], pc_sw: int
+    data: bytes | LoadedMemory, base_sw: int | None, pc_sw: int
 ) -> Instruction:
     """Decode exactly at PC_SW from a flat image or loader-backed memory."""
     if isinstance(data, LoadedMemory):
@@ -61,7 +59,7 @@ def decode_at(
     return next(disassemble(data, start_offset=offset, count=1))
 
 
-def _advance(state: State, insn: Instruction) -> List[State]:
+def _advance(state: State, insn: Instruction) -> list[State]:
     state.steps += 1
     if insn.length_bytes is None:
         raise ValueError("cannot advance an instruction without a decoded length")
@@ -182,7 +180,7 @@ def _advance(state: State, insn: Instruction) -> List[State]:
     return [state]
 
 
-def _lt_ge_le_gt(state: State, cond: int) -> Optional[bool]:
+def _lt_ge_le_gt(state: State, cond: int) -> bool | None:
     """PGR Table 4-37 (p.4-93) / PRM p.4-53:
 
     X = (NOT AF AND (AN XOR (AV AND NOT ALUSAT))) OR (AF AND AN) OR AZ
@@ -223,7 +221,7 @@ def _lt_ge_le_gt(state: State, cond: int) -> Optional[bool]:
     return y if cond == 0x01 else not y  # LT / GE
 
 
-def _predicate(state: State, cond: int) -> Optional[bool]:
+def _predicate(state: State, cond: int) -> bool | None:
     if cond == 0x1F:
         return True
     if cond in (0x00, 0x10):
@@ -248,7 +246,7 @@ def _predicate(state: State, cond: int) -> Optional[bool]:
     return None
 
 
-def _lt_ge_le_gt_pe(state: State, cond: int, pe: str) -> Optional[bool]:
+def _lt_ge_le_gt_pe(state: State, cond: int, pe: str) -> bool | None:
     """_lt_ge_le_gt read against one PE's own status (SHARC+ PRM p.4-53's
     rule, applied to REGF_ASTATY when pe == "y" instead of REGF_ASTATX --
     p.66 Table 3-1 pairs them as the identical per-PE status)."""
@@ -281,7 +279,7 @@ def _lt_ge_le_gt_pe(state: State, cond: int, pe: str) -> Optional[bool]:
     return y if cond == 0x01 else not y
 
 
-def _predicate_pe(state: State, cond: int, pe: str) -> Optional[bool]:
+def _predicate_pe(state: State, cond: int, pe: str) -> bool | None:
     """Evaluate COND against exactly one processing element's own status
     (SHARC+ PRM p.4-54, Table 4-22: a conditional compute or register/
     memory move "[e]xecutes ... depending on condition test in each PE").
@@ -311,7 +309,7 @@ def _predicate_pe(state: State, cond: int, pe: str) -> Optional[bool]:
     return None
 
 
-def _predicate_and(a: Optional[bool], b: Optional[bool]) -> Optional[bool]:
+def _predicate_and(a: bool | None, b: bool | None) -> bool | None:
     """Three-valued AND, used to combine PEx's and PEy's conditions for a
     SIMD branch (SHARC+ PRM p.4-54): a concrete False on either side makes
     the whole AND False even if the other side is unresolved; otherwise an
@@ -323,7 +321,7 @@ def _predicate_and(a: Optional[bool], b: Optional[bool]) -> Optional[bool]:
     return a and b
 
 
-def _predicate_simd_branch(state: State, cond: int) -> Optional[bool]:
+def _predicate_simd_branch(state: State, cond: int) -> bool | None:
     """A branch/call/return's predicate (SHARC+ PRM p.4-54, Table 4-22:
     "Executes in sequencer depending on AND'ing condition test on both
     PEs"). SISD mode uses PEx's own condition only; SIMD mode ANDs PEx's
@@ -342,7 +340,7 @@ def _predicate_simd_branch(state: State, cond: int) -> Optional[bool]:
     return _predicate_and(pex, pey)
 
 
-def _check_return_target(state: State) -> Optional[str]:
+def _check_return_target(state: State) -> str | None:
     """The firmware returns through JUMP (M14, I12) (DB). When both registers
     are known, the jump target must equal the recorded return address."""
     index = _ureg(state.uregs, UREG_CODES["I12"])
@@ -359,8 +357,8 @@ def _check_return_target(state: State) -> Optional[str]:
 
 
 def _transfer(
-    state: State, insn: Instruction, target: int, call: bool, cond: Optional[bool]
-) -> List[State]:
+    state: State, insn: Instruction, target: int, call: bool, cond: bool | None
+) -> list[State]:
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
     if insn.length_bytes is None:
@@ -387,8 +385,8 @@ def _transfer(
 
 
 def _immediate_transfer(
-    state: State, insn: Instruction, target: int, call: bool, cond: Optional[bool]
-) -> List[State]:
+    state: State, insn: Instruction, target: int, call: bool, cond: bool | None
+) -> list[State]:
     """Execute a Type 8 transfer without the instruction's DB modifier."""
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
@@ -408,8 +406,8 @@ def _immediate_transfer(
 
 
 def _return_transfer(
-    state: State, insn: Instruction, predicate: Optional[bool], delayed: bool
-) -> List[State]:
+    state: State, insn: Instruction, predicate: bool | None, delayed: bool
+) -> list[State]:
     """Execute a documented RTS against the tracer's followed-call stack."""
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
@@ -421,7 +419,7 @@ def _return_transfer(
         state.trace[-1]["action"] = "return-not-taken"
         return _advance(state, insn)
 
-    def take_return(taken: State) -> List[State]:
+    def take_return(taken: State) -> list[State]:
         if not taken.call_stack:
             return [_stop(taken, insn, "return without followed call")]
         if taken.loops and taken.call_stack[-1] == taken.loops[-1].start_sw:
@@ -444,7 +442,7 @@ def _return_transfer(
     return take_return(taken) + _advance(not_taken, insn)
 
 
-def _start_counted_loop(state: State, insn: Instruction, count: int) -> List[State]:
+def _start_counted_loop(state: State, insn: Instruction, count: int) -> list[State]:
     if count == 0:
         return [_stop(state, insn, "unsupported zero-count Type12a loop")]
     reladdr = (_field(insn.fields, "reladdr[22:16]") << 16) | _field(

@@ -78,6 +78,7 @@ _PLAUSIBLE_DM_BANDS = (
 def _is_plausible(addr):
     return any(_is_in(addr, band) for band in _PLAUSIBLE_DM_BANDS)
 
+
 # The two RTOS task roots this repo has already named (tools/sharcdb.py's
 # rtos_task root note carries 'helper=... call_site=...'); told apart here
 # by call site rather than re-deriving them, since they're the only two
@@ -120,7 +121,8 @@ def reach_functions(img, root):
         cur = frontier.pop()
         rows = img.sql(
             "SELECT DISTINCT to_function FROM edges WHERE image=? AND from_function=? AND to_function IS NOT NULL",
-            img.name, cur,
+            img.name,
+            cur,
         )
         for (target,) in rows:
             if target not in seen:
@@ -219,7 +221,9 @@ class _RootIndex:
     def __init__(self, img):
         self.img = img
         self.roots_by_sw = {}
-        for sw, kind, note in img.sql("SELECT sw, kind, note FROM roots WHERE image=?", img.name):
+        for sw, kind, note in img.sql(
+            "SELECT sw, kind, note FROM roots WHERE image=?", img.name
+        ):
             self.roots_by_sw.setdefault(sw, []).append((kind, note))
         self.audio_task_root = None
         self.rpc_task_root = None
@@ -236,7 +240,8 @@ class _RootIndex:
         rows = self.img.sql(
             "SELECT rc.root_sw, r.kind, rc.depth FROM reach rc JOIN roots r "
             "ON r.image=rc.image AND r.sw=rc.root_sw WHERE rc.image=? AND rc.function_sw=?",
-            self.img.name, fn_entry,
+            self.img.name,
+            fn_entry,
         )
         return rows
 
@@ -252,10 +257,14 @@ class _RootIndex:
         it reaches (which is most of them) as an ISR."""
         rows = self.roots_reaching(fn_entry)
         root_sws = {r[0] for r in rows}
-        true_isr = any(kind == "interrupt_vector" and sw != RESET_VECTOR_SW for sw, kind, _ in rows)
+        true_isr = any(
+            kind == "interrupt_vector" and sw != RESET_VECTOR_SW for sw, kind, _ in rows
+        )
         if self.audio_task_root is not None and self.audio_task_root in root_sws:
             return "audio task (per block)"
-        if RESET_VECTOR_SW in root_sws or any(kind == "loader_entry" for _, kind, _ in rows):
+        if RESET_VECTOR_SW in root_sws or any(
+            kind == "loader_entry" for _, kind, _ in rows
+        ):
             return "boot/init"
         if true_isr:
             return "interrupt handler (ISR)"
@@ -263,7 +272,10 @@ class _RootIndex:
             return "RPC task"
         kinds = {r[1] for r in rows}
         if kinds:
-            return "unclassified static entry (%s; needs runtime confirmation)" % ", ".join(sorted(kinds))
+            return (
+                "unclassified static entry (%s; needs runtime confirmation)"
+                % ", ".join(sorted(kinds))
+            )
         return "no static root reaches it (needs runtime confirmation)"
 
 
@@ -273,17 +285,20 @@ def classify_external_writers(img, root_index, lo, hi, reach_set):
     as a whole when NO writer (internal or external) was found at all."""
     rows = _global_ptr_rows(img, "store", lo, hi)
     by_fn = {}
-    for sw, base_reg, base_value, address, width in rows:
+    for sw, _base_reg, _base_value, _address, _width in rows:
         fn = img.func(sw)
         fn_entry = int(fn["entry_sw"], 16) if fn else None
         if fn_entry is not None and fn_entry in reach_set:
             continue  # self-written -- not an external contract item
         key = fn_entry if fn_entry is not None else sw
-        entry = by_fn.setdefault(key, {
-            "function": "0x%x" % fn_entry if fn_entry is not None else None,
-            "name": fn["name"] if fn else None,
-            "sites": [],
-        })
+        entry = by_fn.setdefault(
+            key,
+            {
+                "function": "0x%x" % fn_entry if fn_entry is not None else None,
+                "name": fn["name"] if fn else None,
+                "sites": [],
+            },
+        )
         entry["sites"].append("0x%x" % sw)
     writers = []
     for key, entry in by_fn.items():
@@ -321,18 +336,30 @@ def build(img, root):
     store_rows = _ptr_rows_for(img, reach, "store")
 
     read_addrs, read_base_only = set(), []
-    for sw, base_reg, base_value, address, width in load_rows:
+    for sw, base_reg, base_value, address, _width in load_rows:
         if address is not None:
             read_addrs.add(address)
         elif base_value is not None:
-            read_base_only.append({"sw": "0x%x" % sw, "base_reg": base_reg, "base_value": "0x%x" % base_value})
+            read_base_only.append(
+                {
+                    "sw": "0x%x" % sw,
+                    "base_reg": base_reg,
+                    "base_value": "0x%x" % base_value,
+                }
+            )
 
     write_addrs, write_base_only = set(), []
-    for sw, base_reg, base_value, address, width in store_rows:
+    for sw, base_reg, base_value, address, _width in store_rows:
         if address is not None:
             write_addrs.add(address)
         elif base_value is not None:
-            write_base_only.append({"sw": "0x%x" % sw, "base_reg": base_reg, "base_value": "0x%x" % base_value})
+            write_base_only.append(
+                {
+                    "sw": "0x%x" % sw,
+                    "base_reg": base_reg,
+                    "base_value": "0x%x" % base_value,
+                }
+            )
 
     groups = {}
     for addr in read_addrs:
@@ -390,35 +417,59 @@ def build(img, root):
 
 
 def _print_text(contract):
-    print("%s root=%s (function %s): %d functions, %d instructions" % (
-        contract["image"], contract["root"], contract["root_function"],
-        contract["n_functions"], contract["n_instructions"],
-    ))
+    print(
+        "%s root=%s (function %s): %d functions, %d instructions"
+        % (
+            contract["image"],
+            contract["root"],
+            contract["root_function"],
+            contract["n_functions"],
+            contract["n_instructions"],
+        )
+    )
     for obj in contract["objects"]:
         flag = " [PERIPHERAL]" if obj["peripheral"] else ""
-        print("\n%s  %s  size=0x%x  reads=%d self_written=%d%s" % (
-            obj["label"], obj["range"], obj["size"], obj["n_read_addrs"],
-            obj["self_written_addrs"], flag,
-        ))
+        print(
+            "\n%s  %s  size=0x%x  reads=%d self_written=%d%s"
+            % (
+                obj["label"],
+                obj["range"],
+                obj["size"],
+                obj["n_read_addrs"],
+                obj["self_written_addrs"],
+                flag,
+            )
+        )
         if not obj["externally_provided"]:
             print("  fully self-written within the reach set")
             continue
         if obj["writers"]:
             for w in obj["writers"]:
-                print("  writer %s %s  sites=%s  class=%s" % (
-                    w["function"], w["name"] or "", ",".join(w["sites"]), w["class"],
-                ))
+                print(
+                    "  writer %s %s  sites=%s  class=%s"
+                    % (
+                        w["function"],
+                        w["name"] or "",
+                        ",".join(w["sites"]),
+                        w["class"],
+                    )
+                )
         else:
             print("  no external writer found: %s" % obj["fallback_class"])
     if contract["low_confidence_objects"]:
-        print("\n%d low-confidence bucket(s) outside any plausible DM band (likely `ptr`-pass "
-              "false positives -- non-address values resolved as if they were addresses; see "
-              "_PLAUSIBLE_DM_BANDS): %s" % (
-                  len(contract["low_confidence_objects"]),
-                  ", ".join(o["range"] for o in contract["low_confidence_objects"][:20]),
-              ))
+        print(
+            "\n%d low-confidence bucket(s) outside any plausible DM band (likely `ptr`-pass "
+            "false positives -- non-address values resolved as if they were addresses; see "
+            "_PLAUSIBLE_DM_BANDS): %s"
+            % (
+                len(contract["low_confidence_objects"]),
+                ", ".join(o["range"] for o in contract["low_confidence_objects"][:20]),
+            )
+        )
     if contract["read_base_only"]:
-        print("\nbase-only reads (base register known, exact offset not, within 0x10000):")
+        print(
+            "\nbase-only reads (base register known, exact offset not, within 0x10000):"
+        )
         for r in contract["read_base_only"][:40]:
             print("  ", r)
         if len(contract["read_base_only"]) > 40:
@@ -426,9 +477,13 @@ def _print_text(contract):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("image")
-    p.add_argument("root", help="hex or decimal short-word address of the root function")
+    p.add_argument(
+        "root", help="hex or decimal short-word address of the root function"
+    )
     p.add_argument("--json", help="write the full contract as JSON to this path")
     args = p.parse_args(argv)
 

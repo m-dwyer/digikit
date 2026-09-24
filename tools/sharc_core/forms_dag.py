@@ -8,26 +8,25 @@ family tables.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import List, Optional
 
 from sharc_disasm import Instruction
 
+from .compute import (
+    _apply_compute,
+    _compute,
+)
 from .encoding import (
     UREG_CODES,
     _field,
     _wide,
 )
-from .values import (
-    Affine,
-    CIRC_SYMBOL_PREFIX,
-    Const,
-    PartialConst,
-    Unknown,
-    _aconv,
-    _add,
-    _multiply,
-    _signed,
-    _stack_bounded_symbol,
+from .memory import (
+    _access_modifier_scale,
+    _circular_wrap_const,
+)
+from .sequencer import (
+    _advance,
+    _predicate,
 )
 from .state import (
     State,
@@ -37,23 +36,23 @@ from .state import (
     _stop,
     _ureg,
 )
-from .memory import (
-    _access_modifier_scale,
-    _circular_wrap_const,
-)
-from .compute import (
-    _apply_compute,
-    _compute,
-)
-from .sequencer import (
-    _advance,
-    _predicate,
+from .values import (
+    CIRC_SYMBOL_PREFIX,
+    Affine,
+    Const,
+    PartialConst,
+    Unknown,
+    _aconv,
+    _add,
+    _multiply,
+    _signed,
+    _stack_bounded_symbol,
 )
 
 
 def _type_7a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """7a."""
     # Type 7a is MODIFY: the manual guarantees an index-register update in
     # parallel with its optional compute.  The table now carries the M
@@ -67,7 +66,7 @@ def _type_7a(
     source, destination = source_low + bank, destination_low + bank
     modifier = _field(f, "m") + bank
     conditional = cond == 0x17
-    circular_wrap: Optional[Const] = None
+    circular_wrap: Const | None = None
     if conditional:
         if _field(f, "compute[22:16]") or _field(f, "compute[15:0]"):
             return [_stop(state, insn, "unsupported Type7a conditional compute")]
@@ -190,7 +189,7 @@ def _type_7a(
 
 def _type_7b(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """7b."""
     # Type 7b VISA MODIFY (out/refs/sharc-plus-prm pp.13-49/13-50): the
     # same index-register update as Type7a's MODIFY, minus the parallel
@@ -288,7 +287,7 @@ def _type_7b(
 
 def _type_7d(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """7d."""
     # SHARC+ Core Programming Reference (out/refs/sharc-plus-prm), ACONV
     # (Type 7d), Figure 13-21 p.352 and its Encode Table (same page):
@@ -329,7 +328,7 @@ def _type_7d(
     value = _ureg(state.uregs, src_code)
     w2b = bool(_field(f, "toby"))
     direction = "w2b" if w2b else "b2w"
-    if isinstance(value, Unknown) or isinstance(value, PartialConst):
+    if isinstance(value, (Unknown, PartialConst)):
         return [
             _stop(
                 state,
@@ -355,7 +354,7 @@ def _type_7d(
 
 def _type_19a(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
-) -> List[State]:
+) -> list[State]:
     """19a, 19a_scaled."""
     bank = 8 if _field(f, "g") else 0
     src_low = _field(f, "is")

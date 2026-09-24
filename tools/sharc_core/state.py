@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
 from sharc_disasm import Instruction
 from sharcldr import LoadedMemory
@@ -30,11 +29,11 @@ from .values import (
 @dataclass(frozen=True)
 class Pending:
     # A None target marks the delay slots of a conditional transfer not taken.
-    target: Optional[int]
+    target: int | None
     call: bool = False
     slots: int = 2
     return_from_call: bool = False
-    return_sw: Optional[int] = None
+    return_sw: int | None = None
 
 
 # Pending.return_sw placeholder for a delayed call: the return address is the
@@ -53,30 +52,30 @@ class Loop:
 @dataclass
 class State:
     pc_sw: int
-    uregs: Dict[int, Value] = field(default_factory=dict)
-    trace: List[dict] = field(default_factory=list)
-    pending: Optional[Pending] = None
+    uregs: dict[int, Value] = field(default_factory=dict)
+    trace: list[dict] = field(default_factory=list)
+    pending: Pending | None = None
     steps: int = 0
-    stopped: Optional[str] = None
+    stopped: str | None = None
     # Concrete mode is deliberately loader-only.  OVERLAY is per path, so a
     # conditional fork cannot mutate another path or the immutable boot image.
-    concrete: Optional[LoadedMemory] = None
-    overlay: Dict[int, int] = field(default_factory=dict)
-    base_sw: Optional[int] = None
+    concrete: LoadedMemory | None = None
+    overlay: dict[int, int] = field(default_factory=dict)
+    base_sw: int | None = None
     follow_loaded_calls: bool = False
     continue_external_calls: bool = False
     dossier_bytes: int = 0
     max_call_depth: int = 0
-    call_stack: List[int] = field(default_factory=list)
+    call_stack: list[int] = field(default_factory=list)
     skip_provisional_entries: bool = False
     at_loaded_entry: bool = False
     assume_nw32: bool = False
-    loops: List[Loop] = field(default_factory=list)
-    status_stack: List[tuple[Value, Value, Value]] = field(default_factory=list)
+    loops: list[Loop] = field(default_factory=list)
+    status_stack: list[tuple[Value, Value, Value]] = field(default_factory=list)
     core_reset_state: bool = False
-    mmrs: Dict[int, Value] = field(default_factory=dict)
+    mmrs: dict[int, Value] = field(default_factory=dict)
     data_memory_tainted: bool = False
-    special: Dict[str, Value] = field(default_factory=dict)
+    special: dict[str, Value] = field(default_factory=dict)
     # Forms this run may execute although the table marks them unconfirmed,
     # and the ones it actually did. A state that used any is calibration.
     provisional_forms: tuple[str, ...] = ()
@@ -156,7 +155,7 @@ def _event(state: State, insn: Instruction, action: str, **extra) -> None:
     )
 
 
-def _stop(state: State, insn: Optional[Instruction], reason: str) -> State:
+def _stop(state: State, insn: Instruction | None, reason: str) -> State:
     form = insn.type_name if insn else None
     state.trace.append(
         {"pc_sw": state.pc_sw, "form": form, "action": "stop", "reason": reason}
@@ -224,8 +223,10 @@ def _ureg(values: Mapping[int, Value], code: int) -> Value:
     """
     value = _ureg_raw(values, code)
     if isinstance(value, PartialConst):
-        return Const(value.bits) if value.mask == 0xFFFFFFFF else Unknown(
-            "partially known ASTATx"
+        return (
+            Const(value.bits)
+            if value.mask == 0xFFFFFFFF
+            else Unknown("partially known ASTATx")
         )
     return value
 
@@ -240,22 +241,27 @@ def _ureg(values: Mapping[int, Value], code: int) -> Value:
 # no complements, so they do not operate differently in SIMD mode" (p.15-3,
 # the MODE1/LCNTR example) and this tracer's single-PE handling of them is
 # already correct in SIMD mode as well as SISD.
-_CUREG_PAIRS: Dict[int, int] = {code: code + 80 for code in range(16)}
+_CUREG_PAIRS: dict[int, int] = {code: code + 80 for code in range(16)}
 _CUREG_PAIRS.update({code + 80: code for code in range(16)})
-for _pair in (("USTAT1", "USTAT2"), ("USTAT3", "USTAT4"), ("PX1", "PX2"),
-              ("ASTATX", "ASTATY"), ("STKYX", "STKYY")):
+for _pair in (
+    ("USTAT1", "USTAT2"),
+    ("USTAT3", "USTAT4"),
+    ("PX1", "PX2"),
+    ("ASTATX", "ASTATY"),
+    ("STKYX", "STKYY"),
+):
     _CUREG_PAIRS[UREG_CODES[_pair[0]]] = UREG_CODES[_pair[1]]
     _CUREG_PAIRS[UREG_CODES[_pair[1]]] = UREG_CODES[_pair[0]]
 del _pair
 
 
-def _cureg_code(code: int) -> Optional[int]:
+def _cureg_code(code: int) -> int | None:
     """The SIMD companion (Cureg) UREG code for CODE, or None if CODE has
     no SIMD complement (see _CUREG_PAIRS)."""
     return _CUREG_PAIRS.get(code)
 
 
-def _simd_active(state: State) -> Optional[bool]:
+def _simd_active(state: State) -> bool | None:
     """MODE1.PEYEN (bit 21, SHARC+ PRM p.101): True/False when MODE1 is
     concretely known, else None."""
     mode1 = _ureg(state.uregs, UREG_CODES["MODE1"])

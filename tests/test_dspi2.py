@@ -11,6 +11,17 @@ import unittest
 from unicorn import UC_HOOK_MEM_WRITE
 from unicorn.m68k_const import UC_M68K_REG_SR
 
+from emu.dspi2 import (
+    CINT,
+    E_SG,
+    RX_CHAN,
+    RX_VECTOR,
+    TX_CHAN,
+    TX_VECTOR,
+    Dspi2Link,
+    RecordingPeer,
+    ZeroPeer,
+)
 from emu.edma import (
     ATTR,
     BITER,
@@ -25,18 +36,6 @@ from emu.edma import (
     SOFF,
     TCD_BASE,
 )
-from emu.dspi2 import (
-    CINT,
-    E_SG,
-    RX_CHAN,
-    RX_VECTOR,
-    TX_CHAN,
-    TX_VECTOR,
-    Dspi2Link,
-    RecordingPeer,
-    ZeroPeer,
-)
-
 
 SERQ = 0xFC044018  # emu.edma.SERQ; re-derived here to catch an import drift
 
@@ -88,8 +87,22 @@ class FakeMachine:
         return True
 
 
-def put_tcd(machine, channel, *, source, dest, citer=4, biter=None, csr=0,
-            soff=2, doff=2, slast=0, dlast=0, attr=0x0101, nbytes=2):
+def put_tcd(
+    machine,
+    channel,
+    *,
+    source,
+    dest,
+    citer=4,
+    biter=None,
+    csr=0,
+    soff=2,
+    doff=2,
+    slast=0,
+    dlast=0,
+    attr=0x0101,
+    nbytes=2,
+):
     biter = citer if biter is None else biter
     base = TCD_BASE + channel * 0x20
     raw = bytearray(0x20)
@@ -162,13 +175,14 @@ class Dspi2LinkTest(unittest.TestCase):
         machine.uc.mem_write(0x1000, bytes(range(1, 9)))
         put_tcd(machine, TX_CHAN, source=0x1000, dest=0xDEAD)
         put_tcd(machine, RX_CHAN, source=0xBEEF, dest=0x2000)
-        link = Dspi2Link(machine, peer=InvertPeer())
+        _link = Dspi2Link(machine, peer=InvertPeer())
 
         serq(machine, TX_CHAN)
         serq(machine, RX_CHAN)
 
-        self.assertEqual(machine.uc.mem_read(0x2000, 8),
-                          bytes(b ^ 0xFF for b in range(1, 9)))
+        self.assertEqual(
+            machine.uc.mem_read(0x2000, 8), bytes(b ^ 0xFF for b in range(1, 9))
+        )
 
     def test_peer_length_mismatch_raises(self):
         class ShortPeer:
@@ -179,7 +193,7 @@ class Dspi2LinkTest(unittest.TestCase):
         machine.uc.mem_write(0x1000, bytes(range(1, 9)))
         put_tcd(machine, TX_CHAN, source=0x1000, dest=0xDEAD)
         put_tcd(machine, RX_CHAN, source=0xBEEF, dest=0x2000)
-        link = Dspi2Link(machine, peer=ShortPeer())
+        _link = Dspi2Link(machine, peer=ShortPeer())
 
         serq(machine, TX_CHAN)
         with self.assertRaisesRegex(ValueError, "7 bytes for a 8-byte frame"):
@@ -230,7 +244,9 @@ class Dspi2LinkTest(unittest.TestCase):
 
         machine.uc.reg_write(UC_M68K_REG_SR, 0)
         link.service(1)
-        self.assertEqual(sorted(machine.vectors), sorted([(TX_VECTOR, 5), (RX_VECTOR, 6)]))
+        self.assertEqual(
+            sorted(machine.vectors), sorted([(TX_VECTOR, 5), (RX_VECTOR, 6)])
+        )
 
     def test_vector_delivery_blocked_by_current_ipl_then_retried(self):
         machine = FakeMachine()
@@ -248,7 +264,9 @@ class Dspi2LinkTest(unittest.TestCase):
 
         machine.uc.reg_write(UC_M68K_REG_SR, 0)
         link.service(2)
-        self.assertEqual(sorted(machine.vectors), sorted([(TX_VECTOR, 5), (RX_VECTOR, 5)]))
+        self.assertEqual(
+            sorted(machine.vectors), sorted([(TX_VECTOR, 5), (RX_VECTOR, 5)])
+        )
 
     def test_cint_clears_pending_vector(self):
         machine = FakeMachine()

@@ -35,8 +35,8 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Mapping, Optional, Sequence, Union
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -50,7 +50,14 @@ from sharcldr import LoadedMemory  # noqa: E402
 # duplicated from tools/sharc.py's _DEFAULT_TRACE_REGS rather than importing
 # sharc.py -- that module's sqlite/networkx machinery is otherwise unneeded
 # here, and this runner also has to work from a bare LoadedMemory in tests.
-DEFAULT_REGS: Dict[str, int] = {"M5": 0, "M6": 1, "M7": -1, "M13": 0, "M14": 1, "M15": -1}
+DEFAULT_REGS: dict[str, int] = {
+    "M5": 0,
+    "M6": 1,
+    "M7": -1,
+    "M13": 0,
+    "M14": 1,
+    "M15": -1,
+}
 
 
 class Halt(Exception):
@@ -68,7 +75,7 @@ class Halt(Exception):
         self,
         reason: str,
         pc_sw: int,
-        form: Optional[str] = None,
+        form: str | None = None,
         text: str = "",
     ) -> None:
         self.reason = reason
@@ -90,8 +97,8 @@ class Halt(Exception):
 
 
 def reset_uregs(
-    overrides: Optional[Mapping[Union[str, int], Union[int, str]]] = None,
-) -> Dict[int, "st.Value"]:
+    overrides: Mapping[str | int, int | str] | None = None,
+) -> dict[int, st.Value]:
     """Every UREG code seeded with a real value.
 
     sharc_trace.CORE_UREG_RESET_VALUES already documents the reset value for
@@ -114,13 +121,13 @@ def make_state(
     data: LoadedMemory,
     start: int,
     *,
-    regs: Optional[Mapping[Union[str, int], Union[int, str]]] = None,
-    pokes: Optional[Mapping[int, int]] = None,
+    regs: Mapping[str | int, int | str] | None = None,
+    pokes: Mapping[int, int] | None = None,
     follow_loaded_calls: bool = True,
     continue_external_calls: bool = False,
     assume_nw32: bool = True,
     max_call_depth: int = 64,
-) -> "st.State":
+) -> st.State:
     """A fully concrete State ready to step, with sharc_trace's own
     _dm_write() used to apply pokes -- the same canonicalisation (loader
     alias, MMR routing, width gating) a real store instruction gets."""
@@ -129,9 +136,11 @@ def make_state(
             "sharc_run needs a LoadedMemory image; concrete execution has "
             "nothing else to read memory from"
         )
-    combined_regs: Dict[Union[str, int], Union[int, str]] = dict(DEFAULT_REGS)
+    combined_regs: dict[str | int, int | str] = dict(DEFAULT_REGS)
     combined_regs.update(regs or {})
-    mmrs = {address: st.Const(value) for address, value in st.CORE_MMR_RESET_VALUES.items()}
+    mmrs = {
+        address: st.Const(value) for address, value in st.CORE_MMR_RESET_VALUES.items()
+    }
     state = st.State(
         pc_sw=start,
         uregs=reset_uregs(combined_regs),
@@ -159,7 +168,7 @@ class RunResult:
     halt: Halt
     instructions: int
     elapsed: float
-    form_counts: "collections.Counter[str]"
+    form_counts: collections.Counter[str]
     start_pc_sw: int
     final_pc_sw: int
     max_call_depth_reached: int
@@ -199,8 +208,8 @@ class Runner:
         data: LoadedMemory,
         start: int,
         *,
-        regs: Optional[Mapping[Union[str, int], Union[int, str]]] = None,
-        pokes: Optional[Mapping[int, int]] = None,
+        regs: Mapping[str | int, int | str] | None = None,
+        pokes: Mapping[int, int] | None = None,
         follow_loaded_calls: bool = True,
         continue_external_calls: bool = False,
         assume_nw32: bool = True,
@@ -220,9 +229,9 @@ class Runner:
         )
         self.breakpoints = frozenset(breakpoints)
         self.instructions = 0
-        self.form_counts: "collections.Counter[str]" = collections.Counter()
+        self.form_counts: collections.Counter[str] = collections.Counter()
         self.max_call_depth_reached = 0
-        self._cache: Dict[int, Instruction] = {}
+        self._cache: dict[int, Instruction] = {}
 
     def invalidate(self, pc_sw: int) -> None:
         """Evict pc_sw from the decode cache. See the class docstring for
@@ -285,13 +294,13 @@ class Runner:
         )
 
 
-def _parse_kv(items: Sequence[str], flag: str) -> Dict[str, str]:
-    values: Dict[str, str] = {}
+def _parse_kv(items: Sequence[str], flag: str) -> dict[str, str]:
+    values: dict[str, str] = {}
     for item in items:
         try:
             name, value = item.split("=", 1)
         except ValueError:
-            raise SystemExit("%s must be NAME=VALUE, got %r" % (flag, item))
+            raise SystemExit("%s must be NAME=VALUE, got %r" % (flag, item)) from None
         values[name] = value
     return values
 
@@ -312,7 +321,7 @@ def _load_image_memory(name: str) -> LoadedMemory:
     return img._mem()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("image", help='sharc.py image name, e.g. "dt2-1.16"')
     p.add_argument("--start", required=True, type=lambda x: int(x, 0))
@@ -353,13 +362,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
 
-    pokes: Dict[int, int] = {}
+    pokes: dict[int, int] = {}
     for name, value in _parse_kv(a.pokes, "--poke").items():
         # HEX per --help, but int(value, 0) also takes a "0x..."-prefixed
         # value without double-interpreting it.
-        pokes[int(name, 0)] = int(value, 0) if value.lower().startswith("0x") else int(value, 16)
+        pokes[int(name, 0)] = (
+            int(value, 0) if value.lower().startswith("0x") else int(value, 16)
+        )
 
-    regs: Dict[str, int] = {}
+    regs: dict[str, int] = {}
     for name, value in _parse_kv(a.regs, "--reg").items():
         regs[name] = int(value, 0)
 
@@ -381,7 +392,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("start:  %#x" % result.start_pc_sw)
         print("final:  %#x" % result.final_pc_sw)
         print("instructions: %d" % result.instructions)
-        print("elapsed: %.3fs (%.0f instr/s)" % (result.elapsed, result.instructions_per_second))
+        print(
+            "elapsed: %.3fs (%.0f instr/s)"
+            % (result.elapsed, result.instructions_per_second)
+        )
         print("max call depth reached: %d" % result.max_call_depth_reached)
         print(
             "halt: %s at %#x (%s)%s"

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional, Union
 
 
 @dataclass(frozen=True)
@@ -73,7 +72,7 @@ class PartialConst:
         object.__setattr__(self, "bits", self.bits & self.mask)
 
 
-Value = Union[Const, Affine, Unknown, PartialConst]
+Value = Const | Affine | Unknown | PartialConst
 _SYMBOL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -120,7 +119,7 @@ _BOUNDED_SYMBOL_RE = re.compile(r"^[A-Z]+\d+e$")
 CIRC_SYMBOL_PREFIX = "circ_"
 
 
-def _stack_bounded_symbol(value: Value) -> Optional[tuple[str, int]]:
+def _stack_bounded_symbol(value: Value) -> tuple[str, int] | None:
     """-> (name, signed constant offset), if `value` is exactly one named
     symbol with coefficient 1 (any constant offset) whose name matches
     _BOUNDED_SYMBOL_RE or starts with CIRC_SYMBOL_PREFIX -- otherwise None.
@@ -216,7 +215,9 @@ def _multiply_fractional(
     return Const((x * y) >> shift)
 
 
-def _aconv_symbol(value: Affine, direction: str, source_code: int, pc_sw: int) -> Affine:
+def _aconv_symbol(
+    value: Affine, direction: str, source_code: int, pc_sw: int
+) -> Affine:
     """Return an opaque, stable symbolic result for map-dependent ACONV.
 
     B2W is not affine when the source's low two bits are unknown.  The PRM's
@@ -237,7 +238,9 @@ def _aconv(value: Value, w2b: bool, source_code: int, pc_sw: int) -> Value:
         return Unknown("ACONV source is not symbolic")
     if w2b:
         return _multiply(value, Const(4), "ACONV W2B")
-    if value.constant % 4 == 0 and all(coefficient % 4 == 0 for _, coefficient in value.terms):
+    if value.constant % 4 == 0 and all(
+        coefficient % 4 == 0 for _, coefficient in value.terms
+    ):
         return _affine(
             value.constant // 4,
             tuple((name, coefficient // 4) for name, coefficient in value.terms),
@@ -255,7 +258,7 @@ def _not(value: Value, expression: str) -> Value:
     return Const(~value.value) if isinstance(value, Const) else Unknown(expression)
 
 
-def _astatx_known_bit(value: Value, bit: int) -> Optional[bool]:
+def _astatx_known_bit(value: Value, bit: int) -> bool | None:
     """Return ASTATX/ASTATY bit BIT if known, else None."""
     if isinstance(value, Const):
         return bool(value.value & (1 << bit))

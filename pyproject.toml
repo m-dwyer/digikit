@@ -19,5 +19,28 @@ dependencies = [
 # CPython builds bundle tkinter, so the GUI in emu/gui.py works with no
 # system packages installed.
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff==0.16.9",
+]
+
 [tool.uv]
 package = false
+
+# Pinned here so ruff gives the same answer on every machine, whatever the
+# user-level ruff configuration says. tests/test_lint.py enforces these rules
+# and the formatter on the files listed there; add a file to that list when
+# you clean it.
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+# tools/ modules import each other as top-level modules (sys.path setup).
+src = [".", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = [
+    "E501",   # line length is the formatter's job
+    "UP031",  # %-formatting is the house style
+]

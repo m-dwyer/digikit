@@ -5,8 +5,7 @@ Moved verbatim from tools/sharc_trace.py.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Callable, Dict, Optional
+from collections.abc import Callable, Mapping
 
 from sharc_disasm import Instruction
 
@@ -26,48 +25,6 @@ from .encoding import (
     SZ_BIT,
     UREG_CODES,
     _field,
-)
-from .values import (
-    Const,
-    Unknown,
-    Value,
-    _add,
-    _astatx_known_bit,
-    _bitwise,
-    _multiply,
-    _multiply_fractional,
-    _not,
-    _signed,
-    _signed32,
-    _subtract,
-)
-from .state import (
-    State,
-    _event,
-    _json_value,
-    _simd_active,
-    _ureg,
-    _ureg_raw,
-)
-from .floats import (
-    _approx_recips,
-    _fixed_to_float,
-    _fixed_to_float_scaled,
-    _float32,
-    _float32_bits,
-    _float_binary,
-    _float_clip,
-    _float_copysign,
-    _float_logb,
-    _float_mantissa,
-    _float_max,
-    _float_min,
-    _float_round32,
-    _float_scalb,
-    _float_to_fixed,
-    _float_to_fixed_trunc,
-    _float_unary,
-    _scale_fixed_input,
 )
 from .flags import (
     _alu_arith_updates,
@@ -94,6 +51,48 @@ from .flags import (
     _compare_flags_float,
     _float_alu_updates,
     _or_updates,
+)
+from .floats import (
+    _approx_recips,
+    _fixed_to_float,
+    _fixed_to_float_scaled,
+    _float32,
+    _float32_bits,
+    _float_binary,
+    _float_clip,
+    _float_copysign,
+    _float_logb,
+    _float_mantissa,
+    _float_max,
+    _float_min,
+    _float_round32,
+    _float_scalb,
+    _float_to_fixed,
+    _float_to_fixed_trunc,
+    _float_unary,
+    _scale_fixed_input,
+)
+from .state import (
+    State,
+    _event,
+    _json_value,
+    _simd_active,
+    _ureg,
+    _ureg_raw,
+)
+from .values import (
+    Const,
+    Unknown,
+    Value,
+    _add,
+    _astatx_known_bit,
+    _bitwise,
+    _multiply,
+    _multiply_fractional,
+    _not,
+    _signed,
+    _signed32,
+    _subtract,
 )
 
 
@@ -128,8 +127,8 @@ def _field_deposit_or(
 def _shift_immediate(
     f: Mapping[str, int],
     values: Mapping[int, Value],
-    special: Optional[Mapping[str, Value]] = None,
-) -> tuple[int | str | tuple, Value, str, "Callable[[Value], Value]"]:
+    special: Mapping[str, Value] | None = None,
+) -> tuple[int | str | tuple, Value, str, Callable[[Value], Value]]:
     """Execute the documented ShiftImm subset seen on qualifying paths.
 
     SPECIAL is the same special-register mapping ``_compute`` reads MRF
@@ -199,7 +198,12 @@ def _shift_immediate(
             value = Unknown("fext R%d by %d:%d" % (rx, position, length))
         else:
             value = Const((source.value >> position) & ((1 << min(length, 32)) - 1))
-        return rn, value, "field-extract-immediate", _astatx_fext(position + length, value)
+        return (
+            rn,
+            value,
+            "field-extract-immediate",
+            _astatx_fext(position + length, value),
+        )
     if opcode == 0x12:
         # PRM Table 17-9 p.17-10/17-11 (out/refs/sharc-plus-prm/all.txt
         # lines 22781-22785): shiftimm 010010 is
@@ -218,8 +222,15 @@ def _shift_immediate(
         elif not isinstance(source, Const):
             value = Unknown("fext R%d by %d:%d (se)" % (rx, position, length))
         else:
-            value = Const(_signed(source.value >> position, min(length, 32)) & 0xFFFFFFFF)
-        return rn, value, "field-extract-immediate-se", _astatx_fext(position + length, value)
+            value = Const(
+                _signed(source.value >> position, min(length, 32)) & 0xFFFFFFFF
+            )
+        return (
+            rn,
+            value,
+            "field-extract-immediate-se",
+            _astatx_fext(position + length, value),
+        )
     if opcode in (0x30, 0x31):
         position = data8
         if position > 31:
@@ -270,7 +281,7 @@ def _shift_immediate(
         # opcode 0x7c above (writes the bit-FIFO write-pointer special
         # register, not an RN).
         new_wrp = Const(data8 & 0x7F)
-        updates: Dict[int, Optional[bool]] = {
+        updates: dict[int, bool | None] = {
             SS_BIT: False,
             SZ_BIT: False,
             SV_BIT: new_wrp.value > 64,
@@ -331,8 +342,8 @@ def _mr_data_move(
     rn: int,
     direction: int,
     values: Mapping[int, Value],
-    special: Optional[Mapping[str, Value]],
-) -> tuple[int | str, Value, str, "Callable[[Value], Value]"]:
+    special: Mapping[str, Value] | None,
+) -> tuple[int | str, Value, str, Callable[[Value], Value]]:
     """PRM Table 18-29 MRDATAMOVE (p.438): moves a 32-bit value between the
     register file and one of the six banked multiplier-result registers.
     MR0F is the low 32 bits of the same 80-bit accumulator the
@@ -360,10 +371,10 @@ def _compute(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Optional[Mapping[str, Value]] = None,
+    special: Mapping[str, Value] | None = None,
     *,
     approx_recips: bool = False,
-) -> Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]]:
+) -> tuple[int | str, Value, str, Callable[[Value], Value]] | None:
     """Decode the small public-table subset, reading every operand from VALUES.
 
     The 4th element of a non-None result is an ASTATX updater: a function
@@ -422,7 +433,11 @@ def _compute(
         # (a, b, subtract) triple for the arithmetic-flags rule, or "mult"
         # to forget the (unmodelled) multiplier flags.
         operations = {
-            0: ("add", lambda: _add(left, right, "R%d + R%d" % (rn, rx)), (left, right, False)),
+            0: (
+                "add",
+                lambda: _add(left, right, "R%d + R%d" % (rn, rx)),
+                (left, right, False),
+            ),
             1: (
                 "subtract",
                 lambda: _subtract(
@@ -436,8 +451,16 @@ def _compute(
                 lambda: _not(right, "not R%d" % rx),
                 None,
             ),
-            5: ("increment", lambda: _add(right, Const(1), "R%d + 1" % rx), (right, Const(1), False)),
-            6: ("decrement", lambda: _add(right, Const(-1), "R%d - 1" % rx), (right, Const(1), True)),
+            5: (
+                "increment",
+                lambda: _add(right, Const(1), "R%d + 1" % rx),
+                (right, Const(1), False),
+            ),
+            6: (
+                "decrement",
+                lambda: _add(right, Const(-1), "R%d - 1" % rx),
+                (right, Const(1), True),
+            ),
             7: (
                 "multiply",
                 lambda: _multiply(left, right, "R%d * R%d" % (rn, rx)),
@@ -478,23 +501,36 @@ def _compute(
             value, overflow, invalid = _float_binary(
                 left, right, "F%d + F%d" % (rn, rx), lambda a, b: a + b
             )
-            return rn, value, "float-add", _astatx_from_updates(
-                _float_alu_updates(value, av=overflow, ai=invalid)
+            return (
+                rn,
+                value,
+                "float-add",
+                _astatx_from_updates(
+                    _float_alu_updates(value, av=overflow, ai=invalid)
+                ),
             )
         if opcode == 0x9:
             value, overflow, invalid = _float_binary(
                 left, right, "F%d - F%d" % (rn, rx), lambda a, b: a - b
             )
-            return rn, value, "float-subtract", _astatx_from_updates(
-                _float_alu_updates(value, av=overflow, ai=invalid)
+            return (
+                rn,
+                value,
+                "float-subtract",
+                _astatx_from_updates(
+                    _float_alu_updates(value, av=overflow, ai=invalid)
+                ),
             )
         if opcode == 0xA:
             # FN = float RX: unlike the other short float rows, RN is not
             # read as an input here (only RX is converted); RN is purely the
             # destination.
             value, invalid = _fixed_to_float(right, "float R%d" % rx)
-            return rn, value, "float-convert", _astatx_from_updates(
-                _float_alu_updates(value, av=False, ai=invalid)
+            return (
+                rn,
+                value,
+                "float-convert",
+                _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
             )
         if opcode == 0xB:
             label = "comp F%d, F%d" % (rn, rx)
@@ -614,7 +650,9 @@ def _compute(
             # data-dependent, unlike plain float add).
             if category == 0x1C:
                 fa_value, _fa_overflow, fa_invalid = _float_binary(
-                    fxa, fya, "(F%d + F%d)/2" % (rxa_reg, rya_reg),
+                    fxa,
+                    fya,
+                    "(F%d + F%d)/2" % (rxa_reg, rya_reg),
                     lambda a, b: (a + b) / 2,
                 )
                 return with_mult(
@@ -711,16 +749,19 @@ def _compute(
                 _alu_arith_updates(left, right, True, same_source=rx == ry),
             )
             operation = "dual-add-subtract"
-        return (rn, rs), (add_value, sub_value), operation, _astatx_from_updates(updates)
+        return (
+            (rn, rs),
+            (add_value, sub_value),
+            operation,
+            _astatx_from_updates(updates),
+        )
     # PRM Table 17-5: ALUOP 00000001/00000010 are add/subtract.
     if cu == 0 and opcode == 0x01:
         value = _add(left, right, "R%d + R%d" % (rx, ry))
         return rn, value, "add", _astatx_alu_arith(left, right, False)
     if cu == 0 and opcode == 0x02:
         same_source = rx == ry
-        value = _subtract(
-            left, right, "R%d - R%d" % (rx, ry), same_source=same_source
-        )
+        value = _subtract(left, right, "R%d - R%d" % (rx, ry), same_source=same_source)
         return (
             rn,
             value,
@@ -738,7 +779,12 @@ def _compute(
         subtract = opcode == 0x06
         astatx = _ureg_raw(values, UREG_CODES["ASTATX"])
         carry_in = _astatx_known_bit(astatx, AC_BIT)
-        label = "R%d %s R%d + ci%s" % (rx, "-" if subtract else "+", ry, " - 1" if subtract else "")
+        label = "R%d %s R%d + ci%s" % (
+            rx,
+            "-" if subtract else "+",
+            ry,
+            " - 1" if subtract else "",
+        )
         if carry_in is None:
             value = Unknown(label)
         else:
@@ -750,7 +796,12 @@ def _compute(
             offset = (1 if carry_in else 0) - (1 if subtract else 0)
             value = _add(base, Const(offset), label)
         operation = "subtract-with-borrow" if subtract else "add-with-carry"
-        return rn, value, operation, _astatx_alu_arith_ci(left, right, subtract, carry_in)
+        return (
+            rn,
+            value,
+            operation,
+            _astatx_alu_arith_ci(left, right, subtract, carry_in),
+        )
     # PGR p.11-9/11-10 (pgr.txt:20570/20606), opcodes 0010 0101/0010 0110:
     # RN = RX + ci / RN = RX + ci - 1 -- the single-operand twins of
     # 0x05/0x06 above (no RY; PGR's flag table is identical to the RY form),
@@ -766,7 +817,12 @@ def _compute(
             offset = (1 if carry_in else 0) - (1 if subtract else 0)
             value = _add(left, Const(offset), label)
         operation = "subtract-with-borrow" if subtract else "add-with-carry"
-        return rn, value, operation, _astatx_alu_arith_ci(left, Const(0), subtract, carry_in)
+        return (
+            rn,
+            value,
+            operation,
+            _astatx_alu_arith_ci(left, Const(0), subtract, carry_in),
+        )
     # PRM Table 18-5: ALUOP 00001010 is signed comp(RX, RY) and 00001011 is
     # unsigned compu(RX, RY). Both update status only, so the tracer records
     # the comparison without writing RN; the value carries the new flags.
@@ -830,15 +886,21 @@ def _compute(
         value, overflow, invalid = _float_binary(
             left, right, "F%d + F%d" % (rx, ry), lambda a, b: a + b
         )
-        return rn, value, "float-add", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-add",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
         )
     if cu == 0 and opcode == 0x82:
         value, overflow, invalid = _float_binary(
             left, right, "F%d - F%d" % (rx, ry), lambda a, b: a - b
         )
-        return rn, value, "float-subtract", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-subtract",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
         )
     # PGR p.11-27 (pgr.txt:21185), opcode 1001 0010: Fn = abs(Fx - Fy).
     # Magnitude (and so AV/AZ) is identical to plain float-subtract above;
@@ -849,8 +911,13 @@ def _compute(
             left, right, "F%d - F%d" % (rx, ry), lambda a, b: a - b
         )
         value = Const(diff.value & 0x7FFFFFFF) if isinstance(diff, Const) else diff
-        return rn, value, "float-abs-subtract", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, an_zero=True, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-abs-subtract",
+            _astatx_from_updates(
+                _float_alu_updates(value, av=overflow, an_zero=True, ai=invalid)
+            ),
         )
     # PGR p.11-29: comp(Fx, Fy).
     if cu == 0 and opcode == 0x8A:
@@ -860,21 +927,30 @@ def _compute(
     # PGR p.11-32: Fn = pass Fx.
     if cu == 0 and opcode == 0xA1:
         value, overflow, invalid = _float_unary(left, "pass F%d" % rx, lambda a: a)
-        return rn, value, "float-pass", _astatx_from_updates(
-            _float_alu_updates(value, av=False, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-pass",
+            _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
         )
     # PGR p.11-30: Fn = -Fx.
     if cu == 0 and opcode == 0xA2:
         value, overflow, invalid = _float_unary(left, "-F%d" % rx, lambda a: -a)
-        return rn, value, "float-negate", _astatx_from_updates(
-            _float_alu_updates(value, av=False, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-negate",
+            _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
         )
     # PRM Table 18-5 opcode 1010 0101 (p.20-8) / PGR Table 12-4 opcode
     # 1010 0101, p.11-33: Fn = rnd Fx.
     if cu == 0 and opcode == 0xA5:
         value, invalid = _float_round32(left, "rnd F%d" % rx)
-        return rn, value, "float-round32", _astatx_from_updates(
-            _float_alu_updates(value, av=False, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-round32",
+            _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
         )
     # PGR p.11-34/11-35: Rn = mant Fx. Bespoke flag dict, not
     # ``_float_alu_updates``: the result is an unsigned-magnitude fixed
@@ -908,14 +984,23 @@ def _compute(
             AV_BIT: overflow,
             AI_BIT: invalid,
             AZ_BIT: (value.value == 0) if isinstance(value, Const) else None,
-            AN_BIT: bool(value.value & 0x80000000) if isinstance(value, Const) else None,
+            AN_BIT: bool(value.value & 0x80000000)
+            if isinstance(value, Const)
+            else None,
         }
         return rn, value, "logb", _astatx_from_updates(updates)
     # PGR p.11-31: Fn = abs Fx. AN fixed 0; AS carries the *input*'s sign.
     if cu == 0 and opcode == 0xB0:
         value, overflow, invalid = _float_unary(left, "abs F%d" % rx, abs)
-        return rn, value, "float-abs", _astatx_from_updates(
-            _float_alu_updates(value, av=False, an_zero=True, as_source=left, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-abs",
+            _astatx_from_updates(
+                _float_alu_updates(
+                    value, av=False, an_zero=True, as_source=left, ai=invalid
+                )
+            ),
         )
     # PGR p.11-33: Fn = scalb Fx by Ry. Unlike abs/pass/etc., AN here
     # follows the *result*'s sign (PRM Table 3-3 marks AN '*', not 0), so
@@ -925,8 +1010,11 @@ def _compute(
         value, overflow, invalid = _float_scalb(
             left, right, "scalb F%d by R%d" % (rx, ry)
         )
-        return rn, value, "float-scalb", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-scalb",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
         )
     # PGR p.11-20/11-21: Rn = min/max(Rx, Ry) -- fixed-point, not the
     # float min/max at 0xE1/0xE2 below. AV/AC/AS/AI/AF are all fixed 0
@@ -946,8 +1034,11 @@ def _compute(
     # Fx copysign Fy.
     if cu == 0 and opcode == 0xE0:
         value, invalid = _float_copysign(left, right, "F%d copysign F%d" % (rx, ry))
-        return rn, value, "float-copysign", _astatx_from_updates(
-            _float_alu_updates(value, av=False, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-copysign",
+            _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
         )
     # PGR p.11-46/11-47: Fn = min/max(Fx, Fy).
     if cu == 0 and opcode in (0xE1, 0xE2):
@@ -956,22 +1047,31 @@ def _compute(
         value, overflow, invalid = _float_binary(
             left, right, "%s(F%d, F%d)" % (name, rx, ry), combine
         )
-        return rn, value, "float-" + name, _astatx_from_updates(
-            _float_alu_updates(value, av=False, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-" + name,
+            _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
         )
     # PGR p.11-48 / PRM p.3-6: Fn = clip Fx by Fy.
     if cu == 0 and opcode == 0xE3:
         value, overflow, invalid = _float_binary(
             left, right, "clip F%d by F%d" % (rx, ry), _float_clip
         )
-        return rn, value, "float-clip", _astatx_from_updates(
-            _float_alu_updates(value, av=False, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-clip",
+            _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
         )
     # PRM p.427/PGR p.11-39 "without scaling factor": Fn = float Rx.
     if cu == 0 and opcode == 0xCA:
         value, invalid = _fixed_to_float(left, "float R%d" % rx)
-        return rn, value, "float-convert", _astatx_from_updates(
-            _float_alu_updates(value, av=False, ai=invalid)
+        return (
+            rn,
+            value,
+            "float-convert",
+            _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
         )
     # PGR p.11-39 "with scaling factor" / PRM p.19-.. : Fn = float Rx by Ry.
     # AV is data-dependent here (unlike the unscaled form above, where an
@@ -980,8 +1080,11 @@ def _compute(
         value, overflow = _fixed_to_float_scaled(
             left, right, "float R%d by R%d" % (rx, ry)
         )
-        return rn, value, "float-convert-scaled", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=False)
+        return (
+            rn,
+            value,
+            "float-convert-scaled",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=False)),
         )
     # PRM p.24-.. / PGR p.11-36..11-38, opcode 1100 1001: Rn = fix Fx
     # (rounds to nearest or truncates per MODE1.TRUNCATE; see
@@ -989,15 +1092,21 @@ def _compute(
     if cu == 0 and opcode == 0xC9:
         mode1 = _ureg_raw(values, UREG_CODES["MODE1"])
         value, overflow, invalid = _float_to_fixed(left, mode1, False, "fix F%d" % rx)
-        return rn, value, "fix", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=invalid)
+        return (
+            rn,
+            value,
+            "fix",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
         )
     # PRM p.427/PGR p.11-37: Rn = trunc Fx.
     if cu == 0 and opcode == 0xCD:
         mode1 = _ureg_raw(values, UREG_CODES["MODE1"])
         value, overflow, invalid = _float_to_fixed_trunc(left, mode1, "trunc F%d" % rx)
-        return rn, value, "trunc", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=invalid)
+        return (
+            rn,
+            value,
+            "trunc",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
         )
     # PGR p.11-36..11-38, opcode 1101 1001: Rn = fix Fx by Ry -- Ry's
     # exponent-add (``_scale_fixed_input``) applied before the same fix
@@ -1009,8 +1118,11 @@ def _compute(
         value, overflow, invalid = _float_to_fixed(
             scaled, mode1, False, "fix F%d by R%d" % (rx, ry)
         )
-        return rn, value, "fix-scaled", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=invalid)
+        return (
+            rn,
+            value,
+            "fix-scaled",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
         )
     # PGR p.11-36..11-38, opcode 1101 1101: Rn = trunc Fx by Ry -- Ry's
     # exponent-add applied before the same truncation as 0xCD; PGR Table 3-3
@@ -1021,8 +1133,11 @@ def _compute(
         value, overflow, invalid = _float_to_fixed(
             scaled, mode1, True, "trunc F%d by R%d" % (rx, ry)
         )
-        return rn, value, "trunc-scaled", _astatx_from_updates(
-            _float_alu_updates(value, av=overflow, ai=invalid)
+        return (
+            rn,
+            value,
+            "trunc-scaled",
+            _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
         )
     # PRM p.427 / PGR p.11-44/11-45: Fn = recips/rsqrts Fx -- iterative
     # reciprocal/reciprocal-sqrt seed instructions. The seed mantissa comes
@@ -1040,14 +1155,22 @@ def _compute(
             value, updates = _approx_recips(left)
             return rn, value, "float-recips-seed-approx", _astatx_from_updates(updates)
         label = "%s F%d (iterative seed, not numerically modeled)" % (name, rx)
-        return rn, Unknown(label), "float-" + name + "-seed", _astatx_from_updates(
-            _float_alu_updates(Unknown(label), av=None, ai=None)
+        return (
+            rn,
+            Unknown(label),
+            "float-" + name + "-seed",
+            _astatx_from_updates(_float_alu_updates(Unknown(label), av=None, ai=None)),
         )
     # PRM Table 17-7: MULOP 0000 F00x writes a saturated MRF value to RN.
     # The tracer does not model the full-width multiplier accumulator or MOD2
     # format bits, so preserve the documented data dependency conservatively.
     if cu == 1 and opcode == 0x00:
-        return rn, Unknown("saturated MRF (unmodeled MOD2)"), "saturate-mrf", _astatx_mult_forget
+        return (
+            rn,
+            Unknown("saturated MRF (unmodeled MOD2)"),
+            "saturate-mrf",
+            _astatx_mult_forget,
+        )
     if cu == 1 and opcode == 0x70:
         value = _multiply(left, right, "R%d * R%d" % (rx, ry))
         return rn, value, "multiply", _astatx_mult_forget
@@ -1078,9 +1201,7 @@ def _compute(
     # the 64-bit unsigned product (no redundant-sign shift; that only
     # applies when both inputs are signed).
     if cu == 1 and opcode == 0x48:
-        value = _multiply_fractional(
-            left, right, False, False, "R%d * R%d" % (rx, ry)
-        )
+        value = _multiply_fractional(left, right, False, False, "R%d * R%d" % (rx, ry))
         return rn, value, "multiply", _astatx_mult_fixed
     # PRM Table 17-7, "mrf = RX*RY MOD1" row (no accumulate), MOD1 SSI
     # sub-option: the plain-load twin of opcode 0xB4's accumulate above,
@@ -1092,17 +1213,13 @@ def _compute(
     # PRM p.3-9 -- both inputs signed, so the redundant-sign left shift
     # applies (folded into _multiply_fractional's >>31).
     if cu == 1 and opcode == 0x7C:
-        value = _multiply_fractional(
-            left, right, True, True, "R%d * R%d" % (rx, ry)
-        )
+        value = _multiply_fractional(left, right, True, True, "R%d * R%d" % (rx, ry))
         return "MRF", value, "multiply-mrf", _astatx_mult_fixed
     # PRM Table 17-7, "mrf = mrf + RX*RY MOD1" row, MOD1 SSF sub-option:
     # the fractional twin of opcode 0xB4 (SSI, integer) above.
     if cu == 1 and opcode == 0xBC:
         accumulator = (special or {}).get("MRF", Unknown("uninitialized MRF"))
-        product = _multiply_fractional(
-            left, right, True, True, "R%d * R%d" % (rx, ry)
-        )
+        product = _multiply_fractional(left, right, True, True, "R%d * R%d" % (rx, ry))
         value = _add(accumulator, product, "MRF + R%d * R%d (SSF)" % (rx, ry))
         return "MRF", value, "multiply-accumulate", _astatx_mult_fixed
     # PRM Table 17-7, "RN = sat mrf MOD2" row, MOD2 SF sub-option: same row
@@ -1139,8 +1256,11 @@ def _compute(
     # the manuals do not cover.
     if cu == 2 and opcode == 0xB0:
         label = "shift opcode 0xb0 R%d, R%d (undocumented; no public source)" % (rx, ry)
-        return rn, Unknown(label), "shift-undocumented-b0", lambda astatx: _astatx_forget(
-            astatx, ALU_FLAGS_MASK
+        return (
+            rn,
+            Unknown(label),
+            "shift-undocumented-b0",
+            lambda astatx: _astatx_forget(astatx, ALU_FLAGS_MASK),
         )
     # Shifter opcode 0001 0100: absent from PRM Table 17-9, PGR Table 12-11
     # and tools/sharcspec/compute_table.json's shiftop_shiftimm table alike
@@ -1150,14 +1270,17 @@ def _compute(
     # 0xb0 case above (so the walk does not desync) rather than guessed.
     if cu == 2 and opcode == 0x14:
         label = "shift opcode 0x14 R%d, R%d (undocumented; no public source)" % (rx, ry)
-        return rn, Unknown(label), "shift-undocumented-14", lambda astatx: _astatx_forget(
-            astatx, SHIFT_FLAGS_MASK
+        return (
+            rn,
+            Unknown(label),
+            "shift-undocumented-14",
+            lambda astatx: _astatx_forget(astatx, SHIFT_FLAGS_MASK),
         )
     # PRM Table 17-9: SHIFTOP 00000000 is RN = LSHIFT RX by RY. The signed
     # low byte of RY selects a left (positive) or logical right (negative)
     # shift; magnitudes of 32 or more produce zero.
     if cu == 2 and opcode == 0x00:
-        amount: Optional[int] = None
+        amount: int | None = None
         if not isinstance(right, Const):
             value = Unknown("lshift R%d by R%d" % (rx, ry))
         else:
@@ -1195,11 +1318,7 @@ def _compute(
             elif amount >= 32:
                 value = Const(0)
             elif amount <= -32:
-                value = (
-                    Const(0xFFFFFFFF)
-                    if left.value & 0x80000000
-                    else Const(0)
-                )
+                value = Const(0xFFFFFFFF) if left.value & 0x80000000 else Const(0)
             elif amount > 0:
                 value = Const(left.value << amount)
             else:
@@ -1212,7 +1331,7 @@ def _compute(
     # plain lshift (0x00 above), computed independently here rather than
     # shared, then ORed into RN instead of replacing it.
     if cu == 2 and opcode == 0x20:
-        or_amount: Optional[int] = None
+        or_amount: int | None = None
         if not isinstance(right, Const):
             shifted = Unknown("lshift R%d by R%d" % (rx, ry))
         else:
@@ -1301,7 +1420,7 @@ def _compute(
     # out of UPDATES entirely (stays whatever it already was).
     if cu == 2 and opcode == 0x70:
         value = (special or {}).get("BFFWRP", Unknown("uninitialized BFFWRP"))
-        updates: Dict[int, Optional[bool]] = {SS_BIT: False, SZ_BIT: False, SV_BIT: False}
+        updates: dict[int, bool | None] = {SS_BIT: False, SZ_BIT: False, SV_BIT: False}
         return rn, value, "bffwrp-read", _astatx_from_updates(updates)
     # PGR p.11-89 (pgr.txt:23379), opcode 0111 1100: BFFWRP = RN|<data7> --
     # the register-operand twin of ShiftImm opcode 0x1f below. The register
@@ -1310,8 +1429,10 @@ def _compute(
     # significant bits of Rn are written."
     if cu == 2 and opcode == 0x7C:
         source = _ureg(values, rn)
-        new_wrp = Const(source.value & 0x7F) if isinstance(source, Const) else Unknown(
-            "BFFWRP = R%d" % rn
+        new_wrp = (
+            Const(source.value & 0x7F)
+            if isinstance(source, Const)
+            else Unknown("BFFWRP = R%d" % rn)
         )
         updates = {
             SS_BIT: False,
@@ -1330,13 +1451,19 @@ def _compute(
     # guessed at; every other cu=3 opcode still raises, since there is no
     # evidence it is real or what it would mean.
     if cu == 3 and opcode == 0xD6:
-        label = "reserved compute unit cu=3 opcode=%#x R%d, R%d (PRM: cu=11 not used by SINGLEFN)" % (
-            opcode,
-            rx,
-            ry,
+        label = (
+            "reserved compute unit cu=3 opcode=%#x R%d, R%d (PRM: cu=11 not used by SINGLEFN)"
+            % (
+                opcode,
+                rx,
+                ry,
+            )
         )
-        return rn, Unknown(label), "compute-reserved-cu3", lambda astatx: _astatx_forget(
-            astatx, ALU_FLAGS_MASK | SHIFT_FLAGS_MASK
+        return (
+            rn,
+            Unknown(label),
+            "compute-reserved-cu3",
+            lambda astatx: _astatx_forget(astatx, ALU_FLAGS_MASK | SHIFT_FLAGS_MASK),
         )
     raise ValueError("unsupported full compute cu=%#x opcode=%#x" % (cu, opcode))
 
@@ -1344,7 +1471,7 @@ def _compute(
 def _apply_compute(
     state: State,
     insn: Instruction,
-    result: tuple[int | str, Value, str, "Callable[[Value], Value]"],
+    result: tuple[int | str, Value, str, Callable[[Value], Value]],
 ) -> None:
     rn, value, operation, astatx_update = result
     astatx_code = UREG_CODES["ASTATX"]
@@ -1380,7 +1507,7 @@ def _apply_compute(
             result_register=names,
             value=[_json_value(v) for v in value],
         )
-        for reg, val in zip(rn, value):
+        for reg, val in zip(rn, value, strict=True):
             if isinstance(reg, str):
                 state.special["MRF" if reg == "MR0F" else reg] = val
             else:
@@ -1407,7 +1534,7 @@ def _apply_compute(
         _event(state, insn, "approximate-recips", value=value)
 
 
-def _compute_pey_values(values: Mapping[int, Value]) -> Dict[int, Value]:
+def _compute_pey_values(values: Mapping[int, Value]) -> dict[int, Value]:
     """A PEy view of the register file for _compute: R/F codes 0-15 read
     the paired S/SF register instead (SHARC+ PRM p.3-39, "Compute
     Instructions in SIMD Mode": "S0 = S1 + S2; /* implicit ALU instruction
@@ -1424,10 +1551,10 @@ def _compute_pey(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Optional[Mapping[str, Value]] = None,
+    special: Mapping[str, Value] | None = None,
     *,
     approx_recips: bool = False,
-) -> Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]]:
+) -> tuple[int | str, Value, str, Callable[[Value], Value]] | None:
     """PEy's half of a SIMD compute (SHARC+ PRM p.101, "SIMD Mode":
     "Executes the same instruction simultaneously in both processing
     elements"), decoded against the S/SF register file and the PEy
@@ -1452,7 +1579,7 @@ def _compute_pey(
 def _apply_compute_pey(
     state: State,
     insn: Instruction,
-    result: tuple[int | str, Value, str, "Callable[[Value], Value]"],
+    result: tuple[int | str, Value, str, Callable[[Value], Value]],
 ) -> None:
     """PEy's half of _apply_compute: the identical shape, redirected to the
     S/SF register file, REGF_ASTATY, and the PEy multiplier accumulator
@@ -1482,7 +1609,7 @@ def _apply_compute_pey(
             result_register=names,
             value=[_json_value(v) for v in value],
         )
-        for reg, val in zip(rn, value):
+        for reg, val in zip(rn, value, strict=True):
             state.uregs[80 + reg] = val
         return
     if operation in ("compare", "bit-test", "float-compare"):
@@ -1507,12 +1634,12 @@ def _compute_simd(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Optional[Mapping[str, Value]] = None,
+    special: Mapping[str, Value] | None = None,
     *,
     approx_recips: bool = False,
 ) -> tuple[
-    Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
-    Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
+    tuple[int | str, Value, str, Callable[[Value], Value]] | None,
+    tuple[int | str, Value, str, Callable[[Value], Value]] | None,
 ]:
     """Decode a compute for PEx, and for PEy too when MODE1.PEYEN is
     concretely set (SHARC+ PRM p.101, "SIMD Mode": "Dispatches a single
@@ -1530,8 +1657,8 @@ def _compute_simd(
 def _apply_compute_simd(
     state: State,
     insn: Instruction,
-    result_x: Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
-    result_y: Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
+    result_x: tuple[int | str, Value, str, Callable[[Value], Value]] | None,
+    result_y: tuple[int | str, Value, str, Callable[[Value], Value]] | None,
 ) -> None:
     if result_x is not None:
         _apply_compute(state, insn, result_x)

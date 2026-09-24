@@ -6,8 +6,7 @@ Moved verbatim from tools/sharc_trace.py.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from typing import Callable, Dict, Optional
+from collections.abc import Callable, Mapping
 
 from .encoding import (
     AC_BIT,
@@ -20,12 +19,15 @@ from .encoding import (
     AZ_BIT,
     MI_BIT,
     MN_BIT,
-    MULT_FLAGS_MASK,
     MU_BIT,
+    MULT_FLAGS_MASK,
     MV_BIT,
     SS_BIT,
     SV_BIT,
     SZ_BIT,
+)
+from .floats import (
+    _float32,
 )
 from .values import (
     Const,
@@ -34,9 +36,6 @@ from .values import (
     Value,
     _astatx_known_bit,
     _signed32,
-)
-from .floats import (
-    _float32,
 )
 
 
@@ -52,15 +51,13 @@ def _compare_flags(left: Value, right: Value, signed: bool, label: str) -> Value
     if signed:
         x, y = _signed32(x), _signed32(y)
     return Const(
-        (0x1 if x == y else 0)
-        | (0x4 if x < y else 0)
-        | (0x80000000 if x > y else 0)
+        (0x1 if x == y else 0) | (0x4 if x < y else 0) | (0x80000000 if x > y else 0)
     )
 
 
 def _compare_flags_float(
     left: Value, right: Value, label: str
-) -> tuple[Value, Optional[bool]]:
+) -> tuple[Value, bool | None]:
     """comp(FX, FY) (PRM Table 18-5 opcode 0x8A, p.426; PGR p.11-29).
 
     Same bit-0 (AZ)/bit-2 (AN)/bit-31 (new CACC MSB) value encoding
@@ -85,11 +82,11 @@ def _compare_flags_float(
     )
 
 
-def _bits_to_updates(mask: int, bits: Optional[int]) -> Dict[int, Optional[bool]]:
+def _bits_to_updates(mask: int, bits: int | None) -> dict[int, bool | None]:
     """Expand an optional MASK-shaped flag bit pattern into an
     ``_astatx_apply_bits()`` updates dict; BITS=None forgets every bit in
     MASK."""
-    updates: Dict[int, Optional[bool]] = {}
+    updates: dict[int, bool | None] = {}
     bit = 0
     while (1 << bit) <= mask:
         if mask & (1 << bit):
@@ -99,8 +96,8 @@ def _bits_to_updates(mask: int, bits: Optional[int]) -> Dict[int, Optional[bool]
 
 
 def _or_updates(
-    a: Dict[int, Optional[bool]], b: Dict[int, Optional[bool]]
-) -> Dict[int, Optional[bool]]:
+    a: dict[int, bool | None], b: dict[int, bool | None]
+) -> dict[int, bool | None]:
     """Kleene-OR two ASTATX update dicts bit by bit (PRM p.3-21/3-22:
     "Multifunction Computations ... in the dual add/subtract computation,
     the ALU flags from the two operations are ORed together"). True beats
@@ -119,7 +116,7 @@ def _or_updates(
 
 def _alu_arith_updates(
     a: Value, b: Value, subtract: bool, *, same_source: bool = False
-) -> Dict[int, Optional[bool]]:
+) -> dict[int, bool | None]:
     """Dict-returning counterpart of ``_astatx_alu_arith`` (PRM pp.439-440,
     446-447), for callers -- the fixed-point dual add/subtract -- that need
     to OR two such results together before applying either to ASTATX.
@@ -128,7 +125,9 @@ def _alu_arith_updates(
     are the same operand read twice, so the flags are those of 0-0 (AZ/AC
     set, AN/AV clear) regardless of what value that operand held."""
     if same_source and subtract:
-        return _bits_to_updates(ALU_FLAGS_MASK, _arith_flag_bits(Const(0), Const(0), True))
+        return _bits_to_updates(
+            ALU_FLAGS_MASK, _arith_flag_bits(Const(0), Const(0), True)
+        )
     if isinstance(a, Const) and isinstance(b, Const):
         return _bits_to_updates(ALU_FLAGS_MASK, _arith_flag_bits(a, b, subtract))
     return _bits_to_updates(ALU_FLAGS_MASK, None)
@@ -137,11 +136,11 @@ def _alu_arith_updates(
 def _float_alu_updates(
     result: Value,
     *,
-    av: Optional[bool] = False,
+    av: bool | None = False,
     an_zero: bool = False,
-    as_source: Optional[Value] = None,
-    ai: Optional[bool] = None,
-) -> Dict[int, Optional[bool]]:
+    as_source: Value | None = None,
+    ai: bool | None = None,
+) -> dict[int, bool | None]:
     """ASTATX update dict shared by the float ALU ops (PRM Table 3-3,
     pp.3-8/3-9; per-op PGR pages cited at each call site).
 
@@ -154,7 +153,7 @@ def _float_alu_updates(
     or an explicit fixed value for an op the table/PGR documents as always
     0 (e.g. FN=float RX's AV and AI).
     """
-    updates: Dict[int, Optional[bool]] = {
+    updates: dict[int, bool | None] = {
         AC_BIT: False,
         AF_BIT: True,
         AV_BIT: av,
@@ -171,14 +170,16 @@ def _float_alu_updates(
     return updates
 
 
-def _astatx_from_updates(updates: Dict[int, Optional[bool]]) -> "Callable[[Value], Value]":
+def _astatx_from_updates(updates: dict[int, bool | None]) -> Callable[[Value], Value]:
     """Wrap a pre-built updates dict as an ASTATX updater function, matching
     the ``Callable[[Value], Value]`` contract every other compute-table
     branch returns."""
     return lambda astatx: _astatx_apply_bits(astatx, updates)
 
 
-def _astatx_compare_float(value: Value, invalid: Optional[bool]) -> "Callable[[Value], Value]":
+def _astatx_compare_float(
+    value: Value, invalid: bool | None
+) -> Callable[[Value], Value]:
     """Float comp (PRM Table 3-3 AI='*'; PGR p.11-29 spells it out: "Set if
     either of the input operands is a NAN"). Identical to
     ``_astatx_compare``'s AC/AV/AS-clear, AZ/AN/CACC-from-VALUE and
@@ -205,7 +206,11 @@ def _astatx_define(old: Value, mask: int, bits: int) -> Value:
     if isinstance(old, PartialConst):
         new_mask = old.mask | mask
         new_bits = (old.bits & ~mask) | bits
-        return Const(new_bits) if new_mask == 0xFFFFFFFF else PartialConst(new_mask, new_bits)
+        return (
+            Const(new_bits)
+            if new_mask == 0xFFFFFFFF
+            else PartialConst(new_mask, new_bits)
+        )
     # Unknown (or a stray non-ASTATX Value type): only MASK becomes known.
     if not mask:
         return old
@@ -224,10 +229,14 @@ def _astatx_forget(old: Value, mask: int) -> Value:
         new_bits = old.bits & new_mask
     else:
         return old
-    return Unknown("astatx bits forgotten") if new_mask == 0 else PartialConst(new_mask, new_bits)
+    return (
+        Unknown("astatx bits forgotten")
+        if new_mask == 0
+        else PartialConst(new_mask, new_bits)
+    )
 
 
-def _astatx_apply_bits(old: Value, updates: Mapping[int, Optional[bool]]) -> Value:
+def _astatx_apply_bits(old: Value, updates: Mapping[int, bool | None]) -> Value:
     """Apply per-bit updates to an ASTATX-like value: True/False defines that
     bit, None forgets it (downgrades to unknown). Bits not mentioned in
     UPDATES are left exactly as OLD had them."""
@@ -290,7 +299,7 @@ def _arith_flag_bits(a: Const, b: Const, subtract: bool) -> int:
     return bits
 
 
-def _astatx_alu_logical(value: Value) -> "Callable[[Value], Value]":
+def _astatx_alu_logical(value: Value) -> Callable[[Value], Value]:
     """pass/not/and/or/xor: AC/AV/AS/AI/AF cleared; AN/AZ from VALUE."""
 
     def update(astatx: Value) -> Value:
@@ -303,7 +312,7 @@ def _astatx_alu_logical(value: Value) -> "Callable[[Value], Value]":
 
 def _astatx_alu_arith(
     a: Value, b: Value, subtract: bool, *, same_source: bool = False
-) -> "Callable[[Value], Value]":
+) -> Callable[[Value], Value]:
     """add/subtract/increment/decrement: AC/AV/AN/AZ from A and B; AS/AI/AF
     cleared.
 
@@ -318,13 +327,15 @@ def _astatx_alu_arith(
                 astatx, ALU_FLAGS_MASK, _arith_flag_bits(Const(0), Const(0), True)
             )
         if isinstance(a, Const) and isinstance(b, Const):
-            return _astatx_define(astatx, ALU_FLAGS_MASK, _arith_flag_bits(a, b, subtract))
+            return _astatx_define(
+                astatx, ALU_FLAGS_MASK, _arith_flag_bits(a, b, subtract)
+            )
         return _astatx_forget(astatx, ALU_FLAGS_MASK)
 
     return update
 
 
-def _astatx_abs(source: Value) -> "Callable[[Value], Value]":
+def _astatx_abs(source: Value) -> Callable[[Value], Value]:
     """abs (PGR p.11-13/11-14): AC/AV/AN/AZ come from the same adder the
     value itself is computed with -- 0-RX (subtract) when RX is negative,
     0+RX (add, i.e. an ordinary passthrough) when it is not -- so AN/AZ
@@ -338,7 +349,7 @@ def _astatx_abs(source: Value) -> "Callable[[Value], Value]":
         if isinstance(source, Const):
             negative = bool(source.value & 0x80000000)
             bits = _arith_flag_bits(Const(0), source, negative)
-            updates: Dict[int, Optional[bool]] = {
+            updates: dict[int, bool | None] = {
                 AZ_BIT: bool(bits & (1 << AZ_BIT)),
                 AV_BIT: bool(bits & (1 << AV_BIT)),
                 AN_BIT: bool(bits & (1 << AN_BIT)),
@@ -387,8 +398,8 @@ def _arith_flag_bits_ci(a: Const, b: Const, subtract: bool, carry_in: bool) -> i
 
 
 def _astatx_alu_arith_ci(
-    a: Value, b: Value, subtract: bool, carry_in: Optional[bool]
-) -> "Callable[[Value], Value]":
+    a: Value, b: Value, subtract: bool, carry_in: bool | None
+) -> Callable[[Value], Value]:
     """add-with-carry/subtract-with-borrow: AC/AV/AN/AZ from A, B and the
     ASTATX AC carry-in; AS/AI/AF cleared, same as ``_astatx_alu_arith``.
     Forgets the flags (rather than defining them) whenever the carry-in
@@ -404,7 +415,7 @@ def _astatx_alu_arith_ci(
     return update
 
 
-def _astatx_compare(value: Value) -> "Callable[[Value], Value]":
+def _astatx_compare(value: Value) -> Callable[[Value], Value]:
     """PRM comp/compu: AC/AV/AS/AI/AF clear; AZ/AN from VALUE (bits 0, 2);
     CACC (bits 31:24) is an 8-bit shift register, newest bit (VALUE bit 31)
     entering at bit 31. The shift needs the old CACC bits, so it is only
@@ -462,15 +473,17 @@ def _astatx_mult_sat(astatx: Value) -> Value:
     )
 
 
-def _astatx_bit_field(position: Value | int, result: Value) -> "Callable[[Value], Value]":
+def _astatx_bit_field(position: Value | int, result: Value) -> Callable[[Value], Value]:
     """bset/bclr/btgl reg and immediate (PRM pp.511-513): SS cleared; SZ =
     output == 0; SV = bit position > 31."""
-    pos = position.value if isinstance(position, Const) else (
-        position if isinstance(position, int) else None
+    pos = (
+        position.value
+        if isinstance(position, Const)
+        else (position if isinstance(position, int) else None)
     )
 
     def update(astatx: Value) -> Value:
-        updates: Dict[int, Optional[bool]] = {SS_BIT: False}
+        updates: dict[int, bool | None] = {SS_BIT: False}
         if pos is None:
             updates[SV_BIT] = None
             updates[SZ_BIT] = None
@@ -482,12 +495,12 @@ def _astatx_bit_field(position: Value | int, result: Value) -> "Callable[[Value]
     return update
 
 
-def _astatx_fext(span: int, result: Value) -> "Callable[[Value], Value]":
+def _astatx_fext(span: int, result: Value) -> Callable[[Value], Value]:
     """fext immediate (PRM pp.518-519): SS cleared; SZ = output == 0; SV =
     len6 + bit6 > 32. SPAN is len6+bit6, always known from the immediate."""
 
     def update(astatx: Value) -> Value:
-        updates: Dict[int, Optional[bool]] = {
+        updates: dict[int, bool | None] = {
             SS_BIT: False,
             SV_BIT: span > 32,
             SZ_BIT: (result.value == 0) if isinstance(result, Const) else None,
@@ -497,11 +510,11 @@ def _astatx_fext(span: int, result: Value) -> "Callable[[Value], Value]":
     return update
 
 
-def _astatx_leftz(source: Value, result: Value) -> "Callable[[Value], Value]":
+def _astatx_leftz(source: Value, result: Value) -> Callable[[Value], Value]:
     """leftz (PRM p.521): SS cleared; SZ = MSB of RX is 1; SV = result == 32."""
 
     def update(astatx: Value) -> Value:
-        updates: Dict[int, Optional[bool]] = {SS_BIT: False}
+        updates: dict[int, bool | None] = {SS_BIT: False}
         updates[SZ_BIT] = (
             bool(source.value & 0x80000000) if isinstance(source, Const) else None
         )
@@ -511,13 +524,13 @@ def _astatx_leftz(source: Value, result: Value) -> "Callable[[Value], Value]":
     return update
 
 
-def _astatx_lefto(source: Value, result: Value) -> "Callable[[Value], Value]":
+def _astatx_lefto(source: Value, result: Value) -> Callable[[Value], Value]:
     """lefto (PGR p.11-83): SS cleared; SZ = MSB of RX is 0; SV = result ==
     32. The mirror image of ``_astatx_leftz``'s SZ polarity (leading 1s are
     zero in count exactly when RX starts with a 0 bit)."""
 
     def update(astatx: Value) -> Value:
-        updates: Dict[int, Optional[bool]] = {SS_BIT: False}
+        updates: dict[int, bool | None] = {SS_BIT: False}
         updates[SZ_BIT] = (
             not bool(source.value & 0x80000000) if isinstance(source, Const) else None
         )
@@ -527,13 +540,13 @@ def _astatx_lefto(source: Value, result: Value) -> "Callable[[Value], Value]":
     return update
 
 
-def _astatx_btst(source: Value, position: Value) -> "Callable[[Value], Value]":
+def _astatx_btst(source: Value, position: Value) -> Callable[[Value], Value]:
     """btst reg (PRM p.513): SS cleared; SZ set if the tested bit is 0 or the
     position is out of range, cleared if the tested bit is 1; SV = position >
     31. BTF is unaffected."""
 
     def update(astatx: Value) -> Value:
-        updates: Dict[int, Optional[bool]] = {SS_BIT: False}
+        updates: dict[int, bool | None] = {SS_BIT: False}
         if not isinstance(position, Const):
             updates[SV_BIT] = None
             updates[SZ_BIT] = None
@@ -553,8 +566,8 @@ def _astatx_btst(source: Value, position: Value) -> "Callable[[Value], Value]":
 
 
 def _astatx_shift(
-    amount: Optional[int], shifted: Value, ss_mode: str
-) -> "Callable[[Value], Value]":
+    amount: int | None, shifted: Value, ss_mode: str
+) -> Callable[[Value], Value]:
     """lshift/ashift reg and immediate, OR-lshift/OR-ashift immediate (PRM
     pp.508-510): SZ = the shifted value (before any OR) is zero; SV = the
     shift amount is a left shift (> 0).
@@ -566,7 +579,7 @@ def _astatx_shift(
     """
 
     def update(astatx: Value) -> Value:
-        updates: Dict[int, Optional[bool]] = {
+        updates: dict[int, bool | None] = {
             SS_BIT: False if ss_mode == "clear" else None,
             SV_BIT: None if amount is None else amount > 0,
             SZ_BIT: (shifted.value == 0) if isinstance(shifted, Const) else None,

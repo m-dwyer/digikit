@@ -74,12 +74,19 @@ current state and next steps in the newest `HANDOVER-*.md` in the repo root.
   `trace`, or `img.sql(...)`; `uv run python tools/sharc.py IMAGE "SQL"` for
   one query. Do this before running `tools/sharcfn.py` or writing a script.
   A new kind of fact goes into `tools/sharcdb.py`, not a scratch script.
+- SHARC+ instruction semantics live once, in `tools/sharc_core/` (layered
+  modules; forms dispatch through `sharc_core.forms.FORMS`).
+  `tools/sharc_trace.py` is the symbolic driver and `tools/sharc_run.py` the
+  concrete one; neither holds semantics of its own.
 
 ## Shell and tests
 
-- Tests: `uv run --with pytest python -m pytest tests -q`. It skips tests
+- Tests: `uv run python -m pytest tests -q`. It skips tests
   marked `slow` (long firmware integration runs); add `--slow` before a
   commit. While working, run only the test files for the code you changed.
+- Lint: rules are in `pyproject.toml`. `tests/test_lint.py` runs `ruff check`
+  and `ruff format --check` on its `CLEAN` list; new files start clean and go
+  on the list, and a file joins it when you clean it.
 - The shell is zsh: an unquoted `$VAR` is one word, not split. There is no
   `timeout` binary.
 - The rtk hook shortens some output: use `rtk proxy git log` for the full log.

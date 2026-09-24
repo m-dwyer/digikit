@@ -5,26 +5,25 @@ forms_dag, forms_flow, forms_system).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Callable, Dict, List
+from collections.abc import Callable, Mapping
 
 from sharc_disasm import Instruction
 
+from .forms_compute import FORMS as _FORMS_COMPUTE
+from .forms_dag import FORMS as _FORMS_DAG
+from .forms_flow import FORMS as _FORMS_FLOW
+from .forms_move import FORMS as _FORMS_MOVE
+from .forms_system import FORMS as _FORMS_SYSTEM
 from .state import (
     State,
     _stop,
 )
-from .forms_compute import FORMS as _FORMS_COMPUTE
-from .forms_move import FORMS as _FORMS_MOVE
-from .forms_dag import FORMS as _FORMS_DAG
-from .forms_flow import FORMS as _FORMS_FLOW
-from .forms_system import FORMS as _FORMS_SYSTEM
 
 
 def _merge(
-    *tables: Mapping[str, Callable[..., List[State]]],
-) -> Dict[str, Callable[..., List[State]]]:
-    merged: Dict[str, Callable[..., List[State]]] = {}
+    *tables: Mapping[str, Callable[..., list[State]]],
+) -> dict[str, Callable[..., list[State]]]:
+    merged: dict[str, Callable[..., list[State]]] = {}
     for table in tables:
         for form, handler in table.items():
             if form in merged:
@@ -37,7 +36,7 @@ def _merge(
 FORMS = _merge(_FORMS_COMPUTE, _FORMS_MOVE, _FORMS_DAG, _FORMS_FLOW, _FORMS_SYSTEM)
 
 
-def _execute(state: State, insn: Instruction) -> List[State]:
+def _execute(state: State, insn: Instruction) -> list[State]:
     if insn.kind != "confident" or insn.length_bytes is None:
         if insn.length_bytes is None or insn.type_name not in state.provisional_forms:
             return [_stop(state, insn, "uncertain or undecodable form: " + insn.note)]

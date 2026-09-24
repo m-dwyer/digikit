@@ -28,6 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import networkx as nx  # noqa: E402
+
 import sharc  # noqa: E402
 import sharc_trace  # noqa: E402
 from sharc_core.forms import FORMS  # noqa: E402
@@ -46,14 +47,23 @@ def function_set(img, root=None, all_roots=False):
     """Function entries in scope: reach from ROOT over call and jump edges,
     the database's reach table for ALL_ROOTS, or None for the whole image."""
     if all_roots:
-        return {r[0] for r in img.sql("SELECT DISTINCT function_sw FROM reach WHERE image=?", img.name)}
+        return {
+            r[0]
+            for r in img.sql(
+                "SELECT DISTINCT function_sw FROM reach WHERE image=?", img.name
+            )
+        }
     if root is None:
         return None
     graph = nx.DiGraph()
-    graph.add_edges_from(img.sql(
-        "SELECT DISTINCT from_function, to_function FROM edges WHERE image=? "
-        "AND from_function IS NOT NULL AND to_function IS NOT NULL "
-        "AND kind IN ('call', 'jump', 'cond_jump')", img.name))
+    graph.add_edges_from(
+        img.sql(
+            "SELECT DISTINCT from_function, to_function FROM edges WHERE image=? "
+            "AND from_function IS NOT NULL AND to_function IS NOT NULL "
+            "AND kind IN ('call', 'jump', 'cond_jump')",
+            img.name,
+        )
+    )
     graph.add_node(root)
     return nx.descendants(graph, root) | {root}
 
@@ -75,7 +85,9 @@ def probe_compute(form, fields):
         if "compute[22:16]" not in fields:
             return None
         sharc_trace._compute(fields, False, values, {}, approx_recips=True)
-    except Exception as error:  # the tracer signals unsupported encodings with ValueError
+    except (
+        Exception
+    ) as error:  # the tracer signals unsupported encodings with ValueError
         return str(error)
     return None
 
@@ -87,7 +99,9 @@ def coverage(img, functions=None):
     gaps = collections.OrderedDict()
     total = 0
     rows = img.sql(
-        "SELECT sw, form, fields, confidence, function_sw FROM insn WHERE image=? AND aligned=1", img.name)
+        "SELECT sw, form, fields, confidence, function_sw FROM insn WHERE image=? AND aligned=1",
+        img.name,
+    )
     for sw, form, fields, confidence, function_sw in rows:
         if functions is not None and function_sw not in functions:
             continue
@@ -101,23 +115,45 @@ def coverage(img, functions=None):
             if detail is None:
                 continue
             key = ("compute", form, detail)
-        entry = gaps.setdefault(key, {"kind": key[0], "form": key[1], "detail": key[2],
-                                      "count": 0, "example_sw": "0x%x" % sw})
+        entry = gaps.setdefault(
+            key,
+            {
+                "kind": key[0],
+                "form": key[1],
+                "detail": key[2],
+                "count": 0,
+                "example_sw": "0x%x" % sw,
+            },
+        )
         entry["count"] += 1
-    ordered = sorted(gaps.values(), key=lambda g: (-g["count"], g["kind"], g["form"], g["detail"]))
-    return {"image": img.name, "instructions": total,
-            "gap_instructions": sum(g["count"] for g in ordered), "gaps": ordered}
+    ordered = sorted(
+        gaps.values(), key=lambda g: (-g["count"], g["kind"], g["form"], g["detail"])
+    )
+    return {
+        "image": img.name,
+        "instructions": total,
+        "gap_instructions": sum(g["count"] for g in ordered),
+        "gaps": ordered,
+    }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("image", help="database name, e.g. dt2-1.16")
     scope = parser.add_mutually_exclusive_group()
-    scope.add_argument("--root", type=lambda s: int(s, 0), help="function reach from this entry sw")
-    scope.add_argument("--all-roots", action="store_true", help="the database's reach table")
-    parser.add_argument("--kind", choices=("form", "provisional", "compute"), help="show one kind only")
+    scope.add_argument(
+        "--root", type=lambda s: int(s, 0), help="function reach from this entry sw"
+    )
+    scope.add_argument(
+        "--all-roots", action="store_true", help="the database's reach table"
+    )
+    parser.add_argument(
+        "--kind", choices=("form", "provisional", "compute"), help="show one kind only"
+    )
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--fail", action="store_true", help="exit 1 when any gap remains")
+    parser.add_argument(
+        "--fail", action="store_true", help="exit 1 when any gap remains"
+    )
     args = parser.parse_args(argv)
 
     img = sharc.load(args.image)
@@ -128,10 +164,20 @@ def main(argv=None):
     if args.json:
         print(json.dumps(result, indent=1))
     else:
-        print("%s: %d instructions, %d not executable, %d distinct gaps"
-              % (result["image"], result["instructions"], result["gap_instructions"], len(result["gaps"])))
+        print(
+            "%s: %d instructions, %d not executable, %d distinct gaps"
+            % (
+                result["image"],
+                result["instructions"],
+                result["gap_instructions"],
+                len(result["gaps"]),
+            )
+        )
         for g in result["gaps"]:
-            print("%6d  %-11s %-12s %-10s %s" % (g["count"], g["kind"], g["form"], g["example_sw"], g["detail"]))
+            print(
+                "%6d  %-11s %-12s %-10s %s"
+                % (g["count"], g["kind"], g["form"], g["example_sw"], g["detail"])
+            )
     return 1 if args.fail and result["gaps"] else 0
 
 

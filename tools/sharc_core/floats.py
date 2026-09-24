@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import math
 import struct
-from typing import Dict, Optional
 
 from .encoding import (
     AC_BIT,
@@ -27,7 +26,6 @@ from .values import (
     _signed,
     _signed32,
 )
-
 
 # ---------------------------------------------------------------------------
 # Floating-point compute support.
@@ -51,7 +49,7 @@ from .values import (
 # ---------------------------------------------------------------------------
 
 
-def _float32(value: Value) -> Optional[float]:
+def _float32(value: Value) -> float | None:
     """Reinterpret VALUE's 32-bit pattern as IEEE-754 single precision.
 
     Returns None when VALUE isn't a fully known Const: an Affine (symbolic
@@ -85,7 +83,7 @@ _FLOAT_ALL_ONES = Const(0xFFFFFFFF)
 
 def _float_binary(
     left: Value, right: Value, expression: str, operation
-) -> tuple[Value, Optional[bool], Optional[bool]]:
+) -> tuple[Value, bool | None, bool | None]:
     """Evaluate a float ALU/multiplier binary OPERATION; return (result,
     overflowed, invalid).
 
@@ -110,7 +108,7 @@ def _float_binary(
 
 def _float_unary(
     value: Value, expression: str, operation
-) -> tuple[Value, Optional[bool], Optional[bool]]:
+) -> tuple[Value, bool | None, bool | None]:
     """Unary counterpart of ``_float_binary`` (see its docstring)."""
     a = _float32(value)
     if a is None:
@@ -145,7 +143,7 @@ def _float_clip(a: float, b: float) -> float:
 
 def _float_mantissa(
     value: Value, expression: str
-) -> tuple[Value, Optional[bool], Optional[bool], Optional[bool]]:
+) -> tuple[Value, bool | None, bool | None, bool | None]:
     """RN = mant FX (PRM Table 18-5 opcode 0xAD, p.427; PGR p.11-34/11-35).
 
     Extracts the hidden bit plus the 23-bit fraction, left-justified as an
@@ -178,7 +176,7 @@ def _float_mantissa(
 
 def _float_logb(
     value: Value, mode1: Value, expression: str
-) -> tuple[Value, Optional[bool], bool]:
+) -> tuple[Value, bool | None, bool]:
     """RN = logb FX (PGR p.11-36, pgr.txt:21522): the unbiased two's-
     complement exponent of FX as a fixed-point integer (biased_exp - 127).
     A NAN input returns the all-1s sentinel. A +-infinity or +-zero input
@@ -195,7 +193,6 @@ def _float_logb(
     if not isinstance(value, Const):
         return Unknown(expression), None, False
     bits = value.value & 0xFFFFFFFF
-    sign = (bits >> 31) & 1
     biased_exp = (bits >> 23) & 0xFF
     mantissa = bits & 0x7FFFFF
     if biased_exp == 0xFF and mantissa != 0:
@@ -214,7 +211,7 @@ def _float_logb(
 
 def _float_scalb(
     value: Value, scale: Value, expression: str
-) -> tuple[Value, Optional[bool], Optional[bool]]:
+) -> tuple[Value, bool | None, bool | None]:
     """FN = scalb FX by RY (PRM Table 18-5 opcode 0xBD, p.427; PGR p.11-33).
 
     Adds the two's-complement fixed-point integer RY to FX's exponent
@@ -246,7 +243,7 @@ def _float_scalb(
     return Const(bits), overflowed, False
 
 
-def _fixed_to_float(value: Value, expression: str) -> tuple[Value, Optional[bool]]:
+def _fixed_to_float(value: Value, expression: str) -> tuple[Value, bool | None]:
     """FN = float RX (PRM Table 18-5 opcode 0xCA, p.427; PGR p.11-39 "without
     scaling factor"): numeric int32->float32 conversion, not a bit
     reinterpretation. PGR documents AV and AI both fixed 0 for the
@@ -262,7 +259,7 @@ def _fixed_to_float(value: Value, expression: str) -> tuple[Value, Optional[bool
 
 def _float_to_fixed(
     value: Value, mode1: Value, always_truncate: bool, expression: str
-) -> tuple[Value, Optional[bool], Optional[bool]]:
+) -> tuple[Value, bool | None, bool | None]:
     """RN = FIX FX / RN = TRUNC FX (PRM Table 18-5 opcodes 0xC9/0xCD, p.427;
     PGR p.11-36..11-38), and their scaled BY RY siblings 0xD9/0xDD (the
     caller pre-scales VALUE via ``_scale_fixed_input`` -- PGR Table 3-3,
@@ -320,7 +317,7 @@ def _float_to_fixed(
 
 def _float_to_fixed_trunc(
     value: Value, mode1: Value, expression: str
-) -> tuple[Value, Optional[bool], Optional[bool]]:
+) -> tuple[Value, bool | None, bool | None]:
     """RN = TRUNC FX: ``_float_to_fixed`` with ALWAYS_TRUNCATE=True. Kept as
     a named wrapper since opcode 0xCD's call site predates the shared
     FIX/TRUNC helper and reads more clearly with its own name."""
@@ -342,7 +339,7 @@ def _scale_fixed_input(value: Value, scale: Value, expression: str) -> Value:
 
 def _fixed_to_float_scaled(
     value: Value, scale: Value, expression: str
-) -> tuple[Value, Optional[bool]]:
+) -> tuple[Value, bool | None]:
     """FN = FLOAT RX BY RY (PRM p.19-.. ; PGR p.11-39 "with scaling factor"):
     numeric int32->float32 conversion as ``_fixed_to_float``, then the
     fixed-point two's-complement integer in RY is added to the result's
@@ -372,7 +369,7 @@ def _fixed_to_float_scaled(
 
 def _float_copysign(
     left: Value, right: Value, expression: str
-) -> tuple[Value, Optional[bool]]:
+) -> tuple[Value, bool | None]:
     """FN = FX copysign FY (PRM p.19-19, opcode 1110 0000; PGR p.11-45,
     Table 12-4 opcode 1110 0000): copies FY's sign bit onto FX's exponent
     and mantissa unchanged. A denormal FX input flushes to zero before the
@@ -396,7 +393,7 @@ def _float_copysign(
     return Const(bits), False
 
 
-def _float_round32(value: Value, expression: str) -> tuple[Value, Optional[bool]]:
+def _float_round32(value: Value, expression: str) -> tuple[Value, bool | None]:
     """FN = rnd FX (PRM Table 18-5 opcode 1010 0101, p.20-8 "32-bit and
     40-bit Operations"; PGR Table 12-4 opcode 1010 0101, pp.12-3/12-4, and
     p.11-33): rounds FX to a 32-bit floating-point boundary.
@@ -437,7 +434,7 @@ def _float_round32(value: Value, expression: str) -> tuple[Value, Optional[bool]
     return Const(bits), False
 
 
-def _approx_recips(left: Value) -> tuple[Value, Dict[int, Optional[bool]]]:
+def _approx_recips(left: Value) -> tuple[Value, dict[int, bool | None]]:
     """Opt-in ``--approx-recips`` model of ``FN = recips FX``.
 
     PRM p.19-16/19-17 (out/refs/sharc-plus-prm, quoted in ``_compute``'s
@@ -466,7 +463,7 @@ def _approx_recips(left: Value) -> tuple[Value, Dict[int, Optional[bool]]]:
     as ground truth; ``_apply_compute`` tags it with an "approximate-recips"
     trace event so a report can always tell it apart from a real seed.
     """
-    updates: Dict[int, Optional[bool]] = {AC_BIT: False, AS_BIT: False}
+    updates: dict[int, bool | None] = {AC_BIT: False, AS_BIT: False}
     if not isinstance(left, Const):
         updates.update({AV_BIT: None, AI_BIT: None, AN_BIT: None, AZ_BIT: None})
         return Unknown("recips seed (symbolic input)"), updates

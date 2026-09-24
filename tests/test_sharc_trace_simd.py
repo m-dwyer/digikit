@@ -117,10 +117,12 @@ class SimdComputeTest(TraceHelpers):
     def test_full_compute_2a_short_also_duplicates_in_simd(self):
         # cu=0 (fixed ALU), op selecting "add" (PRM full-compute table),
         # matching test_computes_and_old_value_parallel_move's own helper.
-        full = lambda cu, op, rn, rx, ry: {
-            "compute[22:16]": ((cu << 4) | (op >> 4)),
-            "compute[15:0]": ((op & 15) << 12) | (rn << 8) | (rx << 4) | ry,
-        }
+        def full(cu, op, rn, rx, ry):
+            return {
+                "compute[22:16]": ((cu << 4) | (op >> 4)),
+                "compute[15:0]": ((op & 15) << 12) | (rn << 8) | (rx << 4) | ry,
+            }
+
         fields = full(0, 0x01, 0, 1, 2)  # R0 = R1 + R2 (cu=0, op=0x01: ALU add)
         regs = {
             1: T.Const(10),
@@ -263,16 +265,16 @@ class SimdMemoryCompanionTest(TraceHelpers):
         self.assertEqual(pey[0]["ureg"], "S2")
         self.assertEqual(pey[0]["address"], 0x30001000 + 4)
         self.assertEqual(pey[0]["value"], 0x22222222)
-        self.assertEqual(
-            T._dm_read(state, 0x30001000, 4), T.Const(0x11111111)
-        )
-        self.assertEqual(
-            T._dm_read(state, 0x30001004, 4), T.Const(0x22222222)
-        )
+        self.assertEqual(T._dm_read(state, 0x30001000, 4), T.Const(0x11111111))
+        self.assertEqual(T._dm_read(state, 0x30001004, 4), T.Const(0x22222222))
 
         # Load direction, same addresses (poke both words first).
-        load_state = T.State(1, {T.UREG_CODES["MODE1"]: T.Const(1 << 21)},
-                              concrete=loader_memory(), assume_nw32=True)
+        load_state = T.State(
+            1,
+            {T.UREG_CODES["MODE1"]: T.Const(1 << 21)},
+            concrete=loader_memory(),
+            assume_nw32=True,
+        )
         self.assertTrue(T._dm_write(load_state, 0x30001000, 4, T.Const(0xAAAA)))
         self.assertTrue(T._dm_write(load_state, 0x30001004, 4, T.Const(0xBBBB)))
         loaded = self.run_one(load_state, insn("14a", {**fields, "d": 0}, 6))
@@ -528,15 +530,14 @@ class RealBlobSimdRegionTest(unittest.TestCase):
         "dt2-1.16",
         "section_7_BLOB.bin",
     )
-    BLOB_SHA256 = (
-        "0f514a12a2255f5c081e292c47f1f29462003177658da4bbae0a22fd737fffa2"
-    )
+    BLOB_SHA256 = "0f514a12a2255f5c081e292c47f1f29462003177658da4bbae0a22fd737fffa2"
     START = 0xB80105
     PEYEN_SET_PC = 0xB8012F
     PEYEN_CLEAR_PC = 0xB80150
 
     @unittest.skipUnless(
-        os.path.exists(BLOB), "out/sections/dt2-1.16/section_7_BLOB.bin is not available"
+        os.path.exists(BLOB),
+        "out/sections/dt2-1.16/section_7_BLOB.bin is not available",
     )
     def test_simd_window_touches_only_uncomplementary_uregs(self):
         with open(self.BLOB, "rb") as fh:

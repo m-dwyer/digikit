@@ -276,15 +276,16 @@ class RecordingPeer:
 class Dspi2Link:
     """DSPI2 + eDMA 28/29 model. See the module docstring for the mechanism."""
 
-    def __init__(self, m, peer=None, tx_chan=TX_CHAN, rx_chan=RX_CHAN,
-                 raise_completion=True):
+    def __init__(
+        self, m, peer=None, tx_chan=TX_CHAN, rx_chan=RX_CHAN, raise_completion=True
+    ):
         self.m = m
         self.peer = peer if peer is not None else ZeroPeer()
         self.tx_chan, self.rx_chan = tx_chan, rx_chan
         self.raise_completion = raise_completion
 
-        self._tx_ready = None      # captured TX bytes, waiting for RX to arm
-        self._rx_armed = False     # RX armed, waiting for TX bytes
+        self._tx_ready = None  # captured TX bytes, waiting for RX to arm
+        self._rx_armed = False  # RX armed, waiting for TX bytes
         self._pending_vector = {}  # vector -> True, queued for service()
 
         self.frames = 0
@@ -304,7 +305,9 @@ class Dspi2Link:
         return struct.unpack(">H", self.m.uc.mem_read(self._tcd(chan) + off, 2))[0]
 
     def _w32(self, chan, off, value):
-        self.m.uc.mem_write(self._tcd(chan) + off, struct.pack(">I", value & 0xFFFFFFFF))
+        self.m.uc.mem_write(
+            self._tcd(chan) + off, struct.pack(">I", value & 0xFFFFFFFF)
+        )
 
     def _w16(self, chan, off, value):
         self.m.uc.mem_write(self._tcd(chan) + off, struct.pack(">H", value & 0xFFFF))
@@ -336,7 +339,8 @@ class Dspi2Link:
         if len(rx) != len(tx):
             raise ValueError(
                 "Dspi2Link peer returned %d bytes for a %d-byte frame"
-                % (len(rx), len(tx)))
+                % (len(rx), len(tx))
+            )
         self._deliver(self.rx_chan, rx)
         self._tx_ready = None
         self._rx_armed = False
@@ -361,7 +365,9 @@ class Dspi2Link:
         elem = 1 << (attr & 0x7)
         nbytes = self._u32(chan, NBYTES)
         if not nbytes or nbytes % elem:
-            raise RuntimeError("Dspi2Link: NBYTES not a multiple of the source element size")
+            raise RuntimeError(
+                "Dspi2Link: NBYTES not a multiple of the source element size"
+            )
         src = self._u32(chan, SADDR)
         soff = _signed(self._u16(chan, SOFF), 16)
         smod = (attr >> 11) & 0x1F
@@ -409,12 +415,15 @@ class Dspi2Link:
         elem = 1 << ((attr >> 8) & 0x7)
         nbytes = self._u32(chan, NBYTES)
         if not nbytes or nbytes % elem:
-            raise RuntimeError("Dspi2Link: NBYTES not a multiple of the dest element size")
+            raise RuntimeError(
+                "Dspi2Link: NBYTES not a multiple of the dest element size"
+            )
         expect = citer * (nbytes // elem) * elem
         if len(data) != expect:
             raise ValueError(
                 "Dspi2Link: peer frame is %d bytes, TCD%d expects %d"
-                % (len(data), chan, expect))
+                % (len(data), chan, expect)
+            )
         dst = self._u32(chan, DADDR)
         doff = _signed(self._u16(chan, DOFF), 16)
         # DMOD (dest modulo wraparound): bits [7:3] of ATTR by the standard
@@ -430,7 +439,7 @@ class Dspi2Link:
         pos = 0
         for _ in range(citer):
             for _ in range(nbytes // elem):
-                self.m.uc.mem_write(dst, data[pos:pos + elem])
+                self.m.uc.mem_write(dst, data[pos : pos + elem])
                 pos += elem
                 dst = (dst + doff) & 0xFFFFFFFF
                 if mask:
@@ -447,7 +456,9 @@ class Dspi2Link:
         if csr & E_SG:
             pointer = self._u32(chan, DLAST)
             if pointer & 0x1F:
-                raise RuntimeError("Dspi2Link: scatter/gather pointer is not 32-byte aligned")
+                raise RuntimeError(
+                    "Dspi2Link: scatter/gather pointer is not 32-byte aligned"
+                )
             descriptor = bytes(self.m.uc.mem_read(pointer, 0x20))
             self.m.uc.mem_write(self._tcd(chan), descriptor)
         else:
@@ -488,5 +499,10 @@ def install(m, peer=None, tx_chan=TX_CHAN, rx_chan=RX_CHAN, raise_completion=Tru
     installing this always requires an explicit peer or accepts `ZeroPeer`,
     matching how `emu/edma.py` and `emu/ssi.py`'s models are opt-in.
     """
-    return Dspi2Link(m, peer=peer, tx_chan=tx_chan, rx_chan=rx_chan,
-                      raise_completion=raise_completion)
+    return Dspi2Link(
+        m,
+        peer=peer,
+        tx_chan=tx_chan,
+        rx_chan=rx_chan,
+        raise_completion=raise_completion,
+    )
