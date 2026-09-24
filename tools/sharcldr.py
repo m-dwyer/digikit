@@ -68,6 +68,7 @@ while each block starts where the previous one ends, FILL blocks included.
 """
 
 import argparse
+import bisect
 import hashlib
 import json
 import math
@@ -180,6 +181,7 @@ class LoadedMemory:
         except (TypeError, ValueError) as exc:
             raise ValueError("stream data must be bytes-like") from exc
         self.blocks = tuple(self._validate_block(block) for block in blocks)
+        self._segments = self._resolve_segments()
 
     @classmethod
     def from_stream(cls, data, blocks=None):
@@ -242,31 +244,72 @@ class LoadedMemory:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError("%s must be a nonnegative integer" % name)
 
+    def _resolve_segments(self):
+        """Disjoint (starts, ends, owners) lists, sorted by start: each segment
+        [start, end) is covered by one final block, the last in stream order
+        to write it. Block edges split the address space, so coverage is the
+        same at every address of a segment."""
+        edges = sorted(
+            {
+                edge
+                for block in self.blocks
+                if block["byte_count"]
+                for edge in (
+                    block["target_address"],
+                    block["target_address"] + block["byte_count"],
+                )
+            }
+        )
+        starts, ends, owners = [], [], []
+        for low, high in zip(edges, edges[1:]):
+            for index in range(len(self.blocks) - 1, -1, -1):
+                block = self.blocks[index]
+                if (
+                    block["byte_count"]
+                    and block["target_address"]
+                    <= low
+                    < block["target_address"] + block["byte_count"]
+                ):
+                    starts.append(low)
+                    ends.append(high)
+                    owners.append(index)
+                    break
+        return starts, ends, owners
+
+    def _segment(self, address):
+        """(segment end, block index) covering address, or None for a gap."""
+        starts, ends, owners = self._segments
+        i = bisect.bisect_right(starts, address) - 1
+        if i < 0 or address >= ends[i]:
+            return None
+        return ends[i], owners[i]
+
     def _covering_block(self, address):
-        for index in range(len(self.blocks) - 1, -1, -1):
-            block = self.blocks[index]
-            if (
-                block["byte_count"]
-                and block["target_address"]
-                <= address
-                < block["target_address"] + block["byte_count"]
-            ):
-                return index, block
-        return None, None
+        found = self._segment(address)
+        if found is None:
+            return None, None
+        return found[1], self.blocks[found[1]]
 
     def read(self, address, size):
         """Return exactly *size* final loaded bytes, or None for any gap."""
         self._check_address_size(address, size)
-        result = bytearray(size)
-        for i in range(size):
-            _, block = self._covering_block(address + i)
-            if block is None:
+        result = bytearray()
+        end = address + size
+        while address < end:
+            found = self._segment(address)
+            if found is None:
                 return None
-            offset = address + i - block["target_address"]
+            segment_end, index = found
+            block = self.blocks[index]
+            stop = min(end, segment_end)
+            offset = address - block["target_address"]
             if block["fill"]:
-                result[i] = (block["argument"] >> (8 * (offset % 4))) & 0xFF
+                pattern = block["argument"].to_bytes(4, "little")
+                result += bytes(pattern[(offset + k) % 4] for k in range(stop - address))
             else:
-                result[i] = self.data[block["payload_offset"] + offset]
+                start = block["payload_offset"] + offset
+                result += self.data[start : start + stop - address]
+            address = stop
         return bytes(result)
 
     def read_sw(self, pc_sw, size=6):

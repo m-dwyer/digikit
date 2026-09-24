@@ -161,6 +161,11 @@ SIMPLE_COND_BITS = {
 
 
 def _field(f: Mapping[str, int], stem: str) -> int:
+    # Most lookups name a key exactly; no decoded form has both "x" and
+    # "x[...]" keys, so the exact hit is the value the scan would return.
+    value = f.get(stem)
+    if value is not None:
+        return value
     for key, value in f.items():
         if key == stem or key.startswith(stem + "["):
             return value
