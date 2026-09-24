@@ -3,8 +3,8 @@
 Answers "which real instructions would the tracer refuse to execute?" from
 the database alone, without running a trace:
 
-- form: the instruction's form has no branch in sharc_trace._execute and
-  falls through to "unsupported form".
+- form: the instruction's form has no handler in sharc_core.forms.FORMS, so
+  _execute stops with "unsupported form".
 - provisional: the form's decode confidence is 'uncertain', so _execute
   stops unless the form is passed as a provisional form.
 - compute: the compute field raises in sharc_trace._compute or
@@ -20,9 +20,7 @@ modify, long-word access, unresolved predicates): they depend on state.
 from __future__ import annotations
 
 import argparse
-import ast
 import collections
-import inspect
 import json
 import os
 import sys
@@ -32,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import networkx as nx  # noqa: E402
 import sharc  # noqa: E402
 import sharc_trace  # noqa: E402
+from sharc_core.forms import FORMS  # noqa: E402
 
 ONE = sharc_trace.Const(0x3F800000)
 SHIFT_IMMEDIATE_FORMS = ("6b_shiftimm", "6a_mem")
@@ -39,19 +38,8 @@ SHORT_COMPUTE_FORMS = ("2c",)
 
 
 def handled_forms():
-    """Form names that sharc_trace._execute compares `name` against."""
-    tree = ast.parse(inspect.getsource(sharc_trace._execute))
-    forms = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare) or not isinstance(node.left, ast.Name):
-            continue
-        if node.left.id != "name":
-            continue
-        for comparator in node.comparators:
-            for const in ast.walk(comparator):
-                if isinstance(const, ast.Constant) and isinstance(const.value, str):
-                    forms.add(const.value)
-    return forms
+    """Form names with a handler in sharc_core.forms.FORMS."""
+    return set(FORMS)
 
 
 def function_set(img, root=None, all_roots=False):
