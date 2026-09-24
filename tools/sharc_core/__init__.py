@@ -8,6 +8,10 @@ Layers, lowest first; a module imports only from modules before it:
   memory     Data memory reads and writes, DAG address arithmetic and SIMD companions.
   floats     32-bit IEEE float and fixed/float conversion helpers.
   flags      ASTATX flag updates for compute results.
+  compute_alu    Fixed and float ALU compute (cu=0) operation bodies.
+  compute_mult   Multiplier compute (cu=1) operation bodies and MR data moves.
+  compute_shift  Shifter compute (cu=2) operation bodies and the ShiftImm form.
+  compute_multi  Multifunction and short compute operation bodies.
   compute    Compute operations (ALU, multiplier, shifter, multifunction) and their application.
   sequencer  Decode, program flow, conditions, delayed branches, calls, returns and loops.
   forms      Per-form instruction execution: the _execute dispatch.
