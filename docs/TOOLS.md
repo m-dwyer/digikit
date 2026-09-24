@@ -422,58 +422,29 @@ uv run python tools/sharc_trace.py \
 This traces the primary PE through the DAI stores and then stops at the next
 unsupported `9b_abs` form; it is not a general SHARC emulator.
 
-### `tools/sharcemu.py`
+### `tools/sharc_run.py`
 
-A Ghidra p-code emulator harness (`EmulatorHelper`) for the SHARC+ program,
-complementary to `sharc_trace.py`'s abstract interpreter: this one actually
-runs the generated language's p-code, one instruction at a time, against a
-live emulator register/memory state. It fails loudly instead of silently
-no-opping: the generated SLEIGH emits an empty body for any VISA form it has
-not been given semantics for (only ~22% of forms have any), so an
-instruction with zero p-code ops executes as a silent no-op unless caught
-first. Before every step the tool reads the instruction's raw bytes and
-classifies them independently with the repo's own decoder
-(`tools/sharc_disasm.py`, `tools/sharcinv.py`'s `merge_fields`), never
-Ghidra's mnemonic. Only `Type21a` (an architectural NOP with no fields) and
-`Type9a_abs`/`Type9b_abs` with merged field `b==1` (register-indirect call,
-no static target to encode) are legitimately empty; anything else with empty
-p-code is a `no-semantics` fault. A conditional jump's compute-condition is
-an unimplemented CALLOTHER pcodeop in this language, so `step()` returning
-false surfaces as an `emulator-error` fault carrying Ghidra's message.
+A concrete, single-path SHARC+ runner built on `sharc_trace.py`, replacing
+the removed `tools/sharcemu.py` (a Ghidra `EmulatorHelper` p-code harness;
+its arithmetic already came from `sharc_trace.py`, and this runner covers
+the same "run this one routine forward with real inputs" need without a
+Ghidra JVM). `sharc_trace.py` is symbolic and forks on an unresolved
+conditional; `sharc_run.py` seeds every register with a real value and
+treats a fork, or any state it tracks as stopped, as a hard stop.
 
 ```sh
-uv run python tools/sharcemu.py dt2-1.16_SHARC --start sw:0x1c18ed --steps 200 \
-    --watch 0x254d9c --set R2=0x1234 \
-    --project ~/ghidra-projects/sharc-batch-dt2-116 \
-    --project-name sharc-batch-dt2-116 --json
+uv run python tools/sharc_run.py dt2-1.16 --start 0x1c4ecf --max-steps 20000
 ```
 
-`--start` takes `sw:` (short-word) or a displayed coordinate for the program
-counter, same convention as `ghidraq.py`. `--watch` and `--poke` addresses
-are always plain DM byte addresses, unprefixed: `DM(0x254d9c)` is emulated
-at `0x254d9c` directly, matching the loader's placement of on-chip and
-external DM literals at their own byte address. The generated language
-translates a DM byte address into the `ram` space's unit offset internally
-(`tools/sharcspec/ghidra/gen_sleigh.py` `dm_byte_addr_to_ram_unit`), so the
-emulator now sees the image's initialised data at these locations. See
-`docs/findings/05-sharc-isa-and-decoding.md`.
-`--watch ADDR[:LEN]` (repeatable, LEN in bytes, default 4) reports every
-write touching that range: step, PC, address, and old/new bytes. `--set
-REG=VALUE` seeds a register before `--start` runs; `--poke ADDR=VALUE` seeds
-a 32-bit little-endian DM word first, for when the register you want to seed
-gets reloaded from memory before reaching the code you want to watch.
-`--skip-faults N` records up to N faults and advances past them instead of
-stopping at the first one, to harvest a fault table.
+Library use goes through `Runner` directly, given an already-loaded
+`tools.sharcldr.LoadedMemory`:
 
-Write detection prefers `EmulatorHelper.enableMemoryWriteTracking()` /
-`getTrackedMemoryWriteSet()` (present in Ghidra 12.1.3), which reports an
-address as written regardless of value, catching a write that happens to
-store the same value already there; a before/after `readMemory` diff is the
-fallback only if that API is absent, and cannot see a same-value write.
-`getTrackedMemoryWriteSet()` returns a reference to EmulatorHelper's own
-live, mutating set rather than a snapshot, so the tool copies it into an
-independent `AddressSet` each step before diffing -- aliasing it instead
-silently loses every write after the first step.
+```py
+import sharc_run
+runner = sharc_run.Runner(loaded_memory, start=0x1c4ecf)
+result = runner.run(max_steps=20000)
+print(result.halt.reason, result.instructions_per_second)
+```
 
 ### `tools/sharc_worklist.py`
 

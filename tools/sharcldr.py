@@ -77,6 +77,7 @@ import struct
 import sys
 from collections import defaultdict
 from types import MappingProxyType
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -261,7 +262,7 @@ class LoadedMemory:
             }
         )
         starts, ends, owners = [], [], []
-        for low, high in zip(edges, edges[1:]):
+        for low, high in zip(edges, edges[1:], strict=False):
             for index in range(len(self.blocks) - 1, -1, -1):
                 block = self.blocks[index]
                 if (
@@ -305,7 +306,9 @@ class LoadedMemory:
             offset = address - block["target_address"]
             if block["fill"]:
                 pattern = block["argument"].to_bytes(4, "little")
-                result += bytes(pattern[(offset + k) % 4] for k in range(stop - address))
+                result += bytes(
+                    pattern[(offset + k) % 4] for k in range(stop - address)
+                )
             else:
                 start = block["payload_offset"] + offset
                 result += self.data[start : start + stop - address]
@@ -339,7 +342,7 @@ class LoadedMemory:
             for block in self.blocks
             if block["byte_count"]
         )
-        merged = []
+        merged: list[tuple[int, int]] = []
         for start, end in spans:
             if merged and start <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], end))
@@ -536,7 +539,7 @@ def alignment(data, min_count=8, gram=4, strides=(2, 4, 6, 8)):
     for offs in seen.values():
         if len(offs) >= min_count:
             occurrences.extend(offs)
-    result = {}
+    result: dict[str | int, Any] = {}
     for stride in strides:
         hist = {r: 0 for r in range(stride)}
         for off in occurrences:
@@ -600,7 +603,7 @@ def characterise(data, start, window):
         )
         offset += len(chunk)
 
-    regions = []
+    regions: list[dict[str, Any]] = []
     for w in windows:
         if (
             regions
@@ -673,7 +676,8 @@ def main():
     )
     args = ap.parse_args()
 
-    data = open(args.blob, "rb").read()
+    with open(args.blob, "rb") as f:
+        data = f.read()
     blocks = parse_blocks(data)
     stop_offset = (
         blocks[-1]["payload_offset"] + blocks[-1]["payload_len"] if blocks else 0
@@ -711,7 +715,7 @@ def main():
         "regions": regions,
     }
 
-    alignment_results = {}
+    alignment_results: dict[str, Any] = {}
     if args.align:
         alignment_results = {"regions": [], "blocks": []}
         for r in regions:
@@ -739,7 +743,8 @@ def main():
         result["alignment"] = alignment_results
 
     if args.json:
-        json.dump(result, open(args.json, "w"), indent=2)
+        with open(args.json, "w") as f:
+            json.dump(result, f, indent=2)
 
     print("=== %s ===" % args.blob)
     print(

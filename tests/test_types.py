@@ -13,9 +13,12 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 TYPED = [
+    "tools/sharc.py",
     "tools/sharc_core",
+    "tools/sharc_disasm.py",
     "tools/sharc_run.py",
     "tools/sharc_trace.py",
+    "tools/sharcldr.py",
 ]
 
 

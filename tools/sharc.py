@@ -25,17 +25,25 @@ if _here not in sys.path:
     sys.path.insert(0, _here)
 
 import networkx as nx  # noqa: E402
+
+import sharc_trace  # noqa: E402
 import sharcdb  # noqa: E402
 import sharcfn  # noqa: E402
 import sharcldr  # noqa: E402
-import sharc_trace  # noqa: E402
 
 SECTIONS_DIR = "out/sections"
 DB_DIR = "out/sharcdb"
 
 # The firmware's own hardware DAG-modify reset values (docs/findings/06),
 # seeded by default so a trace() caller doesn't have to remember them.
-_DEFAULT_TRACE_REGS = {"M5": 0, "M6": 1, "M7": -1, "M13": 0, "M14": 1, "M15": -1}
+_DEFAULT_TRACE_REGS: dict[str | int, int] = {
+    "M5": 0,
+    "M6": 1,
+    "M7": -1,
+    "M13": 0,
+    "M14": 1,
+    "M15": -1,
+}
 
 # tools/sharcdb.sql's "last writer of REG before sw S" recursive CTE, kept
 # here verbatim rather than re-derived: walk basic blocks backwards over
@@ -64,8 +72,15 @@ SELECT DISTINCT writer_sw FROM (
 )"""
 
 _FUNC_COLUMNS = (
-    "entry_sw", "end_sw", "name", "n_insns", "block", "label", "entry_kind",
-    "has_static_caller", "is_leaf",
+    "entry_sw",
+    "end_sw",
+    "name",
+    "n_insns",
+    "block",
+    "label",
+    "entry_kind",
+    "has_static_caller",
+    "is_leaf",
 )
 
 # Known DM structures, addresses in this repo's own bare convention (the same
@@ -98,8 +113,10 @@ _KNOWN_RANGES = (
 # (same func_hash convention, see Image.match()) for the "cross-image match"
 # section -- the two shipping SHARC+ firmwares this repo builds.
 _CROSS_IMAGE_PARTNER = {
-    "dt2-1.16": "dn2-1.11", "dt2-1.15C": "dn2-1.10E",
-    "dn2-1.11": "dt2-1.16", "dn2-1.10E": "dt2-1.15C",
+    "dt2-1.16": "dn2-1.11",
+    "dt2-1.15C": "dn2-1.10E",
+    "dn2-1.11": "dt2-1.16",
+    "dn2-1.10E": "dt2-1.15C",
 }
 
 
@@ -123,7 +140,14 @@ def _hex(value):
     return "0x%x" % value if isinstance(value, int) else value
 
 
-def load(name, sections_dir=SECTIONS_DIR, db_dir=DB_DIR, min_depth=8, blocks=None, force=False):
+def load(
+    name,
+    sections_dir=SECTIONS_DIR,
+    db_dir=DB_DIR,
+    min_depth=8,
+    blocks=None,
+    force=False,
+):
     """Open `db_dir`/<name>.sqlite, building (or rebuilding, if the blob's
     sha256 or tools/sharcdb.py's DB_VERSION has moved on) from
     `sections_dir`/<name>/section_7_BLOB.bin first when needed. If the blob
@@ -135,9 +159,11 @@ def load(name, sections_dir=SECTIONS_DIR, db_dir=DB_DIR, min_depth=8, blocks=Non
     stale = force or not os.path.exists(out_path)
     if not stale:
         meta = sharcdb.read_meta(out_path)
-        if meta.get("db_version") != str(sharcdb.DB_VERSION):
-            stale = True
-        elif os.path.exists(blob_path) and meta.get("image_sha256") != sharcfn.sha256_of(blob_path):
+        if (
+            meta.get("db_version") != str(sharcdb.DB_VERSION)
+            or os.path.exists(blob_path)
+            and meta.get("image_sha256") != sharcfn.sha256_of(blob_path)
+        ):
             stale = True
 
     if stale:
@@ -146,7 +172,14 @@ def load(name, sections_dir=SECTIONS_DIR, db_dir=DB_DIR, min_depth=8, blocks=Non
                 "sharc.load(%r): %s is missing or stale and %s does not exist to rebuild it"
                 % (name, out_path, blob_path)
             )
-        sharcdb.build_database(blob_path, out_path, name=name, min_depth=min_depth, blocks=blocks, force=True)
+        sharcdb.build_database(
+            blob_path,
+            out_path,
+            name=name,
+            min_depth=min_depth,
+            blocks=blocks,
+            force=True,
+        )
 
     return Image(name, out_path, blob_path)
 
@@ -160,7 +193,11 @@ class Image:
         self.db_path = db_path
         self.blob_path = blob_path
         self.db = sqlite3.connect(db_path)
-        self.meta = dict(self.db.execute("SELECT key, value FROM meta WHERE image=?", (name,)).fetchall())
+        self.meta = dict(
+            self.db.execute(
+                "SELECT key, value FROM meta WHERE image=?", (name,)
+            ).fetchall()
+        )
         self._mem_cache = None
         self._succ_cache = None
         self._notes_attached = False
@@ -182,12 +219,13 @@ class Image:
     def func(self, sw):
         """The function whose [entry_sw, end_sw) span contains sw, or None."""
         row = self.db.execute(
-            "SELECT %s FROM functions WHERE image=? AND entry_sw<=? AND end_sw>?" % ",".join(_FUNC_COLUMNS),
+            "SELECT %s FROM functions WHERE image=? AND entry_sw<=? AND end_sw>?"
+            % ",".join(_FUNC_COLUMNS),
             (self.name, sw, sw),
         ).fetchone()
         if row is None:
             return None
-        d = dict(zip(_FUNC_COLUMNS, row))
+        d = dict(zip(_FUNC_COLUMNS, row, strict=True))
         d["entry_sw"], d["end_sw"] = _hex(d["entry_sw"]), _hex(d["end_sw"])
         return d
 
@@ -219,9 +257,14 @@ class Image:
         rows = self.db.execute(query, args).fetchall()
         return [
             {
-                "kind": kind, "from_sw": _hex(from_sw),
-                "from_function": _hex(from_function) if from_function is not None else None,
-                "cond": cond, "delayed": delayed, "note": note,
+                "kind": kind,
+                "from_sw": _hex(from_sw),
+                "from_function": _hex(from_function)
+                if from_function is not None
+                else None,
+                "cond": cond,
+                "delayed": delayed,
+                "note": note,
             }
             for kind, from_sw, from_function, cond, delayed, note in rows
         ]
@@ -236,7 +279,8 @@ class Image:
 
     def roots(self):
         rows = self.db.execute(
-            "SELECT sw, kind, note FROM roots WHERE image=? ORDER BY kind, sw", (self.name,)
+            "SELECT sw, kind, note FROM roots WHERE image=? ORDER BY kind, sw",
+            (self.name,),
         ).fetchall()
         return [{"sw": _hex(sw), "kind": kind, "note": note} for sw, kind, note in rows]
 
@@ -245,15 +289,19 @@ class Image:
     def _succ_graph(self):
         if self._succ_cache is None:
             g = nx.DiGraph()
-            g.add_edges_from(self.db.execute(
-                "SELECT from_block, to_block FROM succ WHERE image=? AND to_block IS NOT NULL", (self.name,)
-            ).fetchall())
+            g.add_edges_from(
+                self.db.execute(
+                    "SELECT from_block, to_block FROM succ WHERE image=? AND to_block IS NOT NULL",
+                    (self.name,),
+                ).fetchall()
+            )
             self._succ_cache = g
         return self._succ_cache
 
     def _block_at(self, sw):
         row = self.db.execute(
-            "SELECT start_sw FROM bblocks WHERE image=? AND start_sw<=? AND end_sw>?", (self.name, sw, sw)
+            "SELECT start_sw FROM bblocks WHERE image=? AND start_sw<=? AND end_sw>?",
+            (self.name, sw, sw),
         ).fetchone()
         return row[0] if row else None
 
@@ -275,7 +323,19 @@ class Image:
         None when there is none."""
         rows = self.db.execute(
             _LAST_DEF_SQL,
-            (sw, self.name, sw, sw, self.name, self.name, self.name, reg, self.name, self.name, reg),
+            (
+                sw,
+                self.name,
+                sw,
+                sw,
+                self.name,
+                self.name,
+                self.name,
+                reg,
+                self.name,
+                self.name,
+                reg,
+            ),
         ).fetchall()
         writers = sorted(r[0] for r in rows if r[0] is not None)
         if not writers:
@@ -294,7 +354,8 @@ class Image:
 
     def refs(self, addr):
         rows = self.db.execute(
-            "SELECT sw, form, role FROM dataref WHERE image=? AND value=? ORDER BY sw", (self.name, addr)
+            "SELECT sw, form, role FROM dataref WHERE image=? AND value=? ORDER BY sw",
+            (self.name, addr),
         ).fetchall()
         return [{"sw": _hex(sw), "form": form, "role": role} for sw, form, role in rows]
 
@@ -320,10 +381,12 @@ class Image:
         ).fetchall()
         return [
             {
-                "sw": _hex(sw), "base_reg": base_reg,
+                "sw": _hex(sw),
+                "base_reg": base_reg,
                 "base_value": _hex(base_value) if base_value is not None else None,
                 "address": _hex(address) if address is not None else None,
-                "width": width, "kind": kind,
+                "width": width,
+                "kind": kind,
             }
             for sw, base_reg, base_value, address, width, kind in rows
         ]
@@ -349,10 +412,14 @@ class Image:
                 break
             value = int.from_bytes(raw, "little")
             fn = self.func(value)
-            out.append({
-                "index": i, "addr": _hex(addr + i * 4), "value": _hex(value),
-                "function": fn["entry_sw"] if fn else None,
-            })
+            out.append(
+                {
+                    "index": i,
+                    "addr": _hex(addr + i * 4),
+                    "value": _hex(value),
+                    "function": fn["entry_sw"] if fn else None,
+                }
+            )
         return out
 
     # --- notes ----------------------------------------------------------------
@@ -367,7 +434,9 @@ class Image:
     def _ensure_notes_db(self):
         if self._notes_attached:
             return
-        notes_path = os.path.join(os.path.dirname(os.path.abspath(self.db_path)), self.name + ".notes.sqlite")
+        notes_path = os.path.join(
+            os.path.dirname(os.path.abspath(self.db_path)), self.name + ".notes.sqlite"
+        )
         self.db.execute("ATTACH DATABASE ? AS notesdb", (notes_path,))
         self.db.execute("""CREATE TABLE IF NOT EXISTS notesdb.notes (
             image TEXT, function_sw INTEGER, role TEXT, summary TEXT, reads TEXT,
@@ -375,7 +444,15 @@ class Image:
             PRIMARY KEY (image, function_sw))""")
         self._notes_attached = True
 
-    _NOTE_FIELDS = ("role", "summary", "reads", "writes", "confidence", "evidence", "author")
+    _NOTE_FIELDS = (
+        "role",
+        "summary",
+        "reads",
+        "writes",
+        "confidence",
+        "evidence",
+        "author",
+    )
 
     def note(self, fn, **fields):
         """Upsert this image's note for function `fn` in the sidecar
@@ -387,15 +464,29 @@ class Image:
         existing = self.notes(fn)
         prior = existing[0] if existing else {}
         row = {f: fields.get(f, prior.get(f)) for f in self._NOTE_FIELDS}
-        created = fields.get("created") or prior.get("created") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        created = (
+            fields.get("created")
+            or prior.get("created")
+            or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        )
         self.db.execute(
             "INSERT INTO notesdb.notes (image, function_sw, role, summary, reads, writes, confidence, "
             "evidence, author, created) VALUES (?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(image, function_sw) DO UPDATE SET role=excluded.role, summary=excluded.summary, "
             "reads=excluded.reads, writes=excluded.writes, confidence=excluded.confidence, "
             "evidence=excluded.evidence, author=excluded.author, created=excluded.created",
-            (self.name, fn, row["role"], row["summary"], row["reads"], row["writes"],
-             row["confidence"], row["evidence"], row["author"], created),
+            (
+                self.name,
+                fn,
+                row["role"],
+                row["summary"],
+                row["reads"],
+                row["writes"],
+                row["confidence"],
+                row["evidence"],
+                row["author"],
+                created,
+            ),
         )
         self.db.commit()
 
@@ -403,7 +494,17 @@ class Image:
         """This image's note for `fn` (a single-element list, or [] when
         none exists), or every note in the image when fn is None."""
         self._ensure_notes_db()
-        cols = ("function_sw", "role", "summary", "reads", "writes", "confidence", "evidence", "author", "created")
+        cols = (
+            "function_sw",
+            "role",
+            "summary",
+            "reads",
+            "writes",
+            "confidence",
+            "evidence",
+            "author",
+            "created",
+        )
         query = "SELECT %s FROM notesdb.notes WHERE image=?" % ",".join(cols)
         args = [self.name]
         if fn is not None:
@@ -411,7 +512,7 @@ class Image:
             args.append(fn)
         query += " ORDER BY function_sw"
         rows = self.db.execute(query, args).fetchall()
-        out = [dict(zip(cols, r)) for r in rows]
+        out = [dict(zip(cols, r, strict=True)) for r in rows]
         for d in out:
             d["function_sw"] = _hex(d["function_sw"])
         return out
@@ -447,8 +548,10 @@ class Image:
             return "no function at 0x%x" % fn
         entry, end = int(f["entry_sw"], 16), int(f["end_sw"], 16)
         L = []
-        L.append("FUN_%06x  entry=0x%x end=0x%x  n_insns=%d  bytes=%d" %
-                  (entry, entry, end, f["n_insns"], (end - entry) * 2))
+        L.append(
+            "FUN_%06x  entry=0x%x end=0x%x  n_insns=%d  bytes=%d"
+            % (entry, entry, end, f["n_insns"], (end - entry) * 2)
+        )
         bits = ["block=%s" % f["block"], "leaf" if f["is_leaf"] else "non-leaf"]
         if f["name"] and f["name"] != "FUN_%06x" % entry:
             bits.append("name=%s" % f["name"])
@@ -469,7 +572,14 @@ class Image:
             "WHERE rc.image=? AND rc.function_sw=? GROUP BY r.kind ORDER BY 2",
             (self.name, entry),
         ).fetchall()
-        L.append("roots: " + (", ".join("%s(depth=%s)" % (k, d) for k, d in root_rows) if root_rows else "none reach this function"))
+        L.append(
+            "roots: "
+            + (
+                ", ".join("%s(depth=%s)" % (k, d) for k, d in root_rows)
+                if root_rows
+                else "none reach this function"
+            )
+        )
 
         def _role_suffix(fn_hex):
             if fn_hex is None:
@@ -486,12 +596,26 @@ class Image:
             if key in seen:
                 continue
             seen.add(key)
-            caller_bits.append("%s(%s)%s" % (c["from_function"] or c["from_sw"], c["kind"], _role_suffix(c["from_function"])))
-        L.append("callers (%d): %s" % (len(caller_bits), "; ".join(caller_bits) or "none"))
+            caller_bits.append(
+                "%s(%s)%s"
+                % (
+                    c["from_function"] or c["from_sw"],
+                    c["kind"],
+                    _role_suffix(c["from_function"]),
+                )
+            )
+        L.append(
+            "callers (%d): %s" % (len(caller_bits), "; ".join(caller_bits) or "none")
+        )
 
         callees = self.callees(entry)
-        L.append("callees (%d): %s" % (
-            len(callees), "; ".join("%s%s" % (c, _role_suffix(c)) for c in callees) or "none"))
+        L.append(
+            "callees (%d): %s"
+            % (
+                len(callees),
+                "; ".join("%s%s" % (c, _role_suffix(c)) for c in callees) or "none",
+            )
+        )
 
         lit_rows = self.db.execute(
             "SELECT DISTINCT l.value, l.form, l.dest_reg FROM literals l JOIN insn i "
@@ -499,7 +623,10 @@ class Image:
             (self.name, entry),
         ).fetchall()
         if lit_rows:
-            shown = ["0x%x(%s%s)" % (v, form, "->" + dr if dr else "") for v, form, dr in lit_rows[:20]]
+            shown = [
+                "0x%x(%s%s)" % (v, form, "->" + dr if dr else "")
+                for v, form, dr in lit_rows[:20]
+            ]
             more = "" if len(lit_rows) <= 20 else " ... +%d more" % (len(lit_rows) - 20)
             L.append("literals (%d): %s%s" % (len(lit_rows), ", ".join(shown), more))
 
@@ -508,26 +635,45 @@ class Image:
             (self.name, entry, end),
         ).fetchall()
         if dataref_rows:
-            L.append("datarefs: " + ", ".join("%s(%s)" % (_describe_address(v), role) for v, role in dataref_rows[:20]))
+            L.append(
+                "datarefs: "
+                + ", ".join(
+                    "%s(%s)" % (_describe_address(v), role)
+                    for v, role in dataref_rows[:20]
+                )
+            )
 
         mem_rows = self.db.execute(
             "SELECT direction, address, base_value FROM ptr WHERE image=? AND sw>=? AND sw<?",
             (self.name, entry, end),
         ).fetchall()
-        grouped = collections.defaultdict(lambda: [0, 0])
+        grouped: collections.defaultdict[str, list[int]] = collections.defaultdict(
+            lambda: [0, 0]
+        )
         for direction, address, base_value in mem_rows:
             label = _describe_address(address if address is not None else base_value)
             grouped[label][0 if direction == "load" else 1] += 1
         if grouped:
-            L.append("memory: " + "; ".join(
-                "%s(r=%d,w=%d)" % (label, r, w) for label, (r, w) in sorted(grouped.items())))
+            L.append(
+                "memory: "
+                + "; ".join(
+                    "%s(r=%d,w=%d)" % (label, r, w)
+                    for label, (r, w) in sorted(grouped.items())
+                )
+            )
 
         loop_rows = self.db.execute(
             "SELECT header_block, n_blocks, kind, depth FROM loops WHERE image=? AND function_sw=? ORDER BY header_block",
             (self.name, entry),
         ).fetchall()
         if loop_rows:
-            L.append("loops: " + "; ".join("0x%x(%s,n_blocks=%d,depth=%d)" % (h, k, n, d) for h, n, k, d in loop_rows))
+            L.append(
+                "loops: "
+                + "; ".join(
+                    "0x%x(%s,n_blocks=%d,depth=%d)" % (h, k, n, d)
+                    for h, n, k, d in loop_rows
+                )
+            )
 
         total = self.db.execute(
             "SELECT COUNT(*) FROM regdef WHERE image=? AND sw>=? AND sw<? AND kind='compute'",
@@ -538,23 +684,37 @@ class Image:
                 "SELECT COUNT(*) FROM regdef WHERE image=? AND sw>=? AND sw<? AND kind='compute' AND reg LIKE 'F%'",
                 (self.name, entry, end),
             ).fetchone()[0]
-            L.append("float-compute density: %.0f%% (%d/%d compute regdefs)" % (100.0 * floaty / total, floaty, total))
+            L.append(
+                "float-compute density: %.0f%% (%d/%d compute regdefs)"
+                % (100.0 * floaty / total, floaty, total)
+            )
 
         other = self._cross_partner()
         if other is not None:
             matches = self.match(other, entry)
-            L.append("cross-image (%s): %s" % (
-                other.name,
-                ", ".join("%s%s" % (m["entry_sw"], "" if m["exact_match"] else "(reloc-only)") for m in matches)
-                if matches else "no match",
-            ))
+            L.append(
+                "cross-image (%s): %s"
+                % (
+                    other.name,
+                    ", ".join(
+                        "%s%s"
+                        % (m["entry_sw"], "" if m["exact_match"] else "(reloc-only)")
+                        for m in matches
+                    )
+                    if matches
+                    else "no match",
+                )
+            )
 
         all_rows = self.db.execute(
             "SELECT sw, mnemonic FROM insn WHERE image=? AND function_sw=? AND aligned=1 ORDER BY sw",
             (self.name, entry),
         ).fetchall()
         n = listing_n
-        L.append("listing (%d insns%s):" % (len(all_rows), "" if len(all_rows) <= 2 * n + 4 else ", truncated"))
+        L.append(
+            "listing (%d insns%s):"
+            % (len(all_rows), "" if len(all_rows) <= 2 * n + 4 else ", truncated")
+        )
         if len(all_rows) <= 2 * n + 4:
             L += ["  0x%x  %s" % (sw, m) for sw, m in all_rows]
         else:
@@ -563,22 +723,36 @@ class Image:
             # store-heavy dispatcher (e.g. FUN_1c642a) doesn't blow the
             # card's whole size budget -- see the module note on card()'s
             # 1-3k token target.
-            control_flow = set(r[0] for r in self.db.execute(
-                "SELECT DISTINCT from_sw FROM edges WHERE image=? AND from_sw>=? AND from_sw<? "
-                "AND kind IN ('call','jump','cond_jump','indirect','return')", (self.name, entry, end),
-            ).fetchall())
-            stores = set(r[0] for r in self.db.execute(
-                "SELECT DISTINCT sw FROM mem_access WHERE image=? AND sw>=? AND sw<? AND direction='store'",
-                (self.name, entry, end),
-            ).fetchall())
+            control_flow = set(
+                r[0]
+                for r in self.db.execute(
+                    "SELECT DISTINCT from_sw FROM edges WHERE image=? AND from_sw>=? AND from_sw<? "
+                    "AND kind IN ('call','jump','cond_jump','indirect','return')",
+                    (self.name, entry, end),
+                ).fetchall()
+            )
+            stores = set(
+                r[0]
+                for r in self.db.execute(
+                    "SELECT DISTINCT sw FROM mem_access WHERE image=? AND sw>=? AND sw<? AND direction='store'",
+                    (self.name, entry, end),
+                ).fetchall()
+            )
             head, tail = all_rows[:n], all_rows[-n:]
             edge_sws = {sw for sw, _ in head} | {sw for sw, _ in tail}
             store_cap = 40
-            mid_stores = [(sw, m) for sw, m in all_rows if sw not in edge_sws and sw in stores]
+            mid_stores = [
+                (sw, m) for sw, m in all_rows if sw not in edge_sws and sw in stores
+            ]
             omitted_stores = max(0, len(mid_stores) - store_cap)
             mid_stores = mid_stores[:store_cap]
             mid = sorted(
-                {(sw, m) for sw, m in all_rows if sw not in edge_sws and sw in control_flow} | set(mid_stores)
+                {
+                    (sw, m)
+                    for sw, m in all_rows
+                    if sw not in edge_sws and sw in control_flow
+                }
+                | set(mid_stores)
             )
             L += ["  0x%x  %s" % (sw, m) for sw, m in head]
             L.append("  ...")
@@ -598,21 +772,32 @@ class Image:
         condensed, same construction as tools/sharcdb.py's
         _detect_callgraph, so a recursive cluster is yielded as one group)."""
         if order not in ("bottom_up", "top_down"):
-            raise ValueError("cards(): order must be 'bottom_up' or 'top_down', got %r" % order)
-        fn_rows = self.db.execute("SELECT entry_sw FROM functions WHERE image=?", (self.name,)).fetchall()
+            raise ValueError(
+                "cards(): order must be 'bottom_up' or 'top_down', got %r" % order
+            )
+        fn_rows = self.db.execute(
+            "SELECT entry_sw FROM functions WHERE image=?", (self.name,)
+        ).fetchall()
         G = nx.DiGraph()
         G.add_nodes_from(r[0] for r in fn_rows)
-        G.add_edges_from(self.db.execute(
-            "SELECT DISTINCT from_function, to_function FROM edges WHERE image=? AND kind='call' "
-            "AND from_function IS NOT NULL AND to_function IS NOT NULL", (self.name,),
-        ).fetchall())
+        G.add_edges_from(
+            self.db.execute(
+                "SELECT DISTINCT from_function, to_function FROM edges WHERE image=? AND kind='call' "
+                "AND from_function IS NOT NULL AND to_function IS NOT NULL",
+                (self.name,),
+            ).fetchall()
+        )
         if root is not None:
             roots = root if isinstance(root, (list, tuple, set)) else [root]
             keep = set()
             for r in roots:
-                keep |= {row[0] for row in self.db.execute(
-                    "SELECT function_sw FROM reach WHERE image=? AND root_sw=?", (self.name, r),
-                ).fetchall()}
+                keep |= {
+                    row[0]
+                    for row in self.db.execute(
+                        "SELECT function_sw FROM reach WHERE image=? AND root_sw=?",
+                        (self.name, r),
+                    ).fetchall()
+                }
             G = G.subgraph(keep).copy()
 
         C = nx.condensation(G)
@@ -633,7 +818,8 @@ class Image:
         """Functions in other_img matching func by relocation-tolerant
         hash, with whether the match is exact-byte too."""
         row = self.db.execute(
-            "SELECT exact_hash, reloc_hash FROM func_hash WHERE image=? AND entry_sw=?", (self.name, func)
+            "SELECT exact_hash, reloc_hash FROM func_hash WHERE image=? AND entry_sw=?",
+            (self.name, func),
         ).fetchone()
         if row is None:
             return []
@@ -642,8 +828,10 @@ class Image:
             "SELECT entry_sw, exact_hash FROM func_hash WHERE image=? AND reloc_hash=?",
             (other_img.name, reloc_hash),
         ).fetchall()
-        return [{"entry_sw": _hex(entry_sw), "exact_match": exact_hash == other_exact}
-                for entry_sw, other_exact in rows]
+        return [
+            {"entry_sw": _hex(entry_sw), "exact_match": exact_hash == other_exact}
+            for entry_sw, other_exact in rows
+        ]
 
     # --- symbolic trace -----------------------------------------------------------
 
@@ -655,7 +843,15 @@ class Image:
             self._mem_cache = sharcldr.LoadedMemory.from_stream(data, blocks)
         return self._mem_cache
 
-    def trace(self, start, max_steps=100, max_states=32, pokes=None, provisional_forms=(), **regs):
+    def trace(
+        self,
+        start,
+        max_steps=100,
+        max_states=32,
+        pokes=None,
+        provisional_forms=(),
+        **regs,
+    ):
         """tools/sharc_trace.py's trace(), in-process against this image's
         loaded memory: firmware DAG-modify constants seeded by default
         (override any of them, or add more, via **regs), concrete memory
@@ -671,8 +867,16 @@ class Image:
         sets = dict(_DEFAULT_TRACE_REGS)
         sets.update(regs)
         return sharc_trace.trace(
-            self._mem(), None, start, sets, max_steps, max_states,
-            concrete_memory=True, assume_nw32=True, pokes=pokes, provisional_forms=provisional_forms,
+            self._mem(),
+            None,
+            start,
+            sets,
+            max_steps,
+            max_states,
+            concrete_memory=True,
+            assume_nw32=True,
+            pokes=pokes,
+            provisional_forms=provisional_forms,
         )
 
 

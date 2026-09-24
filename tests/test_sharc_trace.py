@@ -5645,5 +5645,101 @@ class RealBlobStage6NormalWordAddressingTest(unittest.TestCase):
         )
 
 
+class TypeCacheCompareRealBlobTest(unittest.TestCase):
+    """Concrete run of FUN_001c2b24's type-cache compare/store (sw
+    0x1c33bc..0x1c33e9) via T._execute() directly. This form's Type3b
+    short-word addressing has no pypcode/SLEIGH semantics (see
+    docs/findings/05-sharc-isa-and-decoding.md), so this exercises the
+    behaviour through sharc_trace instead. A synthetic frame with a
+    matching cached/live type takes the EQ branch and never writes the
+    cache; a mismatch executes both trailing stores in sequence, so the
+    final DM(I5+0xc4) value is whichever register the SECOND store uses
+    (M14), not the freshly-read per-track field the first store wrote.
+
+    Moved out of the now-removed tools/sharcemu.py's test suite (this test
+    never exercised sharcemu itself, only tools/sharc_trace.py).
+    """
+
+    BLOB = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "out",
+        "sections",
+        "dt2-1.16",
+        "section_7_BLOB.bin",
+    )
+
+    def run_type_cache_compare(self, cached, live, m14):
+        i10_frame = 0x290000
+        i6_stack = 0x292000
+        track_base = i6_stack + 62 * 4
+        i5_out = 0x293000
+        cache_addr = 0x255970
+        overlay = {}
+
+        def poke16(addr, value):
+            overlay[addr] = value & 0xFF
+            overlay[addr + 1] = (value >> 8) & 0xFF
+
+        def poke32(addr, value):
+            for i in range(4):
+                overlay[addr + i] = (value >> (8 * i)) & 0xFF
+
+        poke32(track_base, 0x291000)
+        poke16(cache_addr, cached)
+        poke16(i10_frame, live)
+        poke16(0x291000 + 0x54, 0xBEEF)
+
+        uregs = {
+            T.UREG_CODES["R5"]: T.Const(0),
+            T.UREG_CODES["I6"]: T.Const(i6_stack),
+            T.UREG_CODES["I10"]: T.Const(i10_frame),
+            T.UREG_CODES["I5"]: T.Const(i5_out),
+            T.UREG_CODES["M0"]: T.Const(0),
+            T.UREG_CODES["M4"]: T.Const(0),
+            T.UREG_CODES["M5"]: T.Const(0),
+            T.UREG_CODES["M14"]: T.Const(m14),
+            # SISD assumption (MODE1 reset default) so cond=0 (EQ) resolves
+            # from AZ alone -- see the task write-up.
+            T.UREG_CODES["MODE1"]: T.Const(0),
+        }
+        with open(self.BLOB, "rb") as fh:
+            mem = L.LoadedMemory.from_stream(fh.read())
+        state = T.State(0x1C33BC, dict(uregs), concrete=mem, overlay=overlay, assume_nw32=True)
+        active = {T._dedupe_key(state): state}
+        done = []
+        steps = 0
+        while active and steps < 200:
+            s = active.pop(next(iter(active)))
+            if s.pc_sw == 0x1C33E9:
+                done.append(s)
+                continue
+            insn_record = T.decode_at(mem, None, s.pc_sw)
+            for child in T._execute(s, insn_record):
+                if child.stopped:
+                    done.append(child)
+                else:
+                    active[T._dedupe_key(child)] = child
+            steps += 1
+        self.assertEqual(len(done), 1)
+        return T._dm_read(done[0], i5_out + 49 * 4, 4)
+
+    @unittest.skipUnless(
+        os.path.exists(BLOB), "out/sections/dt2-1.16/section_7_BLOB.bin is not available"
+    )
+    def test_matching_cached_and_live_type_does_not_write(self):
+        self.assertIsNone(self.run_type_cache_compare(cached=6, live=6, m14=0xAAAA))
+
+    @unittest.skipUnless(
+        os.path.exists(BLOB), "out/sections/dt2-1.16/section_7_BLOB.bin is not available"
+    )
+    def test_mismatched_type_writes_the_second_store_register(self):
+        result = self.run_type_cache_compare(cached=6, live=7, m14=0xAAAA)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.value, 0xAAAA)
+        result2 = self.run_type_cache_compare(cached=6, live=7, m14=0x5555)
+        self.assertIsNotNone(result2)
+        self.assertEqual(result2.value, 0x5555)
+
+
 if __name__ == "__main__":
     unittest.main()

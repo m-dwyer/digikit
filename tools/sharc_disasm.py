@@ -17,13 +17,13 @@ A form whose table entry marks some fixed bits unconfirmed yields kind
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Protocol
 
 from sharc_isa import load_instruction_set
 from sharc_visa_tables import TYPES, get_type
-
 
 ISA = load_instruction_set()
 
@@ -73,9 +73,14 @@ def _read_u16(data: bytes, offset: int) -> int | None:
 def identify(insn: int, bits: int, include_uncertain: bool = False) -> list[str]:
     """Every form of that width whose mask matches insn, most fixed bits first;
     forms with unconfirmed bits only with include_uncertain."""
-    names = [t["name"] for t in TYPES
-             if t["bits"] == bits and (include_uncertain or not t["uncertain"])
-             and insn & t["opcode_mask"] == t["opcode_value"]]
+    names = [
+        t["name"]
+        for t in TYPES
+        if t["bits"] == bits
+        and (include_uncertain or not t["uncertain"])
+        and insn & t["opcode_mask"] == t["opcode_value"]
+    ]
+
     def fixed_bits(name: str) -> int:
         entry = get_type(name)
         assert entry is not None
@@ -84,8 +89,12 @@ def identify(insn: int, bits: int, include_uncertain: bool = False) -> list[str]
     return sorted(names, key=lambda n: -fixed_bits(n))
 
 
-def disassemble(data: bytes, start_offset: int = 0, count: int | None = None,
-                on_unknown: str = "yield") -> Iterator[Instruction]:
+def disassemble(
+    data: bytes,
+    start_offset: int = 0,
+    count: int | None = None,
+    on_unknown: str = "yield",
+) -> Iterator[Instruction]:
     """Walk data from start_offset, one Instruction per unit, up to count
     instructions (None: until an unknown word or the end of the buffer).
 
@@ -112,8 +121,10 @@ def disassemble(data: bytes, start_offset: int = 0, count: int | None = None,
         elif entry is None and hypotheses:
             if result.truncated and len(hypotheses) == 1:
                 form = result.candidates[0]
-                reason = (f"matches {form.id} ({form.extent_bits} bits) but only "
-                          f"{len(data) - offset} bytes remain")
+                reason = (
+                    f"matches {form.id} ({form.extent_bits} bits) but only "
+                    f"{len(data) - offset} bytes remain"
+                )
             else:
                 reason = f"forms tie: {hypotheses}"
         elif entry is None:
@@ -124,15 +135,27 @@ def disassemble(data: bytes, start_offset: int = 0, count: int | None = None,
             word0 = words[0] if words else 0
             if on_unknown == "raise":
                 raise Desync(offset, reason, word0, hypotheses)
-            yield Instruction(offset=offset, length_bytes=None, type_name="unknown", fields={},
-                              raw=words[0] if words else None, kind="unknown", note=reason)
+            yield Instruction(
+                offset=offset,
+                length_bytes=None,
+                type_name="unknown",
+                fields={},
+                raw=words[0] if words else None,
+                kind="unknown",
+                note=reason,
+            )
             return
         assert entry is not None
         assert decoded is not None
-        yield Instruction(offset=offset, length_bytes=entry["bits"] // 8,
-                          type_name=entry["name"], fields=decoded.field_dict(),
-                          raw=decoded.raw, kind="uncertain" if entry["uncertain"] else "confident",
-                          note=f"source: {entry['source']}" if entry["uncertain"] else "")
+        yield Instruction(
+            offset=offset,
+            length_bytes=entry["bits"] // 8,
+            type_name=entry["name"],
+            fields=decoded.field_dict(),
+            raw=decoded.raw,
+            kind="uncertain" if entry["uncertain"] else "confident",
+            note=f"source: {entry['source']}" if entry["uncertain"] else "",
+        )
         offset += entry["bits"] // 8
         yielded += 1
 
@@ -194,9 +217,15 @@ def walk_and_report(data: bytes, start_offset: int = 0) -> WalkReport:
         assert rec.length_bytes is not None
         offset = rec.offset + rec.length_bytes
     return WalkReport(
-        start_offset=start_offset, end_offset=offset, bytes_total=len(data) - start_offset,
-        bytes_decoded=offset - start_offset, instructions=n_conf + n_unc, confident=n_conf,
-        uncertain=n_unc, stopped_reason=stopped_reason, last_instruction=last,
+        start_offset=start_offset,
+        end_offset=offset,
+        bytes_total=len(data) - start_offset,
+        bytes_decoded=offset - start_offset,
+        instructions=n_conf + n_unc,
+        confident=n_conf,
+        uncertain=n_unc,
+        stopped_reason=stopped_reason,
+        last_instruction=last,
     )
 
 
@@ -214,9 +243,13 @@ if __name__ == "__main__":
     report = walk_and_report(blob, start)
     print(f"Walked {path} from offset {start:#x}:")
     print(f"  buffer size:      {len(blob)} bytes")
-    print(f"  decoded:          {report.bytes_decoded} / {report.bytes_total} bytes "
-          f"({report.fraction_decoded:.1%})")
-    print(f"  instructions:     {report.instructions} "
-          f"(confident={report.confident}, uncertain={report.uncertain})")
+    print(
+        f"  decoded:          {report.bytes_decoded} / {report.bytes_total} bytes "
+        f"({report.fraction_decoded:.1%})"
+    )
+    print(
+        f"  instructions:     {report.instructions} "
+        f"(confident={report.confident}, uncertain={report.uncertain})"
+    )
     print(f"  stopped at:       offset {report.end_offset:#x}")
     print(f"  stopped because:  {report.stopped_reason}")
