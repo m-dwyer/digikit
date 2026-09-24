@@ -688,6 +688,90 @@ def _ureg(values: Mapping[int, Value], code: int) -> Value:
     return value
 
 
+# SHARC+ Core Programming Reference (out/refs/sharc-plus-prm) p.62 (Table
+# 2-3, "Universal and System Register Complementary Pairs") and p.4-55
+# footnote *1 ("Complementary universal register pairs (CUreg) ... include
+# PEx/y data registers and USTAT1/2, USTAT3/4, ASTATx/y, STKYx/y, and PX1/2
+# Uregs"): the UREG codes with a SIMD companion register.  Any code not in
+# this map -- every DAG register (I/M/L/B), PC/PCSTK/loop and interrupt
+# state, the combined PX, MODE1/MMASK/MODE2/FLAGS, and the timers -- "has
+# no complements, so they do not operate differently in SIMD mode" (p.15-3,
+# the MODE1/LCNTR example) and this tracer's single-PE handling of them is
+# already correct in SIMD mode as well as SISD.
+_CUREG_PAIRS: Dict[int, int] = {code: code + 80 for code in range(16)}
+_CUREG_PAIRS.update({code + 80: code for code in range(16)})
+for _pair in (("USTAT1", "USTAT2"), ("USTAT3", "USTAT4"), ("PX1", "PX2"),
+              ("ASTATX", "ASTATY"), ("STKYX", "STKYY")):
+    _CUREG_PAIRS[UREG_CODES[_pair[0]]] = UREG_CODES[_pair[1]]
+    _CUREG_PAIRS[UREG_CODES[_pair[1]]] = UREG_CODES[_pair[0]]
+del _pair
+
+
+def _cureg_code(code: int) -> Optional[int]:
+    """The SIMD companion (Cureg) UREG code for CODE, or None if CODE has
+    no SIMD complement (see _CUREG_PAIRS)."""
+    return _CUREG_PAIRS.get(code)
+
+
+def _simd_active(state: State) -> Optional[bool]:
+    """MODE1.PEYEN (bit 21, SHARC+ PRM p.101): True/False when MODE1 is
+    concretely known, else None."""
+    mode1 = _ureg(state.uregs, UREG_CODES["MODE1"])
+    if not isinstance(mode1, Const):
+        return None
+    return bool(mode1.value & (1 << 21))
+
+
+# Widths this tracer resolves a SIMD companion memory transfer for (SHARC+
+# PRM p.212, Table 6-10 "DAG Address vs. Access Modes": explicit address
+# Ia, implicit address Ia+k, k=1 for normal-word). Byte and short-word
+# access have their own SIMD addressing rule (PRM pp.222-223, packing the
+# companion into an adjacent byte/short-word rather than offsetting by a
+# whole normal word) that this tracer does not yet model, so those widths
+# raise rather than silently transfer only the explicit half.
+_SIMD_COMPANION_WIDTHS = frozenset({"normal-word"})
+
+
+def _simd_ureg_mem_companion(
+    state: State, code: int, address: Value, access_width: str = "normal-word"
+) -> Optional[tuple[int, Value]]:
+    """The SIMD companion (Cureg code, companion address) for a single
+    UREG<->memory transfer, or None when no companion transfer applies
+    (SISD mode, or a UREG with no SIMD complement -- SHARC+ PRM p.15-12's
+    TCOUNT/USTAT1 worked example: only "Cureg subset registers" gain a
+    companion in SIMD mode, every other UREG "operates the same in SIMD
+    and SISD mode").
+
+    An unresolved MODE1.PEYEN is treated like SISD (no companion): the
+    explicit transfer this helper's caller performs regardless is correct
+    either way (SIMD only ever *adds* an implicit transfer beside it, PRM
+    p.28), so an unknown MODE1 cannot make the explicit half wrong -- it
+    can only leave a companion transfer unmodelled, exactly as this
+    tracer already left it before this helper existed.  ACCESS_WIDTH not
+    in _SIMD_COMPANION_WIDTHS raises ValueError instead, since a
+    concretely SIMD-active companion this tracer cannot model would
+    otherwise be silently dropped; callers should stop the state on that.
+    """
+    cureg = _cureg_code(code)
+    if cureg is None:
+        return None
+    if access_width == "long-word":
+        # PRM p.13-17: the (LW) modifier "override[s] SIMD mode, so these
+        # loads always operate in SISD mode" -- unlike byte/short-word,
+        # this is a documented no-companion case, not an unmodelled one.
+        return None
+    if _simd_active(state) is not True:
+        return None
+    if access_width not in _SIMD_COMPANION_WIDTHS:
+        raise ValueError(
+            "unsupported SIMD companion access width %r for %s"
+            % (access_width, UREG_NAMES[code])
+        )
+    k = _access_modifier_scale("normal-word", state.assume_nw32)
+    companion_address = _add(address, Const(k), "%s + %d" % (_render(address), k))
+    return cureg, companion_address
+
+
 def _terms(value: Const | Affine) -> tuple[int, tuple[tuple[str, int], ...]]:
     return (
         (value.value, ()) if isinstance(value, Const) else (value.constant, value.terms)
@@ -3222,6 +3306,138 @@ def _apply_compute(
         _event(state, insn, "approximate-recips", value=value)
 
 
+def _compute_pey_values(values: Mapping[int, Value]) -> Dict[int, Value]:
+    """A PEy view of the register file for _compute: R/F codes 0-15 read
+    the paired S/SF register instead (SHARC+ PRM p.3-39, "Compute
+    Instructions in SIMD Mode": "S0 = S1 + S2; /* implicit ALU instruction
+    */" -- the PEy compute is decoded from the *same* instruction bits as
+    PEx, just re-targeted at the S file, so re-running _compute unchanged
+    against a shifted register map is exactly this rule)."""
+    shifted = dict(values)
+    for code in range(16):
+        shifted[code] = values.get(80 + code, Unknown("uninitialized S%d" % code))
+    return shifted
+
+
+def _compute_pey(
+    f: Mapping[str, int],
+    short: bool,
+    values: Mapping[int, Value],
+    special: Optional[Mapping[str, Value]] = None,
+    *,
+    approx_recips: bool = False,
+) -> Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]]:
+    """PEy's half of a SIMD compute (SHARC+ PRM p.101, "SIMD Mode":
+    "Executes the same instruction simultaneously in both processing
+    elements"), decoded against the S/SF register file and the PEy
+    multiplier accumulator (PRM p.101, "Multiplier Result Register Swap":
+    "swapping also occurs with the PEY unit based registers (REGF_MS0F,
+    REGF_MS2F, and REGF_MS0B, REGF_MS2B)"). _compute always names its MR
+    data-move/multiply-accumulate destination "MRF" regardless of PE (see
+    its own docstring); disguise state.special["MSF"] as "MRF" on the way
+    in so that accumulator read is correct, and _apply_compute_pey below
+    undoes the disguise on the way out.
+    """
+    pey_special = {"MRF": (special or {}).get("MSF", Unknown("uninitialized MSF"))}
+    return _compute(
+        f,
+        short,
+        _compute_pey_values(values),
+        pey_special,
+        approx_recips=approx_recips,
+    )
+
+
+def _apply_compute_pey(
+    state: State,
+    insn: Instruction,
+    result: tuple[int | str, Value, str, "Callable[[Value], Value]"],
+) -> None:
+    """PEy's half of _apply_compute: the identical shape, redirected to the
+    S/SF register file, REGF_ASTATY, and the PEy multiplier accumulator
+    (SHARC+ PRM p.66, Table 3-1: ASTATx/ASTATy and STKYx/STKYy are the
+    per-PE computation-status register pairs)."""
+    rn, value, operation, astatx_update = result
+    astaty_code = UREG_CODES["ASTATY"]
+    state.uregs[astaty_code] = astatx_update(_ureg_raw(state.uregs, astaty_code))
+    if isinstance(rn, str):
+        _event(
+            state,
+            insn,
+            "compute-pey",
+            operation=operation,
+            result_register="MSF",
+            value=value,
+        )
+        state.special["MSF"] = value
+        return
+    if isinstance(rn, tuple):
+        names = ["S%d" % reg for reg in rn]
+        _event(
+            state,
+            insn,
+            "compute-pey",
+            operation=operation,
+            result_register=names,
+            value=[_json_value(v) for v in value],
+        )
+        for reg, val in zip(rn, value):
+            state.uregs[80 + reg] = val
+        return
+    if operation in ("compare", "bit-test", "float-compare"):
+        _event(state, insn, "compute-pey", operation=operation, status_only=True)
+    else:
+        _event(
+            state,
+            insn,
+            "compute-pey",
+            operation=operation,
+            result_register="S%d" % rn,
+            value=value,
+        )
+        state.uregs[80 + rn] = value
+    if operation == "float-recips-seed-approx":
+        state.approx_recips_used = True
+        _event(state, insn, "approximate-recips-pey", value=value)
+
+
+def _compute_simd(
+    state: State,
+    f: Mapping[str, int],
+    short: bool,
+    values: Mapping[int, Value],
+    special: Optional[Mapping[str, Value]] = None,
+    *,
+    approx_recips: bool = False,
+) -> tuple[
+    Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
+    Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
+]:
+    """Decode a compute for PEx, and for PEy too when MODE1.PEYEN is
+    concretely set (SHARC+ PRM p.101, "SIMD Mode": "Dispatches a single
+    instruction to both processing element's computational units").  SISD
+    mode, or an unresolved MODE1, returns a PEy result of None -- exactly
+    like SISD, the tracer does not invent a PEy effect it cannot confirm.
+    """
+    result_x = _compute(f, short, values, special, approx_recips=approx_recips)
+    if _simd_active(state) is not True:
+        return result_x, None
+    result_y = _compute_pey(f, short, values, special, approx_recips=approx_recips)
+    return result_x, result_y
+
+
+def _apply_compute_simd(
+    state: State,
+    insn: Instruction,
+    result_x: Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
+    result_y: Optional[tuple[int | str, Value, str, "Callable[[Value], Value]"]],
+) -> None:
+    if result_x is not None:
+        _apply_compute(state, insn, result_x)
+    if result_y is not None:
+        _apply_compute_pey(state, insn, result_y)
+
+
 def decode_at(
     data: bytes | LoadedMemory, base_sw: Optional[int], pc_sw: int
 ) -> Instruction:
@@ -3423,6 +3639,100 @@ def _predicate(state: State, cond: int) -> Optional[bool]:
             return None
         return (not known) if negate else known
     return None
+
+
+def _lt_ge_le_gt_pe(state: State, cond: int, pe: str) -> Optional[bool]:
+    """_lt_ge_le_gt read against one PE's own status (SHARC+ PRM p.4-53's
+    rule, applied to REGF_ASTATY when pe == "y" instead of REGF_ASTATX --
+    p.66 Table 3-1 pairs them as the identical per-PE status)."""
+    astat_code = UREG_CODES["ASTATX"] if pe == "x" else UREG_CODES["ASTATY"]
+    astat = _ureg_raw(state.uregs, astat_code)
+    af = _astatx_known_bit(astat, AF_BIT)
+    an = _astatx_known_bit(astat, AN_BIT)
+    az = _astatx_known_bit(astat, AZ_BIT)
+    if af is None or an is None or az is None:
+        return None
+    if af:
+        x = an or az
+        y = an and not az
+    else:
+        av = _astatx_known_bit(astat, AV_BIT)
+        if av is None:
+            return None
+        if not av:
+            term = an
+        else:
+            mode1 = _ureg(state.uregs, UREG_CODES["MODE1"])
+            if not isinstance(mode1, Const):
+                return None
+            alusat = bool(mode1.value & (1 << ALUSAT_BIT))
+            term = an != (not alusat)
+        x = term or az
+        y = term
+    if cond in (0x02, 0x12):
+        return x if cond == 0x02 else not x
+    return y if cond == 0x01 else not y
+
+
+def _predicate_pe(state: State, cond: int, pe: str) -> Optional[bool]:
+    """Evaluate COND against exactly one processing element's own status
+    (SHARC+ PRM p.4-54, Table 4-22: a conditional compute or register/
+    memory move "[e]xecutes ... depending on condition test in each PE").
+    Unlike _predicate, this never bails out because SIMD mode is active or
+    unresolved -- reading a single PE's own condition is exactly what SIMD
+    mode calls for, and callers that need the combined branch condition use
+    _predicate_simd_branch instead."""
+    if cond == 0x1F:
+        return True
+    if cond in (0x00, 0x10):
+        astat_code = UREG_CODES["ASTATX"] if pe == "x" else UREG_CODES["ASTATY"]
+        astat = _ureg_raw(state.uregs, astat_code)
+        equal = _astatx_known_bit(astat, AZ_BIT)
+        if equal is None:
+            return None
+        return equal if cond == 0x00 else not equal
+    if cond in (0x01, 0x02, 0x11, 0x12):
+        return _lt_ge_le_gt_pe(state, cond, pe)
+    if cond in SIMPLE_COND_BITS:
+        bit, negate = SIMPLE_COND_BITS[cond]
+        astat_code = UREG_CODES["ASTATX"] if pe == "x" else UREG_CODES["ASTATY"]
+        astat = _ureg_raw(state.uregs, astat_code)
+        known = _astatx_known_bit(astat, bit)
+        if known is None:
+            return None
+        return (not known) if negate else known
+    return None
+
+
+def _predicate_and(a: Optional[bool], b: Optional[bool]) -> Optional[bool]:
+    """Three-valued AND, used to combine PEx's and PEy's conditions for a
+    SIMD branch (SHARC+ PRM p.4-54): a concrete False on either side makes
+    the whole AND False even if the other side is unresolved; otherwise an
+    unresolved side makes the result unresolved."""
+    if a is False or b is False:
+        return False
+    if a is None or b is None:
+        return None
+    return a and b
+
+
+def _predicate_simd_branch(state: State, cond: int) -> Optional[bool]:
+    """A branch/call/return's predicate (SHARC+ PRM p.4-54, Table 4-22:
+    "Executes in sequencer depending on AND'ing condition test on both
+    PEs"). SISD mode uses PEx's own condition only; SIMD mode ANDs PEx's
+    and PEy's. An unresolved MODE1.PEYEN leaves the choice between those
+    two rules unresolved too, except for the unconditional ("always")
+    branch, which needs neither PE's status."""
+    if cond == 0x1F:
+        return True
+    simd = _simd_active(state)
+    if simd is None:
+        return None
+    pex = _predicate_pe(state, cond, "x")
+    if not simd:
+        return pex
+    pey = _predicate_pe(state, cond, "y")
+    return _predicate_and(pex, pey)
 
 
 def _check_return_target(state: State) -> Optional[str]:
@@ -3855,7 +4165,7 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         return _return_transfer(
             state,
             insn,
-            _predicate(state, _field(f, "cond")),
+            _predicate_simd_branch(state, _field(f, "cond")),
             bool(_field(f, "j")),
         )
     if name == "11a":
@@ -4054,7 +4364,7 @@ def _execute(state: State, insn: Instruction) -> List[State]:
             insn,
             target,
             bool(_field(f, "b")),
-            _predicate(state, _field(f, "cond")),
+            _predicate_simd_branch(state, _field(f, "cond")),
         )
     if name == "25c_rframe":
         if state.pending and state.pending.return_from_call:
@@ -4526,27 +4836,41 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         rendered = _render(Const(address))
         code = _field(f, "ureg")
         space = "PM" if _field(f, "g") else "DM"
+        try:
+            companion = _simd_ureg_mem_companion(state, code, Const(address))
+        except ValueError as error:
+            return [_stop(state, insn, str(error))]
         if _field(f, "d"):
+            value = _ureg(state.uregs, code)
             _event(
                 state,
                 insn,
                 "store",
                 space=space,
                 ureg=UREG_NAMES[code],
-                value=_ureg(state.uregs, code),
+                value=value,
                 address=address,
                 expression=rendered,
                 simd_companion_possible=True,
                 **(
-                    {
-                        "concrete_write": _dm_write(
-                            state, address, 4, _ureg(state.uregs, code)
-                        )
-                    }
+                    {"concrete_write": _dm_write(state, address, 4, value)}
                     if space == "DM" and state.concrete is not None
                     else {}
                 ),
             )
+            if companion is not None and space == "DM":
+                companion_value = _ureg(state.uregs, companion[0])
+                _dm_write(state, companion[1], 4, companion_value)
+                _event(
+                    state,
+                    insn,
+                    "store-pey",
+                    space=space,
+                    ureg=UREG_NAMES[companion[0]],
+                    value=companion_value,
+                    address=companion[1],
+                    expression=_render(companion[1]),
+                )
         else:
             loaded = _load_normal_ureg(state, space, address, code)
             _event(
@@ -4560,6 +4884,20 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                 concrete_value=loaded,
                 simd_companion_possible=True,
             )
+            if companion is not None and space == "DM":
+                companion_loaded = _load_normal_ureg(
+                    state, space, companion[1], companion[0]
+                )
+                _event(
+                    state,
+                    insn,
+                    "load-pey",
+                    space=space,
+                    ureg=UREG_NAMES[companion[0]],
+                    address=companion[1],
+                    expression=_render(companion[1]),
+                    concrete_value=companion_loaded,
+                )
         return _advance(state, insn)
     if name == "14d":
         # SHARC+ Core Programming Reference (out/refs/sharc-plus-prm)
@@ -4652,6 +4990,26 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         )
         dst = _field(f, "dstureg")
         copied = _ureg(old, src)
+        # The unconditional ("always") case is PE-independent by
+        # construction, so its SIMD companion can be resolved without
+        # forking on the predicate at all (SHARC+ PRM p.28, "Data and
+        # Complementary Data Register Transfers": a complementary
+        # destination with an uncomplementary source loads both PEs from
+        # that one source -- "R5 = I8; loads R5 and S5 with I8"; a
+        # complementary source and destination move each PE from its own
+        # register; an uncomplementary destination gets no implicit move
+        # at all, p.4-55 Table 4-22). Conditional (cond != 0x1F) ureg
+        # copies are not SIMD-duplicated here: PEx's and PEy's predicates
+        # can differ, which would need this form's existing predicate-fork
+        # logic doubled for the PEy side too. An unresolved MODE1.PEYEN is
+        # treated like SISD (no companion), exactly like
+        # _simd_ureg_mem_companion: the explicit copy is correct either
+        # way, so unknown MODE1 only leaves a companion unmodelled.
+        cureg_dst = _cureg_code(dst) if cond == 0x1F else None
+        simd_companion_source = None
+        if cureg_dst is not None and _simd_active(state) is True:
+            cureg_src = _cureg_code(src)
+            simd_companion_source = cureg_src if cureg_src is not None else src
         predicate = _predicate(state, cond)
         if predicate is False:
             _event(
@@ -4667,6 +5025,8 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         executed = state if predicate is True else _copy(state)
         # The Type 5a data move and compute both consume the pre-instruction file.
         executed.uregs[dst] = copied
+        if simd_companion_source is not None:
+            executed.uregs[cureg_dst] = _ureg(old, simd_companion_source)
         if compute is not None:
             _apply_compute(executed, insn, compute)
         _event(
@@ -4677,6 +5037,14 @@ def _execute(state: State, insn: Instruction) -> List[State]:
             destination=UREG_NAMES[dst],
             condition=cond,
             predicate_assumption=True,
+            simd_companion=(
+                {
+                    "source": UREG_NAMES[simd_companion_source],
+                    "destination": UREG_NAMES[cureg_dst],
+                }
+                if simd_companion_source is not None
+                else None
+            ),
         )
         if predicate is True:
             return _advance(executed, insn)
@@ -4692,20 +5060,24 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         )
         return _advance(executed, insn) + _advance(skipped, insn)
     if name == "2c":
+        # Unconditional (no cond field): a SIMD-active MODE1 duplicates
+        # this onto PEy's S register file too (PRM p.101, p.3-39).
         try:
-            compute = _compute(f, True, dict(state.uregs))
+            compute_x, compute_y = _compute_simd(state, f, True, dict(state.uregs))
         except ValueError as error:
             return [_stop(state, insn, str(error))]
-        if compute is None:
+        if compute_x is None:
             return [_stop(state, insn, "empty short compute")]
-        _apply_compute(state, insn, compute)
+        _apply_compute_simd(state, insn, compute_x, compute_y)
         return _advance(state, insn)
     if name in ("2a_short", "2b"):
         # Both are 32-bit unconditional full-compute forms with no
         # condition field (Type2b: PRM prefix 0xc0, decode_table.json
         # "prm figure (overrides PGR; firmware-confirmed)"): always execute.
+        # A SIMD-active MODE1 duplicates this onto PEy too (PRM p.101).
         try:
-            compute = _compute(
+            compute_x, compute_y = _compute_simd(
+                state,
                 f,
                 False,
                 dict(state.uregs),
@@ -4714,9 +5086,9 @@ def _execute(state: State, insn: Instruction) -> List[State]:
             )
         except ValueError as error:
             return [_stop(state, insn, str(error))]
-        if compute is None:
+        if compute_x is None:
             return [_stop(state, insn, "empty full compute")]
-        _apply_compute(state, insn, compute)
+        _apply_compute_simd(state, insn, compute_x, compute_y)
         return _advance(state, insn)
     if name == "2a":
         # Type 2a conditionally executes a full compute.  Decode against the
@@ -4939,7 +5311,7 @@ def _execute(state: State, insn: Instruction) -> List[State]:
         ureg = _field(f, "ureg")
         cond = _field(f, "cond")
 
-        def access(executed: State) -> None:
+        def access(executed: State) -> Optional[str]:
             old = dict(executed.uregs)
             iv, mv = _ureg(old, 16 + index), _ureg(old, 32 + modifier)
             widths = {
@@ -4958,6 +5330,12 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                 if post_modify
                 else _add(iv, scaled_mv, f"I{index} + M{modifier} * {scale}")
             )
+            try:
+                companion = _simd_ureg_mem_companion(
+                    executed, ureg, address, access_width
+                )
+            except ValueError as error:
+                return str(error)
             if store:
                 value = _ureg(old, ureg)
                 _event(
@@ -4977,6 +5355,21 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                     condition=cond,
                     predicate_assumption=True,
                 )
+                if companion is not None and space == "DM":
+                    companion_value = _ureg(old, companion[0])
+                    _dm_write(executed, companion[1], width, companion_value)
+                    _event(
+                        executed,
+                        insn,
+                        "store-pey",
+                        space=space,
+                        ureg=UREG_NAMES[companion[0]],
+                        value=companion_value,
+                        address=companion[1],
+                        expression=_render(companion[1]),
+                        addressing_mode=addressing_mode,
+                        access_width=access_width,
+                    )
             else:
                 if access_width == "normal-word":
                     loaded: Optional[Const | dict[str, int]] = _load_normal_ureg(
@@ -5011,17 +5404,38 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                     condition=cond,
                     predicate_assumption=True,
                 )
+                if companion is not None and space == "DM" and access_width == "normal-word":
+                    companion_loaded = _load_normal_ureg(
+                        executed, space, companion[1], companion[0]
+                    )
+                    _event(
+                        executed,
+                        insn,
+                        "load-pey",
+                        space=space,
+                        ureg=UREG_NAMES[companion[0]],
+                        address=companion[1],
+                        expression=_render(companion[1]),
+                        concrete_value=companion_loaded,
+                        addressing_mode=addressing_mode,
+                        access_width=access_width,
+                    )
             if post_modify:
                 executed.uregs[16 + index] = _add(
                     iv, scaled_mv, "I%d + M%d * %d" % (index, modifier, scale)
                 )
+            return None
 
         predicate = _predicate(state, cond)
         if predicate is True:
-            access(state)
+            error = access(state)
+            if error:
+                return [_stop(state, insn, error)]
             return _advance(state, insn)
         executed, skipped = _copy(state), _copy(state)
-        access(executed)
+        error = access(executed)
+        if error:
+            return [_stop(executed, insn, error)]
         _event(
             skipped,
             insn,
@@ -5238,6 +5652,10 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                 )
             return _advance(state, insn)
         code = _field(f, "ureg")
+        try:
+            companion = _simd_ureg_mem_companion(state, code, address)
+        except ValueError as error:
+            return [_stop(state, insn, str(error))]
         if _field(f, "d"):
             value = _ureg(state.uregs, code)
             _event(
@@ -5254,6 +5672,19 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                 if space == "DM"
                 else False,
             )
+            if companion is not None and space == "DM":
+                companion_value = _ureg(state.uregs, companion[0])
+                _dm_write(state, companion[1], 4, companion_value)
+                _event(
+                    state,
+                    insn,
+                    "store-pey",
+                    space=space,
+                    ureg=UREG_NAMES[companion[0]],
+                    value=companion_value,
+                    address=companion[1],
+                    expression=_render(companion[1]),
+                )
         else:
             loaded = _load_normal_ureg(state, space, address, code)
             _event(
@@ -5267,6 +5698,20 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                 concrete_value=loaded,
                 simd_companion_possible=True,
             )
+            if companion is not None and space == "DM":
+                companion_loaded = _load_normal_ureg(
+                    state, space, companion[1], companion[0]
+                )
+                _event(
+                    state,
+                    insn,
+                    "load-pey",
+                    space=space,
+                    ureg=UREG_NAMES[companion[0]],
+                    address=companion[1],
+                    expression=_render(companion[1]),
+                    concrete_value=companion_loaded,
+                )
         return _advance(state, insn)
     if name in ("19a", "19a_scaled"):
         bank = 8 if _field(f, "g") else 0
@@ -5440,7 +5885,11 @@ def _execute(state: State, insn: Instruction) -> List[State]:
                 saved_i6=_json_value(previous_i6),
                 frame=_json_value(new_i6),
             )
-        cond = True if name.startswith("25a") else _predicate(state, _field(f, "cond"))
+        cond = (
+            True
+            if name.startswith("25a")
+            else _predicate_simd_branch(state, _field(f, "cond"))
+        )
         delayed = name.startswith("25a") or bool(_field(f, "j"))
         transfer = _transfer if delayed else _immediate_transfer
         return transfer(state, insn, target, call, cond)
