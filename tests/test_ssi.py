@@ -56,6 +56,22 @@ class FakeMachine:
         return True
 
 
+class FakePeer:
+    """Records rx()/tx() calls; rx() always returns `rx_data` verbatim."""
+
+    def __init__(self, rx_data=b""):
+        self.rx_data = rx_data
+        self.rx_calls = []  # [nbytes, ...]
+        self.tx_calls = []  # [bytes, ...]
+
+    def rx(self, nbytes):
+        self.rx_calls.append(nbytes)
+        return self.rx_data
+
+    def tx(self, data):
+        self.tx_calls.append(data)
+
+
 def put_tcd(machine, channel, *, source, dest, citer=64, link=0, csr=0):
     base = TCD_BASE + channel * 0x20
     raw = bytearray(0x20)
@@ -134,6 +150,42 @@ class Ssi0DmaTest(unittest.TestCase):
         self.assertEqual(machine.uc.mem_read(0x5000, 32), before)
         self.assertEqual(source._u32(RX_CHAN, DADDR), 0x5020)
         self.assertEqual(source._u16(RX_CHAN, CITER), 1)
+
+    def test_rx_peer_hook_supplies_destination_bytes(self):
+        machine, source = self.make_source()
+        machine.uc.mem_write(0x5000, bytes(32))  # untouched-by-default baseline
+        put_tcd(machine, RX_CHAN, source=RX_REGISTER, dest=0x5000, citer=2)
+        source.enabled.add(RX_CHAN)
+        provided = bytes(range(1, 33))
+        peer = FakePeer(rx_data=provided)
+        source.peer = peer
+
+        source._run_minor(RX_CHAN, capture_tx=False)
+
+        self.assertEqual(machine.uc.mem_read(0x5000, 32), provided)
+        self.assertEqual(peer.rx_calls, [32])
+
+    def test_tx_peer_hook_receives_captured_bytes(self):
+        machine, source = self.make_source()
+        payload = bytes(range(32))
+        machine.uc.mem_write(0x1000, payload)
+        put_tcd(machine, TX_CHAN, source=0x1000, dest=TX_REGISTER, citer=2)
+        source.enabled.add(TX_CHAN)
+        peer = FakePeer(rx_data=b"")
+        source.peer = peer
+
+        source._run_minor(TX_CHAN, capture_tx=True)
+
+        self.assertEqual(peer.tx_calls, [payload])
+
+    def test_peer_rx_length_mismatch_raises(self):
+        machine, source = self.make_source()
+        put_tcd(machine, RX_CHAN, source=RX_REGISTER, dest=0x5000, citer=2)
+        source.enabled.add(RX_CHAN)
+        source.peer = FakePeer(rx_data=b"\x00" * 4)  # short: expects 32
+
+        with self.assertRaisesRegex(ValueError, "expected 32"):
+            source._run_minor(RX_CHAN, capture_tx=False)
 
     def test_force_bit_is_delivered_only_at_safe_rte_hook(self):
         machine, source = self.make_source()

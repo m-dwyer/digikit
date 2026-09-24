@@ -10,7 +10,25 @@ The request rate must be supplied explicitly.  DT2 selects an external
 SSI_CLKIN, whose board frequency is not yet recovered; silently assuming an
 audio sample rate would turn an exploratory model into false qualification.
 RX destination bytes are preserved rather than inventing data from the
-external SSI peer.
+external SSI peer, unless an explicit `peer` supplies them (below).
+
+## SSI0 peer hook
+
+`Ssi0Dma(..., peer=None)` (default unchanged: RX untouched, TX bytes only
+tracked internally) accepts an object with:
+
+    peer.rx(nbytes: int) -> bytes   # exactly nbytes; this period's RX samples
+    peer.tx(data: bytes) -> None    # this period's captured TX samples
+
+called from `_run_minor` once per DMA period (one call = one minor-loop
+element-group, i.e. one `_run_minor` invocation, not one 32-bit element) --
+`rx()` before the RX channel's destination is written (its return value
+*is* what gets written), `tx()` after the TX channel's source bytes are
+captured. This is the audio-side half of the pairing described in
+`emu/dspi2.py`'s "Lockstep interface for a future SHARC stepper": a stepper
+implementing both `rx`/`tx` here and `exchange()` there is how a future
+SHARC model answers both the periodic control frame and the sample stream
+with one peer object.
 """
 
 # pyright: reportMissingImports=false, reportAttributeAccessIssue=false
@@ -59,12 +77,19 @@ def _signed(value, bits):
 class Ssi0Dma:
     """Exact-deadline SSI request source for the observed DT2 descriptors."""
 
-    def __init__(self, machine, request_hz, instr_per_sec, at=None, force_rte=None):
+    def __init__(self, machine, request_hz, instr_per_sec, at=None, force_rte=None,
+                 peer=None):
         if request_hz <= 0 or instr_per_sec <= 0:
             raise ValueError("SSI request and instruction rates must be positive")
         self.m = machine
         self.request_hz = int(request_hz)
         self.ips = int(instr_per_sec)
+        # Optional peer supplying RX samples / consuming TX samples once per
+        # DMA period (one `_run_minor` call); see the module docstring,
+        # "SSI0 peer hook". None (default): unchanged from before this
+        # parameter existed -- RX destination bytes are left untouched, and
+        # captured TX bytes are tracked in self.tx_bytes/tx_crc32 only.
+        self.peer = peer
         self.now = 0
         self.next = None
         self.enabled = set()
@@ -246,9 +271,25 @@ class Ssi0Dma:
         source_offset = _signed(self._u16(channel, SOFF), 16)
         dest_offset = _signed(self._u16(channel, DOFF), 16)
         captured = bytearray()
+        # `self.peer`, if given, supplies this period's RX samples and
+        # receives this period's TX samples -- see the module docstring,
+        # "SSI0 peer hook". `provided` is fetched once per `_run_minor` call
+        # (one DMA period), not per element, since the peer answers for the
+        # whole nbytes-sized chunk in one call.
+        provided = None
+        if self.peer is not None and not capture_tx:
+            provided = self.peer.rx(nbytes)
+            if len(provided) != nbytes:
+                raise ValueError(
+                    "Ssi0Dma peer.rx returned %d bytes, expected %d"
+                    % (len(provided), nbytes))
+        pos = 0
         for _ in range(nbytes // source_size):
             if capture_tx:
                 captured += self.m.uc.mem_read(source, source_size)
+            elif provided is not None:
+                self.m.uc.mem_write(dest, provided[pos:pos + dest_size])
+                pos += dest_size
             source = (source + source_offset) & 0xFFFFFFFF
             dest = (dest + dest_offset) & 0xFFFFFFFF
         self._w32(channel, SADDR, source)
@@ -258,6 +299,8 @@ class Ssi0Dma:
         if captured:
             self.tx_bytes += len(captured)
             self.tx_crc32 = zlib.crc32(captured, self.tx_crc32)
+            if self.peer is not None:
+                self.peer.tx(bytes(captured))
         if citer:
             return False
 
@@ -355,13 +398,14 @@ class Ssi0Dma:
         return False
 
 
-def install(machine, at, events, request_hz, instr_per_sec, force_rte):
+def install(machine, at, events, request_hz, instr_per_sec, force_rte, peer=None):
     source = Ssi0Dma(
         machine,
         request_hz=request_hz,
         instr_per_sec=instr_per_sec,
         at=at,
         force_rte=force_rte,
+        peer=peer,
     )
     events["ssi0_dma"] = source
     return source

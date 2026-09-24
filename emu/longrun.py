@@ -57,7 +57,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
           modeled_vectors=None,
           trace=None, trace_path=None, trace_ranges=(), trace_registers=None,
           deferred_components=(), idle_yield=20000, ssi0_request_hz=None,
-          ssi0_legacy_upgrade=False):
+          ssi0_legacy_upgrade=False, dspi2_peer=None):
     """Stand up a hooked Machine and restore `snapshot` onto it.
 
     -> (m, ev, st, pc, inq, at) where `at(addr, fn)` registers a further
@@ -217,6 +217,12 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
     the fresh SSI clock begins at that checkpoint boundary, and subsequent
     saves carry both a topology manifest entry and an independent component.
     It is never silently added to legacy snapshots.
+
+    ``dspi2_peer`` opts into `emu/dspi2.py`'s DSPI2/eDMA-28/29 SHARC link
+    model, stored at ``ev['dspi2']``. None (default): not installed, so the
+    driver's eDMA/DSPI2 writes are unmodeled exactly as before this
+    parameter existed. Pass an `emu.dspi2` peer (e.g. `ZeroPeer()` or
+    `RecordingPeer()`) to install it with that peer.
     """
     if trace is not None and trace_path is not None:
         raise ValueError('pass either trace or trace_path, not both')
@@ -411,6 +417,10 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
         from emu.dsp import install as install_dsp
         install_dsp(m, ev)
 
+    if dspi2_peer is not None:         # see emu/dspi2.py
+        from emu.dspi2 import install as install_dspi2
+        ev['dspi2'] = install_dspi2(m, peer=dspi2_peer)
+
     spins = {'n': 0}
     ev['idle_spins'] = spins
 
@@ -595,6 +605,25 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
     m._checkpoint_deferred_restore = deferred_restore
     pc = restore_into(m, snapshot, st, components=checkpoint_components,
                       manifest=checkpoint_manifest, deferred=deferred_restore)
+    if dspi2_peer is not None:
+        # restore_into() merges the snapshot's OWN saved `mmio` dict on top
+        # of whatever was set above (emu/snapshot.py: `m.mmio.update(blob
+        # ["mmio"])`), so a pre-restore force here is clobbered back to
+        # whatever an older snapshot recorded for 0xEC03802C (bit 31 only).
+        # Re-apply after restore instead. SR_LINK_IDLE is
+        # FUN_400cd2bc's (the periodic DSPI2/eDMA-28/29 frame driver) own
+        # status poll, `btst.b #$1c,d0` right after `move.l $ec03802c,d0`
+        # at its entry (0x400cd2ee on 1.16) -- found by disassembling the
+        # driver directly, then confirmed empirically: with only bit 31
+        # forced, a vector-191 pass through the real (unstubbed) driver
+        # produced zero eDMA/DSPI2 writes at all, every time, on every
+        # snapshot, because this bit read 0 and the driver took the `beq`
+        # early-return before ever touching a TCD. See emu/dspi2.py's
+        # module docstring, "The real mechanism: a polled status bit, not
+        # an interrupt". Bit 31 (the pre-existing SHARC-boot-upload status
+        # mock; see emu/dspboot.py) is preserved alongside it.
+        from emu.dspi2 import SR_LINK_IDLE
+        m.mmio[0xEC03802C] = m.mmio.get(0xEC03802C, 0) | SR_LINK_IDLE
     if ssi0 is not None:
         if ssi0_legacy_upgrade:
             assert ssi0_request_hz is not None
