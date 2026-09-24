@@ -779,6 +779,29 @@ def _multiply(left: Value, right: Value, expression: str) -> Value:
     return Unknown(expression + " (non-affine multiplication)")
 
 
+def _multiply_fractional(
+    left: Value, right: Value, signed_x: bool, signed_y: bool, expression: str
+) -> Value:
+    """RX * RY MOD1 in 1.31/0.32 fractional format (PRM "Fixed-Point
+    Formats", p.27-3/27-4): a 32-bit fractional operand's value is its raw
+    bit pattern scaled by 2**-31 (signed) or 2**-32 (unsigned), so the
+    64-bit product is scaled by 2**-62/2**-63/2**-64 depending on operand
+    signs. The register-file/MRF result keeps the top 32 bits of that
+    product (PRM Figure 3-2, p.3-10: "bits 63-0 for a fractional result").
+    When both inputs are signed, PRM p.3-9 documents an extra left shift by
+    one to remove the redundant sign bit before that truncation, which
+    folds into dividing by 2**31 instead of 2**32 below. Only the doubly
+    Const case is evaluated; anything else (Unknown, or a still-symbolic
+    Affine, which this shift does not distribute over) stays Unknown.
+    """
+    if not (isinstance(left, Const) and isinstance(right, Const)):
+        return Unknown(expression)
+    x = _signed32(left.value) if signed_x else left.value
+    y = _signed32(right.value) if signed_y else right.value
+    shift = 31 if (signed_x and signed_y) else 32
+    return Const((x * y) >> shift)
+
+
 def _aconv_symbol(value: Affine, direction: str, source_code: int, pc_sw: int) -> Affine:
     """Return an opaque, stable symbolic result for map-dependent ACONV.
 
@@ -2136,6 +2159,71 @@ def _compute(
             bits, _overflowed = _float32_bits(a * b)
             value = Const(bits)
         return rn, value, "float-multiply", _astatx_mult_forget
+    # PRM Table 17-7 (p.17-7), "(RN|mrf|mrb) = RX*RY MOD1" row, MOD1 UUI
+    # sub-option (PRM p.17-9): same row as opcode 0x70 (SSI) above with
+    # RX/RY unsigned instead of signed. The low 32 bits of a 32x32 product
+    # do not depend on operand signedness (two's-complement wraparound is
+    # identical either way), so this shares 0x70's raw-multiply semantics.
+    if cu == 1 and opcode == 0x40:
+        value = _multiply(left, right, "R%d * R%d" % (rx, ry))
+        return rn, value, "multiply", _astatx_mult_fixed
+    # Same row, MOD1 UUF sub-option (fractional, unsigned*unsigned, no
+    # round): PRM p.3-9/27-3 -- the register result is the top 32 bits of
+    # the 64-bit unsigned product (no redundant-sign shift; that only
+    # applies when both inputs are signed).
+    if cu == 1 and opcode == 0x48:
+        value = _multiply_fractional(
+            left, right, False, False, "R%d * R%d" % (rx, ry)
+        )
+        return rn, value, "multiply", _astatx_mult_fixed
+    # PRM Table 17-7, "mrf = RX*RY MOD1" row (no accumulate), MOD1 SSI
+    # sub-option: the plain-load twin of opcode 0xB4's accumulate above,
+    # same raw-multiply-into-MRF data dependency.
+    if cu == 1 and opcode == 0x74:
+        value = _multiply(left, right, "R%d * R%d" % (rx, ry))
+        return "MRF", value, "multiply-mrf", _astatx_mult_fixed
+    # Same row, MOD1 SSF sub-option (fractional, signed*signed, no round):
+    # PRM p.3-9 -- both inputs signed, so the redundant-sign left shift
+    # applies (folded into _multiply_fractional's >>31).
+    if cu == 1 and opcode == 0x7C:
+        value = _multiply_fractional(
+            left, right, True, True, "R%d * R%d" % (rx, ry)
+        )
+        return "MRF", value, "multiply-mrf", _astatx_mult_fixed
+    # PRM Table 17-7, "mrf = mrf + RX*RY MOD1" row, MOD1 SSF sub-option:
+    # the fractional twin of opcode 0xB4 (SSI, integer) above.
+    if cu == 1 and opcode == 0xBC:
+        accumulator = (special or {}).get("MRF", Unknown("uninitialized MRF"))
+        product = _multiply_fractional(
+            left, right, True, True, "R%d * R%d" % (rx, ry)
+        )
+        value = _add(accumulator, product, "MRF + R%d * R%d (SSF)" % (rx, ry))
+        return "MRF", value, "multiply-accumulate", _astatx_mult_fixed
+    # PRM Table 17-7, "RN = sat mrf MOD2" row, MOD2 SF sub-option: same row
+    # opcode 0x00 above handles as UI. PRM p.3-11/Table 3-5 defines
+    # saturation against the fractional maximum, which needs the unmodeled
+    # 80-bit MRF value, so this stays Unknown for the same reason 0x00
+    # does; only the ASTATX rule differs (MU is fixed 0 on this row, not
+    # merely unknown -- PRM Table 3-7, p.3-12).
+    if cu == 1 and opcode == 0x09:
+        return (
+            rn,
+            Unknown("saturated MRF (unmodeled MOD2, SF)"),
+            "saturate-mrf",
+            _astatx_mult_sat,
+        )
+    # Undocumented in both public sources: PRM Table 17-7 and PGR Table
+    # 12-5 both list only mrf/mrb=0 (0001 0100/0110) and rnd MOD3
+    # (0001 100x-111x) under the "0001 xxxx" opcode prefix -- neither has a
+    # 0001 0000 row. Decode it (so the walk does not desync) and leave the
+    # result and flags Unknown, same as the shifter's undocumented 0xB0 gap
+    # below.
+    if cu == 1 and opcode == 0x10:
+        label = "multiply opcode 0x10 R%d, R%d (undocumented; no public source)" % (
+            rx,
+            ry,
+        )
+        return rn, Unknown(label), "multiply-undocumented-10", _astatx_mult_forget
     # Shifter opcode 1011 0000: absent from both public sources' shifter
     # tables (PRM Table 17-9, p.17-10/17-11, and PGR Table 12-11, p.580-581,
     # transcribed in full -- neither lists any 0xA0-0xBF row). Seen at
@@ -2478,6 +2566,29 @@ def _astatx_mult_forget(astatx: Value) -> Value:
 def _astatx_mult_clear(astatx: Value) -> Value:
     """mr-data-move: PRM p.493 documents MU/MN/MI/MV all cleared."""
     return _astatx_define(astatx, MULT_FLAGS_MASK, 0)
+
+
+def _astatx_mult_fixed(astatx: Value) -> Value:
+    """Fixed-point multiply/multiply-mrf/multiply-accumulate rows of PRM
+    Table 3-7 (p.3-12): MN/MV/MU are data-dependent on the unmodeled
+    multiplier result format, so they stay unknown like
+    ``_astatx_mult_forget``; MI is documented 0 on every fixed-point row
+    there (it only ever applies to the floating-point row), so it is
+    defined rather than forgotten.
+    """
+    return _astatx_apply_bits(
+        astatx, {MN_BIT: None, MV_BIT: None, MU_BIT: None, MI_BIT: False}
+    )
+
+
+def _astatx_mult_sat(astatx: Value) -> Value:
+    """sat mrf/mrb MOD2 row of PRM Table 3-7 (p.3-12): MN/MV are
+    data-dependent and unmodeled, but that row documents MU and MI as fixed
+    0 (unlike the plain multiply/accumulate rows, where only MI is fixed).
+    """
+    return _astatx_apply_bits(
+        astatx, {MN_BIT: None, MV_BIT: None, MU_BIT: False, MI_BIT: False}
+    )
 
 
 def _astatx_bit_field(position: Value | int, result: Value) -> "Callable[[Value], Value]":
