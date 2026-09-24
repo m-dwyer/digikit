@@ -325,19 +325,19 @@ def _predicate_simd_branch(state: State, cond: int) -> bool | None:
     """A branch/call/return's predicate (SHARC+ PRM p.4-54, Table 4-22:
     "Executes in sequencer depending on AND'ing condition test on both
     PEs"). SISD mode uses PEx's own condition only; SIMD mode ANDs PEx's
-    and PEy's. An unresolved MODE1.PEYEN leaves the choice between those
-    two rules unresolved too, except for the unconditional ("always")
-    branch, which needs neither PE's status."""
+    and PEy's. With MODE1.PEYEN unresolved the predicate is still resolved
+    whenever both rules give the same answer: a false PEx condition is false
+    in both, and so is agreement between PEx and PEy."""
     if cond == 0x1F:
         return True
-    simd = _simd_active(state)
-    if simd is None:
-        return None
     pex = _predicate_pe(state, cond, "x")
-    if not simd:
+    simd = _simd_active(state)
+    if simd is False or pex is False:
         return pex
-    pey = _predicate_pe(state, cond, "y")
-    return _predicate_and(pex, pey)
+    both = _predicate_and(pex, _predicate_pe(state, cond, "y"))
+    if simd:
+        return both
+    return pex if both == pex else None
 
 
 def _check_return_target(state: State) -> str | None:

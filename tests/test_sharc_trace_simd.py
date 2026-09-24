@@ -458,17 +458,25 @@ class SimdBranchPredicateTest(TraceHelpers):
         )
         self.assertTrue(T._predicate_simd_branch(state, 0x00))
 
-    def test_predicate_simd_branch_unresolved_mode1_is_unresolved(self):
-        state = T.State(
-            0,
-            {
-                T.UREG_CODES["ASTATX"]: T.Const(1 << T.AZ_BIT),
-                T.UREG_CODES["ASTATY"]: T.Const(1 << T.AZ_BIT),
-            },
+    def test_predicate_simd_branch_unresolved_mode1_resolves_when_modes_agree(self):
+        # MODE1 unknown: SISD gives PEx, SIMD gives PEx AND PEy (EQ = cond 0x00).
+        equal, unequal = T.Const(1 << T.AZ_BIT), T.Const(0)
+        cases = (
+            (equal, equal, True),  # both modes take the branch
+            (unequal, equal, False),  # PEx false: false in both modes
+            (unequal, T.Unknown("PEy"), False),
+            (equal, unequal, None),  # SISD takes it, SIMD does not
+            (equal, T.Unknown("PEy"), None),
         )
-        self.assertIsNone(T._predicate_simd_branch(state, 0x00))
-        # The "always" condition never depends on PE state.
-        self.assertTrue(T._predicate_simd_branch(state, 0x1F))
+        for astatx, astaty, expected in cases:
+            state = T.State(
+                0,
+                {T.UREG_CODES["ASTATX"]: astatx, T.UREG_CODES["ASTATY"]: astaty},
+            )
+            with self.subTest(astatx=astatx, astaty=astaty):
+                self.assertIs(T._predicate_simd_branch(state, 0x00), expected)
+                # The "always" condition never depends on PE state.
+                self.assertTrue(T._predicate_simd_branch(state, 0x1F))
 
     def test_9b_abs_branch_is_not_taken_when_pey_disagrees(self):
         fields = {
