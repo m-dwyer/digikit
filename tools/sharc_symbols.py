@@ -243,6 +243,7 @@ class EnclosingFunction:
 #   cmd_handler_{0,1,2,3}={0x1c7524,0x1c75d8,0x1c763c,0x1c7671}
 #   command_table=0x25f7b0 ring_a=0x261cc8 ring_b=0x261ec8 ring_d=0x263138
 #   ring_flag=0x25f780 command_word=0x264220 command_word_shift_src=0x261ca4
+#   command_record_table=0x266220
 #   render_frame=0x1c2b24 unpack_track=0x1c24e9 slot_dispatch=0x1c642a
 #   master_mix=0x1c207b voice_render=0x1c4ecf voice_render_tail=0x1c4f81
 #   init=0x1c15e3 voice_alloc_scan=0x1c149b voice_record_init_a=0x1c7442
@@ -293,6 +294,12 @@ SYMBOLS: list[tuple[str, _Rule, frozenset[str]]] = [
     # to fold into it (docs/findings/06 "0x1c7578..0x1c7586").
     ('command_word', LiteralAt('command_dispatch_fn', 0x9, form='17a'), REQUIRED_COMMON),
     ('command_word_shift_src', LiteralAt('command_dispatch_fn', 0x6, form='14a'), REQUIRED_COMMON),
+    # command_dispatch_fn's OTHER by-reference output (docs/findings/06
+    # "Frame call path": R1 = DM(I6-2), the record render_frame's own M9
+    # points at) -- the same shift folded into command_word, added to a
+    # DIFFERENT base (lane F2, 2026-09-26). See sharc_harness.py's
+    # companding_record_address().
+    ('command_record_table', LiteralAt('command_dispatch_fn', 0x1D, form='17a'), REQUIRED_COMMON),
 
     # ---- DT2 (Digitakt) sample-playback voice engine. DN2 is FM (finding
     # 11): its analogous functions were found by call-graph inspection, not

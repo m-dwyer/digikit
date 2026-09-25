@@ -230,6 +230,30 @@ class FirmwareBackedTest(unittest.TestCase):
         self.assertEqual(read8(h.FIELD_ZERO_CROSS_MUTE), 0)
         self.assertEqual(read8(h.FIELD_RESEED), 0)
 
+    def test_companding_record_address_matches_shift_zero(self):
+        # Lane F2 (2026-09-26): command_dispatch_fn's own raw bytes compute
+        # command_record_table + (command_word_shift_src << 12); with
+        # setup_frame()'s own default (shift left at 0), that is simply
+        # command_record_table itself (0x266220 on DT2 1.16).
+        runner = h.new_runner(self.memory, "dt2-1.16")
+        h.setup_frame(runner.state, "dt2-1.16", command=3, ring_flag=0)
+        self.assertEqual(
+            h.companding_record_address(runner.state, "dt2-1.16"), 0x266220
+        )
+
+    def test_companding_record_fields_are_zero_from_run_init(self):
+        # docs/findings/06's Lane E2: DM(0x254d78) (this record's own word
+        # +2) reads back as a null pointer after run_init() -- this table
+        # (companding_record_fields()'s own COMPANDING_RECORD_TARGETS) is
+        # this lane's own trace of exactly why: the whole record is
+        # unwritten (explicit_memory_model), not just that one field.
+        init = h.run_init(self.memory, "dt2-1.16")
+        self.assertTrue(init.ran, init.error)
+        self.assertEqual(
+            h.companding_record_fields(init.runner.state, "dt2-1.16"),
+            [0, 0, 0, 0],
+        )
+
     def test_setup_voice_reverse_seeds_phase_to_end_minus_one_sample(self):
         # Finding 06's "Flags and seed": "if set, it clears it and sets the
         # phase to end - 1.0 sample ... when +0x1bb is set, else to start."

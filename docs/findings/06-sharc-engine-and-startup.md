@@ -4242,3 +4242,176 @@ trace instead, the same pc-hit-breakpoint technique this lane used
 elsewhere); (3) trace `FUN_1c2ac9`'s own reachability and its two
 `0x252730`/`0x252908` targets, in case they are relevant to a *different*
 kind of "armed" state this lane did not check.
+
+## Lane F2: both `FRAME_PATCH_TABLE` forks are `tools/sharc_core` gaps, not missing frame data; the companding record's real address is found, and it is unwritten everywhere this project has run **[C][V][O]**
+
+Branch `work/sharc-emulator` @ `a5ec878`. Answers this lane's own task 1
+("do lane E1's two `FRAME_PATCH_TABLE` hypotheses still need patching with a
+real RX frame?") and task 2 ("trace how the companding record `DM(0x254d78)`
+etc. is filled").
+
+### Task 1: real frame data does not remove either fork -- both are precisely-identified `sharc_core` gaps **[V]**
+
+Re-running `render_frames_to_ring_a()`'s own single-frame call
+(`call_frame()`) from `out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap`
+frame 20 (track 2, master-bus table UNMASKED so the real per-track gain
+table this fork's own read depends on is genuinely nonzero -- lane E1's own
+finding that this real range trips a *different* gap, `compute.py`'s
+`cu=3 opcode=0xe0`, on the SECOND such call, so this is a single-frame
+check only), WITHOUT the `0x1C2FEC` entry: the run reaches the identical
+`0xb88e4b` fork at the identical instruction count (18059) it hit under the
+original all-empty synthetic frame. WITHOUT `0x1C4965`: identical, at
+`0x1c4969`, 19585 instructions. Real, nonzero frame data changes nothing at
+either fork.
+
+A live register read at each fork's own upstream write (`Runner.state.uregs`
+at a pc-hit breakpoint, not `img.print_slice()`'s own separate static
+slice, which reports a looser "unresolved" for anything it can't follow
+past a call boundary) pins down why, precisely:
+
+- **`0xb88e4b` (`0x1C2FEC`).** `R8` (the divisor `FUN_b88e04`, a shared
+  recips-based fixed-point divide helper the voice record contract's own
+  Step formula also uses, receives) is a genuine, concrete `Const(0)`: one
+  of the other 15 tracks this real capture's kit does not assign a machine
+  to legitimately has zero gain there, same as the all-empty synthetic
+  frame. `recips(0.0)` is well-defined (PRM p.19-16: a `+-zero` input
+  returns `+-infinity`), but the helper's own Newton-Raphson refinement
+  turns that infinity into a NaN (`infinity * 0.0` inside one of its own
+  iterations), and `tools/sharc_core/compute_alu.py`'s `fix()` handler has
+  no modeled saturation rule for a NaN/infinity input --
+  `Unknown(reason='fix F0 (unsaturated NAN/infinity fix)')`. Real hardware
+  has a documented saturated result for this case (PRM's own
+  IEEE-754-compatibility rules); `tools/sharc_core` does not implement it.
+  Every genuinely-silent track hits this identical case on real hardware
+  too, so this is not a data-completeness gap this lane could close by
+  tracing further.
+- **`0x1c4969` (`0x1C4965`).** `F4`/`F6` are Unknown, tracing (through
+  `F15=fsub(F15,F7)`, `F2=F10*F15`, `F4=fmax(F2,F13)`) to
+  `Unknown(reason='bitext: undefined (bitlen 95 > 32)')` -- a
+  `tools/sharc_core` BITEXT decode that refuses a field wider than 32 bits.
+  Hit inside `FUN_1c4afe` (one of the four Step/Positions setters,
+  confirmed by the fork's own live call stack to run from `FUN_1c642a`'s
+  own per-voice "Trigger" dispatch, `0x1c6553`, on **every frame**, not
+  only a real note-trigger -- `FUN_1c75d8 -> FUN_1c2b24 -> FUN_1c642a ->
+  FUN_1c4afe -> FUN_1c4914`), deriving a note/tune-interpolated value from
+  an UNDOCUMENTED voice-record field pair, `DM(I4+0x62)`/`DM(I4+0x63)` --
+  not in "The voice record contract" table above, an `[O]` gap this lane
+  is recording but not resolving -- through a ~150-instruction pitch-table
+  routine (`fext`, mantissa/logb-style float ops, a `0x8055c840` jump
+  table) this lane read but did not fully reverse: doing so would mean
+  hand-replicating that routine's arithmetic as a harness patch, the same
+  kind of unverified guess this repo's CLAUDE.md rules out for a
+  `sharc_core` fix (a PRM page, a test, or a widthaudit 0-mismatch proof).
+
+**Net: both `FRAME_PATCH_TABLE` entries stay** (`tools/sharc_harness.py`'s
+own comments there are updated with this section's findings). This lane's
+own task ("remove both, and match `output = freq * pitch_step`") is not
+achievable without either fixing one of these two `tools/sharc_core` gaps
+(FIX-of-non-finite saturation; BITEXT wider than 32 bits) -- out of this
+lane's scope, per this repo's CLAUDE.md and this lane's own brief ("don't
+edit `sharc_core` ... stop at it and report") -- or a fully independent
+reimplementation of `FUN_1c4afe`'s own note/tune-to-step arithmetic, judged
+disproportionate to attempt inline here. Lane E1's frame-path pitch bug
+(`FIELD_PHASE` advancing a fixed ~40.43 samples/frame regardless of
+`pitch_step`) is therefore unresolved: this lane's own deliverable render
+(`render_frames_to_ring_a()`, 384 real frames, track 2, same configuration
+as lane E1's own milestone) still measures its tone at
+**631.7191123962402 Hz** for a 1000 Hz request (`power_ratio` 1.00004 at
+that frequency, near-zero at 1000 Hz itself) -- unchanged from lane E1's
+own figure, confirming this lane made no accidental regression or
+improvement to the render path itself.
+
+### Task 2: the companding record's real address, and confirmation it is unwritten everywhere reachable **[V][O]**
+
+Traced `command_dispatch_fn`'s (`0x1c778a`) own raw bytes end to end
+(`tools/sharc.py`'s `img.sql` over `insn`, not just `print_slice()`, since
+the earlier "M9 = DM(I6-18) [unresolved: I6]" trace in this file's own
+"Lane E2" section above stops at exactly this call boundary). It writes
+its TWO by-reference outputs identically in shape:
+
+- `DM(I6-3) = command_word + (DM(command_word_shift_src) << 12)` -- this
+  is simply the address block_handler itself reads its OWN pending command
+  from (docs/findings/06's own "Task loop" section, `0x264220 +
+  (DM(0x261ca4) << 12)`); `render_frame`'s own `R12` argument, previously
+  called a "ring C pointer", is literally the address of the command word,
+  not a separate ring.
+- `DM(I6-2) = command_record_table + (DM(command_word_shift_src) << 12)`
+  -- a DIFFERENT, previously-unnamed base, confirmed at `0x266220` on DT2
+  1.16 (new `sharc_symbols.SYMBOLS` entry `command_record_table`,
+  `LiteralAt('command_dispatch_fn', 0x1d, form='17a')`, resolved the same
+  way `command_word` is). This is `render_frame`'s own `R1` argument, the
+  companding record's own base (`M9` in this file's own "Lane E2" trace).
+
+With this harness's own `setup_frame()` (`command_word_shift_src` always
+left at 0), the record address is simply `command_record_table` itself --
+confirmed by execution (a pc-hit breakpoint at `0x1c2c51`, `I1 = M9`, reads
+back `I1 == 0x266220` exactly). New, reusable functions:
+`sharc_harness.companding_record_address()`/`companding_record_fields()`.
+
+**Not the SPI-slave control block at `0x261a10` (lane D2), and not a
+ring**: `0x266220` sits well past the live ring A/B/C/D DMA cluster
+(`0x261cc8`-`0x263938`, lane D2's own note) and past `command_word` itself
+(`0x264220`) by a fixed `0x2000`-byte gap, consistent with `command_word`
+and `command_record_table` being two SEPARATE `0x1000`-byte-per-shift
+regions, not sub-fields of one structure.
+
+**The table is empty, and no writer of it was found anywhere reached from
+`run_init()` or a real capture-driven frame call.** `img.writers()` over
+`[0x266220, 0x266260)` returns only `base_only` (unresolved-offset) hits
+from `FUN_1c80f2`'s own, UNRELATED master-mix ramp/crossfade loop (entry
+`0x1c80f2`, called from `render_frame`'s own post-master-mix cleanup per
+this file's "Master stage" section; a `DO`-loop whose trip count is a
+runtime register the static tool can't bound, so it conservatively reports
+every address in the whole image as a possible target of that ONE loop --
+read directly to confirm this, not a real writer of the companding
+record). This corrects/pins down this file's own "Lane E2" section's "no
+writer of a non-null value ... found" conclusion with the record's exact,
+now-named address, rather than the unresolved `M9`/`DM(I6-18)` chain that
+section's own trace stopped at.
+
+`command_word_shift_src` itself (the table's own selector,
+`DM(0x261ca4)`) has exactly one static writer, `FUN_1c77b4` (sw
+`0x1c77b4`-`0x1c77c8`, `has_static_caller: 0` in `tools/sharc.py`'s own
+`img.func()` -- confirming this file's own D2 section's "no static caller"
+note independently), gated by a runtime condition (`JUMP IF NOT SZ` on
+`DM(I6,M7)`) this harness's own `setup_frame()` never drives -- so even the
+SHIFT selecting which per-ring instance of this table is read is not
+something a synthetic frame call exercises realistically, on top of the
+table itself being empty.
+
+**Net: neither confirmed nor ruled out within this lane's own scope.** The
+record is very likely populated the same way the RX frame itself is (this
+file's own "The ColdFire frame is mapped into SHARC DM at `0x2558dc`"
+section) -- written directly by a DMA transfer this project's SHARC-side
+tracing cannot see (no SHARC store instruction needs to exist for a
+host-mapped region) -- or by a SHARC "session start"/note-on preparation
+routine this project has never executed (not part of `FUN_1c15e3`, and not
+reached by any capture this lane or lane E2 replayed). Per this lane's own
+task brief, not fabricated: `companding_record_address()`/
+`companding_record_fields()` are this lane's own reusable, exact form of
+the finding for whichever future lane finds (or allocates) the real
+writer -- poking the same four fields these read would be the concrete
+next step to check whether `FUN_1c60a2` then runs and a voice record gets
+armed.
+
+**Answers to this lane's own two closing questions, unchanged from lane
+E2's own conclusions, now on firmer (address-precise) footing:**
+`FUN_1c60a2` does not run (this lane did not re-run lane E2's own
+pc-hit-breakpoint check, since nothing found here changes its own
+premise -- the record feeding the gate is confirmed empty by a different,
+independent method); no voice is armed by firmware from a real frame.
+
+## Owned-file changes (lane F2)
+
+- `tools/sharc_symbols.py`: new `command_record_table` symbol
+  (`LiteralAt('command_dispatch_fn', 0x1d, form='17a')`), resolves to
+  `0x266220` on DT2 1.16.
+- `tools/sharc_harness.py`: `FRAME_PATCH_TABLE`'s own comments corrected
+  per this section's task-1 findings; new `companding_record_address()`/
+  `companding_record_fields()` plus `COMPANDING_RECORD_FIELD_OFFSETS`/
+  `COMPANDING_RECORD_TARGETS`. No `render_frames_to_ring_a()` behaviour
+  change (confirmed: `RealFrameRingAMilestoneTest`'s own pinned hash is
+  unchanged).
+- `tests/test_sharc_harness.py`: two new tests for the companding-record
+  helpers.
+- No `tools/sharc_replay.py` or `sharc_core` changes.
