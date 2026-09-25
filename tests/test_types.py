@@ -17,6 +17,7 @@ TYPED = [
     "tools/sharc.py",
     "tools/sharc_core",
     "tools/sharc_disasm.py",
+    "tools/sharc_framemap.py",
     "tools/sharc_harness.py",
     "tools/sharc_inputs.py",
     "tools/sharc_proc.py",

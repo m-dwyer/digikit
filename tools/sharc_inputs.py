@@ -19,7 +19,20 @@ Static labels, checked in this order (the first that applies wins):
                       finding's "[C][V] Core code writes rings A and C and
                       only reads rings B and D"); a read landing on A/C
                       here is still labelled from this same table rather
-                      than falling through to "no writer found".
+                      than falling through to "no writer found". The same
+                      bucket also covers the ColdFire's 0x802-byte DSPI2 TX
+                      frame itself, mapped into SHARC DM at 0x2558dc
+                      (docs/findings/06, "The ColdFire frame is mapped into
+                      SHARC DM at 0x2558dc" -- FRAME_REGION below): no SHARC
+                      code writes this range, so every address in it that a
+                      root reads but never writes is a ColdFire input, not
+                      an unresolved internal one. 52 of the 142 addresses
+                      this labeller used to report as `no_writer` for root
+                      0x1c2b24 land in this range, including the per-track
+                      gain/mixer mirror 0x255fb6-0x2560d0 FRAME_PATCH_TABLE
+                      (tools/sharc_harness.py) already had to hand-patch
+                      around (0x2560b8, "a per-track mixer/gain parameter
+                      mirror this lane's synthetic frame never populated").
     (c) sharc_root -- some OTHER SHARC+ function (outside ROOT's own reach
                       set) writes it: tools/sharc_contract.py's own
                       classify_external_writers(), named by function and
@@ -94,14 +107,55 @@ RING_BUFFERS: tuple[tuple[str, int, int], ...] = (
     ("ring D buf1", 0x263938, 0x263938 + 0x800),
 )
 
+# docs/findings/06-sharc-engine-and-startup.md, "The ColdFire frame is
+# mapped into SHARC DM at 0x2558dc": the ColdFire's own 0x802-byte DSPI2 TX
+# frame (docs/findings/04's per-track TX frame map), laid out at SHARC DM
+# addresses `0x2558dc + <ColdFire TX byte offset>` -- eleven independent
+# per-track scalar literals (FUN_1c24e9/FUN_001c2b24) match this base
+# exactly, and tools/sharc_framemap.py's own frame-poke run (this lane, see
+# its --json output) exercises reads inside it during a real render_frame
+# call. This is the whole frame, not just the fields a static literal scan
+# already resolved: no SHARC code is known to write into this range, so
+# every address inside it is a ColdFire input, the same way a RING_BUFFERS
+# half is.
+FRAME_FINDING = (
+    'docs/findings/06 ("The ColdFire frame is mapped into SHARC DM at 0x2558dc")'
+)
+FRAME_REGION: tuple[str, int, int] = ("coldfire TX frame", 0x2558DC, 0x2558DC + 0x802)
+
 _LABEL_ORDER = {"init": 0, "coldfire": 1, "sharc_root": 2, "no_writer": 3}
 
 
 def ring_label(addr: int) -> str | None:
-    """The RING_BUFFERS half-buffer name covering ADDR, or None."""
+    """The RING_BUFFERS half-buffer name covering ADDR, or None. Does not
+    cover FRAME_REGION -- see frame_label() for that -- so this keeps its
+    original, narrower meaning for any other caller/test."""
     for name, lo, hi in RING_BUFFERS:
         if lo <= addr < hi:
             return name
+    return None
+
+
+def frame_label(addr: int) -> str | None:
+    """'coldfire TX frame +0xNN'-style text for ADDR if it falls inside
+    FRAME_REGION (the ColdFire's own 0x802-byte DSPI2 TX frame, mapped into
+    SHARC DM at 0x2558dc), or None."""
+    name, lo, hi = FRAME_REGION
+    if lo <= addr < hi:
+        return "%s +0x%x" % (name, addr - lo)
+    return None
+
+
+def coldfire_region(addr: int) -> tuple[str, str] | None:
+    """(name, finding) for whichever of RING_BUFFERS/FRAME_REGION covers
+    ADDR, or None -- the single lookup classify_address() uses for label
+    (b)."""
+    ring = ring_label(addr)
+    if ring is not None:
+        return ring, RING_FINDING
+    frame = frame_label(addr)
+    if frame is not None:
+        return frame, FRAME_FINDING
     return None
 
 
@@ -179,9 +233,10 @@ def classify_address(
                 extra={"nonzero": bool(value)},
             )
 
-    ring = ring_label(addr)
-    if ring is not None:
-        return InputLabel(addr, "coldfire", "%s (%s)" % (ring, RING_FINDING))
+    coldfire = coldfire_region(addr)
+    if coldfire is not None:
+        name, finding = coldfire
+        return InputLabel(addr, "coldfire", "%s (%s)" % (name, finding))
 
     writers = C.classify_external_writers(img, root_index, addr, addr + 4, reach_set)
     if writers:

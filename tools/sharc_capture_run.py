@@ -4,7 +4,7 @@ tools/sharc_replay.py.
 
     uv run python tools/sharc_capture_run.py SNAPSHOT --out CAPTURE.dt2cap \
         --kind idle|note --instrs N [--syx SYX] [--ssi0-hz N] [--trig-at N]
-        [--force-period N] [--unblock]
+        [--force-period N] [--unblock] [--poke-track-type TRACK:TYPE ...]
 
 Two things a run needs, both handled here:
 
@@ -72,6 +72,33 @@ in that chain is the panel's own "Track 1" (1-indexed on the hardware,
 0-indexed internally) -- this is the "note triggered on track 1" this tool
 captures. No UI/framebuffer read is needed: the whole chain is inferred
 from the resulting TX frame bytes this tool already captures.
+
+**Changing a track's machine, without re-running the real UI navigation.**
+The same finding's own causal-control run (`out/experiments/a2-queue-
+trigger/report.json`) already established, end to end and byte-checked,
+that "machine change on track 0, then TRIG 1" is what actually flips the TX
+frame's machine-type word (`0x94 + 2*track`) from `0x0000` to a real type --
+"TRIG 1 without a machine change" or "machine change without TRIG 1" alone
+do not. But reaching that "machine menu commit" state through the real panel
+(`MACHINE SEL` chord, encoder turns, `YES`) took that prior run 46-160M
+ColdFire instructions of UI navigation just to get there, before the part
+this tool cares about (the DSPI2 frame) ever happens -- far more than this
+capture tool's own budget. `--poke-track-type TRACK:TYPE` instead seeds the
+*result* of that commit directly: the per-track machine-type mirror byte
+`0x80003cd0 + track*0x9a` (`tools/framelink.py`'s `track_9a`, corrected base
+per docs/findings/04) that `FUN_4002d438`/the vector-191 handler already
+reads on every real commit -- the same address and mechanism
+`tools/sharcframe.py` used for its own `[V]`-marked single-poke experiment
+("Measured, not only read", docs/findings/04). The vector-191 handler does
+not care why that byte changed; it copies it into the TX frame exactly the
+same way whether a real MACHINE SEL commit, a MIDI program change, or this
+poke set it. This is not synthesizing the frame -- the DSPI2 driver call is
+still the real one, hooked the same way as always -- it only stands in for
+the (already independently `[V]`-established, just prohibitively expensive
+to re-run here) UI front-end that would normally produce that same byte
+change. Combine with `--kind note` (`--trig-at`) for the full causal chain
+that report.json's own `machine_trig1` run used: a poked machine change,
+then a real panel TRIG 1.
 """
 
 from __future__ import annotations
@@ -102,9 +129,45 @@ from emu.sharc_capture import CaptureWriter, CapturingPeer  # noqa: E402
 TRIG_1_CHANNEL = 3
 TRIG_1_BIT = 0
 
+# tools/framelink.py TABLES's 'track_9a' entry (base corrected to 0x80003cd0
+# in docs/findings/04-coldfire-dsp-link.md, "Corrections to the SRAM
+# layout"): 16 rows of 0x9a bytes; byte 0 of each row is the track's machine
+# type, per "The machine type reaches the SHARC, at TX frame offset
+# 0x94 + 2i".
+TRACK_9A_BASE = 0x80003CD0
+TRACK_9A_STRIDE = 0x9A
+TRACK_TYPE_OFFSET = 0
+
 
 def _resolve_panel_profile(main_img: bytes):
     return symbols.resolve(main_img)
+
+
+def parse_track_type_poke(spec: str) -> tuple[int, int]:
+    """'TRACK:TYPE' -> (track, type), both plain ints (0x-prefixed or
+    decimal). Raises ValueError with SPEC in the message on a bad shape, so
+    argparse reports a useful error."""
+    if ":" not in spec:
+        raise ValueError("bad --poke-track-type %r (want TRACK:TYPE)" % spec)
+    track_s, type_s = spec.split(":", 1)
+    track, type_ = int(track_s, 0), int(type_s, 0)
+    if not 0 <= track < 16:
+        raise ValueError("bad --poke-track-type %r: track must be 0..15" % spec)
+    return track, type_
+
+
+def poke_track_type(m, track: int, type_: int) -> None:
+    """Set TRACK's machine-type mirror byte directly (see TRACK_9A_BASE's
+    own docstring) -- the same address/mechanism docs/findings/04's
+    tools/sharcframe.py experiment used, standing in for a real (but, per
+    this module's own docstring, prohibitively expensive to re-run here)
+    MACHINE SEL commit. Does not touch the frame itself: the next real
+    vector-191 firing reads this byte through FUN_4002d438/the handler's
+    own copy exactly as it would a firmware-driven change."""
+    m.uc.mem_write(
+        TRACK_9A_BASE + track * TRACK_9A_STRIDE + TRACK_TYPE_OFFSET,
+        bytes([type_ & 0xFF]),
+    )
 
 
 def run(
@@ -119,6 +182,7 @@ def run(
     force_period: int = 50_000,
     chunk: int = 200_000,
     unblock: bool = False,
+    poke_track_types: tuple[tuple[int, int], ...] = (),
 ) -> dict:
     if kind not in ("idle", "note"):
         raise ValueError("kind must be 'idle' or 'note', got %r" % (kind,))
@@ -154,6 +218,8 @@ def run(
 
     panel_profile = _resolve_panel_profile(main_img)
     m.uc.mem_write(prof["gate"], bytes(4))  # open the frame-build gate
+    for track, type_ in poke_track_types:
+        poke_track_type(m, track, type_)
 
     pits = Timers(Pits(m), Dtims(m, channels=(3,)))
     ssi0 = ev.get("ssi0_dma")
@@ -170,6 +236,7 @@ def run(
             "profile": prof["name"],
             "ssi0": ssi0_status,
             "ssi0_hz": ssi0_hz if ssi0 is not None else None,
+            "poke_track_types": ["%d:%d" % (t, y) for t, y in poke_track_types],
         },
     )
     peer = CapturingPeer(writer, counter=lambda: pits.now)
@@ -246,12 +313,24 @@ def parse_args(argv=None):
     p.add_argument("--force-period", type=lambda s: int(s, 0), default=50_000)
     p.add_argument("--chunk", type=lambda s: int(s, 0), default=200_000)
     p.add_argument("--unblock", action="store_true")
+    p.add_argument(
+        "--poke-track-type",
+        dest="poke_track_type",
+        action="append",
+        default=[],
+        metavar="TRACK:TYPE",
+        help="seed a track's machine-type mirror byte before capturing (see "
+        "poke_track_type()'s own docstring); repeatable",
+    )
     return p.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+    poke_track_types = tuple(
+        parse_track_type_poke(spec) for spec in args.poke_track_type
+    )
     result = run(
         args.snapshot,
         args.out,
@@ -263,6 +342,7 @@ def main(argv=None) -> int:
         force_period=args.force_period,
         chunk=args.chunk,
         unblock=args.unblock,
+        poke_track_types=poke_track_types,
     )
     print(
         "%s: %d frame(s), %d ssi0-rx, stop=%s, instructions=%d, ssi0=%s%s"

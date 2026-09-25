@@ -59,6 +59,52 @@ class RingLabelTest(unittest.TestCase):
         # Between ring A buf1's end and ring B buf0's start there is no gap
         # (0x261dc8 + 0x100 == 0x261ec8), but well past ring D there is.
         self.assertIsNone(si.ring_label(0x264138))
+        # The ColdFire TX frame region is not a ring: ring_label() keeps
+        # its original, narrower meaning (see frame_label()/
+        # coldfire_region() below).
+        self.assertIsNone(si.ring_label(0x2558DC))
+
+
+class FrameLabelTest(unittest.TestCase):
+    """docs/findings/06, "The ColdFire frame is mapped into SHARC DM at
+    0x2558dc": FRAME_REGION covers the whole 0x802-byte TX frame."""
+
+    def test_frame_start(self):
+        self.assertEqual(si.frame_label(0x2558DC), "coldfire TX frame +0x0")
+
+    def test_known_scalar_offsets_from_finding_04(self):
+        # docs/findings/04's per-track TX frame map, base 0x2558dc: machine
+        # type at 0x94, the two derived flags at 0x73c/0x75c.
+        self.assertEqual(si.frame_label(0x2558DC + 0x94), "coldfire TX frame +0x94")
+        self.assertEqual(si.frame_label(0x2558DC + 0x73C), "coldfire TX frame +0x73c")
+
+    def test_gain_table_is_inside_the_frame(self):
+        # tools/sharc_harness.FRAME_PATCH_TABLE's own hand-patched
+        # "per-track mixer/gain parameter mirror" at 0x2560b8.
+        self.assertIsNotNone(si.frame_label(0x2560B8))
+
+    def test_end_exclusive(self):
+        self.assertIsNotNone(si.frame_label(0x2558DC + 0x801))
+        self.assertIsNone(si.frame_label(0x2558DC + 0x802))
+
+    def test_outside_frame_is_none(self):
+        self.assertIsNone(si.frame_label(0x0))
+        self.assertIsNone(si.frame_label(0x2558DC - 1))
+
+
+class ColdfireRegionTest(unittest.TestCase):
+    def test_ring_takes_priority_and_cites_the_ring_finding(self):
+        name, finding = si.coldfire_region(0x261CC8)
+        self.assertEqual(name, "ring A buf0")
+        self.assertEqual(finding, si.RING_FINDING)
+
+    def test_frame_cites_the_frame_finding(self):
+        name, finding = si.coldfire_region(0x2558DC + 0x94)
+        self.assertEqual(name, "coldfire TX frame +0x94")
+        self.assertEqual(finding, si.FRAME_FINDING)
+
+    def test_outside_both_is_none(self):
+        self.assertIsNone(si.coldfire_region(0x0))
 
 
 class IsPlausibleTest(unittest.TestCase):
