@@ -17,6 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools"))
 import sharc_replay as replay_mod  # noqa: E402
+import sharc_run as sr  # noqa: E402
 
 DT2_116_BLOB = pathlib.Path("out/sections/dt2-1.16/section_7_BLOB.bin")
 IDLE_CAPTURE = pathlib.Path("out/captures/dt2-1.16-idle.dt2cap")
@@ -67,6 +68,75 @@ class MonoTest(unittest.TestCase):
         self.assertEqual(replay_mod._mono([]), [])
 
 
+class FrameCommandTest(unittest.TestCase):
+    """frame_command() reads the ColdFire's own header word (TX byte offset
+    0, docs/findings/04's "a header written at +0x00"), not a hardcoded
+    value -- every real capture on hand has this as 1 on its first frame
+    and 3 on every frame after (see the module docstring's point 4)."""
+
+    def _tx(self, header):
+        tx = bytearray(0x802)
+        tx[0] = (header >> 8) & 0xFF
+        tx[1] = header & 0xFF
+        return bytes(tx)
+
+    def test_reads_header_word(self):
+        self.assertEqual(replay_mod.frame_command(self._tx(1)), 1)
+        self.assertEqual(replay_mod.frame_command(self._tx(3)), 3)
+
+    def test_falls_back_to_render_on_implausibly_short_tx(self):
+        self.assertEqual(replay_mod.frame_command(b""), 3)
+
+
+class FirstNonzeroWriteTest(unittest.TestCase):
+    """_first_nonzero_write() scans an sr.Runner.watch_log-shaped sequence
+    for the first in-range write whose new value is nonzero, optionally
+    restricted to a strided per-record field offset (SLOT_TYPE_WATCH's own
+    convention)."""
+
+    def _event(self, address, new_value, access="write", pc_sw=0x1234):
+        return sr.WatchEvent(
+            pc_sw=pc_sw,
+            form=None,
+            access=access,
+            address=address,
+            width=4,
+            old_value=0,
+            new_value=new_value,
+        )
+
+    def test_finds_first_nonzero_write_in_range(self):
+        events = [
+            self._event(0x100, 0, pc_sw=0x1),
+            self._event(0x104, 0x2A, pc_sw=0x2),
+            self._event(0x108, 0x99, pc_sw=0x3),
+        ]
+        hit = replay_mod._first_nonzero_write(events, 0x100, 0x110)
+        self.assertEqual(hit, {"address": "0x104", "pc": "0x2", "value": "0x2a"})
+
+    def test_ignores_reads_and_out_of_range(self):
+        events = [
+            self._event(0x104, 0x2A, access="read"),
+            self._event(0x200, 0x2A),
+        ]
+        self.assertIsNone(replay_mod._first_nonzero_write(events, 0x100, 0x110))
+
+    def test_returns_none_when_all_zero(self):
+        events = [self._event(0x104, 0)]
+        self.assertIsNone(replay_mod._first_nonzero_write(events, 0x100, 0x110))
+
+    def test_strided_offset_restricts_to_matching_records(self):
+        # record 0 at 0x100, record 1 at 0x200, stride 0x100, field +0x10.
+        events = [
+            self._event(0x108, 0x5),  # record 0, wrong offset
+            self._event(0x210, 0x7, pc_sw=0x9),  # record 1, matching offset
+        ]
+        hit = replay_mod._first_nonzero_write(
+            events, 0x100, 0x300, stride=0x100, offset=0x10
+        )
+        self.assertEqual(hit, {"address": "0x210", "pc": "0x9", "value": "0x7"})
+
+
 class ParseArgsTest(unittest.TestCase):
     def test_defaults(self):
         args = replay_mod.parse_args(["dt2-1.16", "cap.dt2cap"])
@@ -76,10 +146,15 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(args.freq, 1000.0)
         self.assertEqual(args.sample_len, 4096)
         self.assertFalse(args.poke_candidates)
+        self.assertIsNone(args.force_command)
 
     def test_poke_candidates_flag(self):
         args = replay_mod.parse_args(["dt2-1.16", "cap.dt2cap", "--poke-candidates"])
         self.assertTrue(args.poke_candidates)
+
+    def test_force_command_flag(self):
+        args = replay_mod.parse_args(["dt2-1.16", "cap.dt2cap", "--force-command", "3"])
+        self.assertEqual(args.force_command, 3)
 
 
 @pytest.mark.slow
@@ -88,30 +163,47 @@ class ParseArgsTest(unittest.TestCase):
     IDLE_CAPTURE.exists(), "dt2-1.16-idle.dt2cap capture is not available"
 )
 class ReplayIdleCaptureTest(unittest.TestCase):
-    """Replays the first two frames of the idle capture through the real
-    block_handler call chain (tools/sharc_harness.call_frame_collect_all())
-    and pins today's own result as a milestone -- the same convention
+    """Replays the first three frames of the idle capture through the real
+    block_handler call chain (tools/sharc_harness.call_frame_collect_all()),
+    each frame's own command now coming from that frame's own captured
+    header (frame_command()) instead of a hardcoded 3 (lane C2, 2026-09-25)
+    -- and pins today's own result as a milestone, the same convention
     tools/sharc_harness.py's FRAME_MILESTONE uses for a single bare frame
-    call. Frame 0 (a `run_init()` Runner, one hand-set-up voice, no other
-    per-track frame data -- this capture's own per-track TX fields are all
-    zero at every one of its 38 frames, confirmed separately by a static
-    scan) reaches the same "frame-returned" milestone FRAME_MILESTONE pins.
-    Frame 1 -- the first call to render_frame a *second* time, on state
-    carried over from frame 0 -- hits a stop FRAME_MILESTONE's own
-    single-call measurement never reaches. It used to be forms_move.py's
-    Type14a handler refusing a long-word access whose decoded UREG code is
-    odd (0x1c32ad, USTAT2); that gap is fixed (sharc_core.state
-    ._lw_pair_mate implements the PRM's odd-register and complementary
-    -pair (LW) rules, p.2-4/2-9/2-12/6-5), so frame 1 now runs one
-    instruction further and hits the next, unrelated gap: an unconfirmed
-    opcode at 0x1c32b0. This is still a real, reproducible tools/sharc_core
-    gap, not something this test papers over: an intended fix updates this
-    pin and says why, exactly like FRAME_MILESTONE's own docstring asks.
+    call.
 
-    ring_a_mono stays all-zero: the mix gate (Z2-report.md's "mix_gate")
-    blocks the hand-set-up voice's output before it reaches the master mix,
-    so this pins silence, not a rendered tone -- a fix to the mix gate
-    changes this pin too.
+    This capture's own header word is 1 (docs/findings/04's "a header
+    written at +0x00", command "clears + stores 0") on frame 0 and 3
+    ("renders") on every frame after -- true of every `.dt2cap` capture on
+    hand, not just this one. So under real per-frame dispatch:
+
+    - frame 0 (command 1) never reaches render_frame at all: a trivial
+      clear, 192 instructions, "frame-returned" at the block handler's own
+      return pc (FRAME_MILESTONE, 0x1c75d3).
+    - frame 1 -- the FIRST real render call -- reaches the same
+      "frame-returned" milestone a single bare frame call does, at exactly
+      95982 instructions: the same count the old (forced-command-3-on-every-
+      frame) version of this test pinned for its own "frame 0", now
+      correctly attributed to the first frame that is actually a render.
+    - frame 2 -- the SECOND real render call, on state carried over from
+      frame 1 -- hits the same unconfirmed opcode at 0x1c32b0 the old
+      version of this test hit one frame earlier (as its "frame 1"), at the
+      same 82549-instruction count: forcing command 3 on frame 0 was
+      running an extra, unreal render before the real one, off by exactly
+      one frame; fixing the command source does not change what
+      tools/sharc_core still cannot decode, only which capture-frame index
+      it shows up on. This is still a real, reproducible tools/sharc_core
+      gap (lane C3's own scope, not this lane's) -- an intended fix updates
+      this pin and says why, exactly like FRAME_MILESTONE's own docstring
+      asks.
+
+    ring_a_mono stays all-zero: the mix gate (docs/findings/06's still-open
+    mix gate, DM(0x252d3c)) blocks the hand-set-up voice's output before it
+    reaches the master mix, so this pins silence, not a rendered tone -- a
+    fix to the mix gate changes this pin too. mix_gate_write/
+    master_bus_decoded_write/slot_type_write all stay None across all three
+    frames: even a fully successful render (frame 1) never writes any of
+    lane C2's own target globals here, on this capture's own (all-zero
+    machine-type) per-track data -- see the lane's own report for why.
     """
 
     @classmethod
@@ -120,40 +212,58 @@ class ReplayIdleCaptureTest(unittest.TestCase):
             0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools")
         )
 
-    def test_two_frame_replay_milestone(self):
+    def test_three_frame_replay_milestone(self):
         result = replay_mod.replay(
-            "dt2-1.16", str(IDLE_CAPTURE), n_frames=2, tone_freq=1000.0
+            "dt2-1.16", str(IDLE_CAPTURE), n_frames=3, tone_freq=1000.0
         )
-        self.assertEqual(result["frames_replayed"], 2)
+        self.assertEqual(result["frames_replayed"], 3)
         self.assertEqual(result["rx_base"], "%#x" % replay_mod.RX_BASE)
         self.assertEqual(result["other_voices_active_by_firmware"], {})
+        self.assertIsNone(result["forced_command"])
+        self.assertEqual(result["commands_seen"], {1: 1, 3: 2})
 
-        frame0, frame1 = result["per_frame"]
+        frame0, frame1, frame2 = result["per_frame"]
+
+        self.assertEqual(frame0["command"], 1)
         self.assertEqual(frame0["stop_reason"], "frame-returned")
-        self.assertEqual(frame0["instructions"], 95982)
+        self.assertEqual(frame0["stop_pc"], "0x1c75d3")
+        self.assertEqual(frame0["instructions"], 192)
+        self.assertFalse(frame0["master_bus_source_nonzero"])
 
-        # Type14a's odd-UREG-pair gap at 0x1c32ad is fixed (sharc_core.state
-        # ._lw_pair_mate: an odd ureg pairs with ureg-1, and USTAT2's own
-        # complementary-pair/load-only-the-named-register rule, PRM
-        # p.2-9/2-12); frame 1 now executes one instruction further and
-        # hits the next, unrelated gap -- an unconfirmed opcode.
+        self.assertEqual(frame1["command"], 3)
+        self.assertEqual(frame1["stop_reason"], "frame-returned")
+        self.assertEqual(frame1["stop_pc"], "0x1c75d3")
+        self.assertEqual(frame1["instructions"], 95982)
+        self.assertTrue(frame1["master_bus_source_nonzero"])
+
+        # The second real render call hits the same unconfirmed opcode the
+        # old always-command-3 version of this test hit on its own "frame
+        # 1" -- one frame later here because frame 0 is no longer an extra,
+        # unreal render (see the class docstring).
+        self.assertEqual(frame2["command"], 3)
         self.assertEqual(
-            frame1["stop_reason"],
+            frame2["stop_reason"],
             "uncertain or undecodable form: source: firmware (undocumented; unconfirmed)",
         )
-        self.assertEqual(frame1["stop_pc"], "0x1c32b0")
-        self.assertEqual(frame1["instructions"], 82549)
+        self.assertEqual(frame2["stop_pc"], "0x1c32b0")
+        self.assertEqual(frame2["instructions"], 82549)
+        self.assertTrue(frame2["master_bus_source_nonzero"])
 
-        self.assertEqual(len(result["ring_a_mono"]), 64)
+        self.assertEqual(result["first_stop"]["frame"], 2)
+        self.assertEqual(result["first_stop"]["pc"], "0x1c32b0")
+
+        self.assertEqual(len(result["ring_a_mono"]), 96)
         self.assertEqual(max(abs(v) for v in result["ring_a_mono"]), 0.0)
 
-        # Per-frame nonzero checks (track buffers / master mix / ring A) and
-        # the per-frame ACTIVE-byte snapshot, added alongside the pretracks
-        # capture survey (B1 2026-09-25): both frames are silent end to end
-        # -- no track buffer, the master mix, or ring A ever goes nonzero,
-        # and no voice other than the hand-set-up one (voice 0, excluded)
-        # is ever marked ACTIVE by the firmware itself.
-        for frame in (frame0, frame1):
+        # Per-frame nonzero checks (track buffers / master mix / ring A),
+        # the per-frame ACTIVE-byte snapshot, and lane C2's own target-global
+        # writes: all three frames are silent end to end -- no track buffer,
+        # the master mix, or ring A ever goes nonzero; no voice other than
+        # the hand-set-up one (voice 0, excluded) is ever marked ACTIVE by
+        # the firmware itself; and none of the mix gate, the master-bus
+        # decode destinations, or a voice record's own slot-type byte is
+        # ever written, even by frame 1's fully successful render.
+        for frame in (frame0, frame1, frame2):
             self.assertEqual(frame["voice_active_by_firmware"], {})
             self.assertEqual(
                 frame["track_buffers_nonzero"], {t: False for t in range(16)}
@@ -161,6 +271,9 @@ class ReplayIdleCaptureTest(unittest.TestCase):
             self.assertFalse(frame["any_track_buffer_nonzero"])
             self.assertFalse(frame["master_mix_nonzero"])
             self.assertFalse(frame["ring_a_nonzero"])
+            self.assertIsNone(frame["mix_gate_write"])
+            self.assertIsNone(frame["master_bus_decoded_write"])
+            self.assertIsNone(frame["slot_type_write"])
 
 
 if __name__ == "__main__":

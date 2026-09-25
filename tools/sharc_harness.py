@@ -911,6 +911,7 @@ def call_frame_collect_all(
     patch_table: sv.PatchTable | None = None,
     max_steps: int = 4_000_000,
     img: sharcmod.Image | None = None,
+    watchpoints: Sequence[sr.Watchpoint] = (),
 ) -> tuple[sr.Runner, sv.CollectAllResult]:
     """Like `call_frame()`, but drives the call with
     `tools/sharc_survey.py`'s `run_collect_all()` instead of
@@ -925,6 +926,14 @@ def call_frame_collect_all(
     report is a full list of what it depended on instead of only the
     nearest one.
 
+    `watchpoints`, if given, are attached to the fresh_call Runner before it
+    runs (`Runner.attach_watchpoints()` -- not carried over from `runner`
+    itself, since `fresh_call()` never carries watchpoints either): a
+    caller wanting to know which pc, if any, wrote a given DM range during
+    this one frame call reads them back off the returned Runner's own
+    `watch_log` (`sr.Runner.watch_log`), which `fresh_call()` always starts
+    empty.
+
     Returns (the fresh_call Runner, positioned at the terminal stop, its
     `sv.CollectAllResult`) -- `result.terminal` is the same kind of Halt
     information `call_frame()`'s own `RunResult.halt` would have stopped
@@ -932,6 +941,8 @@ def call_frame_collect_all(
     """
     p = profile(image)
     new_runner = runner.fresh_call(p.block_handler, diagnose_unknown=True)
+    if watchpoints:
+        new_runner.attach_watchpoints(list(watchpoints))
     result = sv.run_collect_all(new_runner, patch_table or {}, max_steps, img=img)
     return new_runner, result
 

@@ -59,6 +59,12 @@ Usage:
     # dynamic_view()'s docstring) instead of only the static labels:
     uv run python tools/sharc_inputs.py dt2-1.16 0x1c2b24 --dynamic
 
+    # Same cross-check, but replaying a real capture's own frames through
+    # the real per-frame command dispatch (see dynamic_view_capture()'s
+    # docstring) instead of one bare command-3 frame:
+    uv run python tools/sharc_inputs.py dt2-1.16 0x1c2b24 \
+        --capture out/captures/dt2-1.16-play-pretracks.dt2cap --capture-frames 3
+
     import sys; sys.path.insert(0, "tools")
     import sharc, sharc_inputs
     img = sharc.load("dt2-1.16")
@@ -440,6 +446,123 @@ def dynamic_view(
     )
 
 
+def dynamic_view_capture(
+    image: str,
+    capture_path: str,
+    *,
+    n_frames: int | None = None,
+    patch_table: sv.PatchTable | None = None,
+    max_steps: int = 4_000_000,
+    dm_range: tuple[int, int] = DYNAMIC_DM_RANGE,
+    voice: int = 0,
+    sample_len: int = 4096,
+) -> DynamicView:
+    """Like `dynamic_view()`, but drives N frames of a real
+    tools/sharc_capture_run.py capture through the real per-frame command
+    dispatch (`tools/sharc_replay.py`'s own `RX_BASE`/`frame_command()`
+    convention -- lane C2, 2026-09-25) on one continuous Runner, instead of
+    one bare default-command-3 frame with no captured frame content at all.
+
+    A caller asking "how many no-writer inputs remain after a replay of the
+    capture" wants THIS, not `dynamic_view()`: `build()`'s own static
+    `no_writer` count never changes from any runtime replay (it is a purely
+    static classification of the image), but a real multi-frame,
+    real-command replay can retire entries from it by showing a concrete
+    writer `build()`'s static `ptr`-pass missed (an untracked indexed
+    store -- see that pass's own module docstring on its blind spots), the
+    same live cross-check `dynamic_view()` already does for one bare frame.
+
+    Every byte this replay writes -- `run_init()`'s own overlay, each
+    frame's `RX_BASE`-mapped captured bytes (docs/findings/06's "The
+    ColdFire frame is mapped into SHARC DM at 0x2558dc" -- already a
+    ColdFire input, not a "no writer" address, in `build()`'s own
+    `frame_label()` bucket), and `command_word`/`command_word_shift_src` --
+    is folded into "explained" up front, so a genuinely no-writer read is
+    never miscounted just because this tool, not SHARC code, supplied the
+    byte.
+    """
+    import sharc_harness as h  # lazy: only this path needs the harness
+    import sharc_replay as rp  # lazy: only this path needs the capture format
+    from emu import sharc_capture
+
+    memory = sr._load_image_memory(image)
+    init = h.run_init(memory, image)
+    if not init.ran or init.runner is None:
+        raise RuntimeError("run_init did not complete: %s" % init.error)
+    explained = set(init.runner.state.overlay)
+
+    h.setup_voice(init.runner.state, image, voice, sample_len=sample_len)
+    p = h.profile(image)
+
+    cap = sharc_capture.load(capture_path)
+    frames = cap.dspi2_frames if n_frames is None else cap.dspi2_frames[:n_frames]
+
+    frame_patch_table = patch_table if patch_table is not None else h.FRAME_PATCH_TABLE
+
+    runner = init.runner
+    total_instructions = 0
+    read_addrs: set[int] = set()
+    written_addrs: set[int] = set()
+    halt_json: dict = {}
+    for frame in frames:
+        rp._write_bytes(runner.state, rp.RX_BASE, frame.tx)
+        h._poke(runner.state, p.command_word_shift_src, 0)
+        cmd = rp.frame_command(frame.tx)
+        h._poke(runner.state, p.command_word, cmd)
+        # Fold in whatever canonical (possibly SW_ALIAS_BASE-aliased --
+        # see sharc_core.memory._canonical_dm_address()) keys these pokes
+        # actually landed on, read back off the overlay itself rather than
+        # hand-computed from RX_BASE/command_word: a raw, unaliased range
+        # would silently under-count against watch_log's own canonical
+        # addresses if this region needs the low-memory alias, exactly the
+        # mistake `init_overlay` above avoids by reading `state.overlay`.
+        explained.update(runner.state.overlay)
+
+        watchpoint = sr.Watchpoint(
+            dm_range[0],
+            dm_range[1],
+            on_read=True,
+            on_write=True,
+            stop=False,
+            label="dynamic-view-capture",
+        )
+        # sharc_harness.call_frame_collect_all() (this lane's own
+        # tools/sharc_replay.py uses it too, the same way): continues
+        # through every resolvable fork with FRAME_PATCH_TABLE and the
+        # documented not-taken default instead of `run_with_patches()`'s
+        # own "stop at the first unpatched fork" (which `dynamic_view()`'s
+        # own bare-frame call also does, but a bare bare-command-3 frame
+        # never reaches a real per-track fork the way a real capture's
+        # frame 1 does).
+        call_runner, result = h.call_frame_collect_all(
+            runner,
+            image,
+            patch_table=frame_patch_table,
+            max_steps=max_steps,
+            watchpoints=[watchpoint],
+        )
+        halt_json = result.terminal.to_json()
+        for event in call_runner.watch_log:
+            if event.access == "read":
+                read_addrs.add(event.address)
+            else:
+                written_addrs.update(range(event.address, event.address + event.width))
+        total_instructions += call_runner.instructions
+        runner = call_runner
+
+    unexplained = sorted(
+        (a - SW_ALIAS_BASE if a >= SW_ALIAS_BASE else a)
+        for a in (read_addrs - written_addrs - explained)
+    )
+    return DynamicView(
+        instructions=total_instructions,
+        halt=halt_json,
+        n_read_addrs=len(read_addrs),
+        n_written_addrs=len(written_addrs),
+        unexplained_reads=unexplained,
+    )
+
+
 # --- CLI ----------------------------------------------------------------------
 
 
@@ -511,6 +634,18 @@ def main(argv=None) -> int:
         action="store_true",
         help="also run the real frame call once and report the dynamic view",
     )
+    p.add_argument(
+        "--capture",
+        help="cross-check against a real tools/sharc_capture_run.py capture "
+        "replayed through the real per-frame command dispatch "
+        "(dynamic_view_capture()) instead of one bare command-3 frame",
+    )
+    p.add_argument(
+        "--capture-frames",
+        type=int,
+        default=None,
+        help="--capture only: replay at most this many frames (default: all)",
+    )
     p.add_argument("--max-steps", type=int, default=4_000_000)
     p.add_argument(
         "--json", help="write the full report (+dynamic view, if asked) as JSON here"
@@ -530,6 +665,16 @@ def main(argv=None) -> int:
         view = dynamic_view(args.image, max_steps=args.max_steps)
         _print_dynamic(view)
         payload["dynamic_view"] = view.to_json()
+    if args.capture:
+        print()
+        capture_view = dynamic_view_capture(
+            args.image,
+            args.capture,
+            n_frames=args.capture_frames,
+            max_steps=args.max_steps,
+        )
+        _print_dynamic(capture_view)
+        payload["dynamic_view_capture"] = capture_view.to_json()
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:

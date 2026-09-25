@@ -27,6 +27,8 @@ L = import_module("sharcldr")
 
 DT2_116_DB = pathlib.Path("out/sharcdb/dt2-1.16.sqlite")
 DT2_116_BLOB = pathlib.Path("out/sections/dt2-1.16/section_7_BLOB.bin")
+IDLE_CAPTURE = pathlib.Path("out/captures/dt2-1.16-idle.dt2cap")
+PLAY_PRETRACKS_CAPTURE = pathlib.Path("out/captures/dt2-1.16-play-pretracks.dt2cap")
 
 
 def loader_memory():
@@ -332,6 +334,64 @@ class DynamicViewTest(unittest.TestCase):
         # ever writing it -- the static "no writer found" bucket is not
         # just an artifact of an incomplete reach walk.
         self.assertTrue(no_writer_addrs & unexplained)
+
+
+@pytest.mark.slow
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+@unittest.skipUnless(
+    IDLE_CAPTURE.exists(), "dt2-1.16-idle.dt2cap capture is not available"
+)
+class DynamicViewCaptureTest(unittest.TestCase):
+    """dynamic_view_capture() (lane C2, 2026-09-25) against three frames of
+    the idle capture, real per-frame command dispatch and all: frame 0's
+    own header is command 1 (a trivial clear, 192 instructions), frame 1 is
+    the first real render (95982 instructions, the same "frame-returned"
+    count tools/sharc_replay.py's own milestone test pins for its own
+    frame 1), and frame 2 -- the second real render -- hits the same
+    unconfirmed opcode at 0x1c32b0 that module's milestone test also pins.
+    Instruction counts across the two tools agree exactly (178723 =
+    192 + 95982 + 82549), an end-to-end cross-check that both drive the
+    same real call chain the same way."""
+
+    def test_three_frame_capture_replay_milestone(self):
+        view = si.dynamic_view_capture("dt2-1.16", str(IDLE_CAPTURE), n_frames=3)
+        self.assertEqual(view.instructions, 178723)
+        self.assertEqual(
+            view.halt["category"],
+            "uncertain or undecodable form: source: firmware (undocumented; unconfirmed)",
+        )
+        self.assertEqual(view.halt["pc"], 0x1C32B0)
+        self.assertGreater(view.n_read_addrs, 0)
+        self.assertGreater(view.n_written_addrs, 0)
+
+    @unittest.skipUnless(
+        PLAY_PRETRACKS_CAPTURE.exists(),
+        "dt2-1.16-play-pretracks.dt2cap capture is not available",
+    )
+    def test_static_no_writer_count_shrinks_against_a_real_capture_replay(self):
+        img = sharc.load("dt2-1.16")
+        init_state = si.run_init_state("dt2-1.16")
+        static = si.build(img, 0x1C2B24, init_state=init_state)
+        no_writer_addrs = {
+            lbl.address for lbl in static.labels if lbl.label == "no_writer"
+        }
+        view = si.dynamic_view_capture(
+            "dt2-1.16",
+            str(PLAY_PRETRACKS_CAPTURE),
+            n_frames=3,
+        )
+        unexplained = set(view.unexplained_reads)
+        # A real, per-frame-dispatched, real-kit-data (docs/findings/06's
+        # own "4 tracks with nonzero machine type" pretracks capture)
+        # replay retires SOME of the static no_writer bucket (never read on
+        # this path, or a concrete dynamic writer found) without retiring
+        # all of it -- see the lane's own report for the exact count and
+        # which addresses remain.
+        still_unexplained = {
+            a for a in no_writer_addrs if any((a + i) in unexplained for i in range(4))
+        }
+        self.assertTrue(still_unexplained)
+        self.assertLess(len(still_unexplained), len(no_writer_addrs))
 
 
 if __name__ == "__main__":
