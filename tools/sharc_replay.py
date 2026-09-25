@@ -3,7 +3,7 @@ task, from a post-init state.
 
     uv run python tools/sharc_replay.py dt2-1.16 CAPTURE.dt2cap \
         [--frames N] [--out OUT.wav] [--report OUT.json] [--freq HZ] \
-        [--sample-len N] [--poke-candidates]
+        [--sample-len N] [--force-command N]
 
 For each captured DSPI2 frame, in capture order:
 
@@ -16,75 +16,79 @@ For each captured DSPI2 frame, in capture order:
    (see point 2): it is read straight from the captured bytes, the same way
    `docs/findings/04`'s own `tools/sharcframe.py` experiment read them.
 
-2. **Best-effort, diagnostic only**: writes the captured payload verbatim
-   (byte 0 of the payload -> byte 0 of the candidate buffer -- justified by
-   the *same* finding: the SHARC-side reader in `FUN_1c2b24` indexes `I5 +
-   0x94`/`+0x73c`/`+0x75c`, the identical offsets, which only makes sense if
-   the transport is a byte-for-byte copy) at BOTH of
-   docs/findings/04's still-open candidate SHARC receive-buffer addresses
-   (`CANDIDATE_RX_BUFFERS` below, "The SHARC reads and change-tests the
-   0x94 + 2i machine word": "The two strongest candidate receive states are
-   now concrete but still not aliased to I5"). Neither address is
-   established as the real one -- this tool reports whether poking them
-   measurably changed anything (it does not gate the render on it either
-   way), not a claim that it found the real buffer.
+2. **Delivers the transfer at its real hardware address and lets the
+   firmware do the rest (lane G1, 2026-09-26)**, instead of poking a
+   confirmed-by-execution but firmware-internal buffer directly. Lane G1
+   traced the SPI-slave receive DMA's own descriptor-list ring
+   (`tools/sharc_harness.py`'s own module note above
+   `dma_landing_address()`: `FUN_1c7bd4` builds it at DM `0x2641b0`/
+   `0x2641cc`, ADDRSTART fields pointing at `command_word`'s own two
+   ping-pong instances, `0x264220`/`0x265220` on DT2 1.16 -- the SC58x/
+   2158x Hardware Reference's own Descriptor-List Mode layout,
+   out/refs/adsp-2156x-hwr Table 27-10) and confirmed the SAME address from
+   `render_frame`'s (`FUN_1c2b24`) own consumer side: its `M10` (saved from
+   its incoming `R12` argument, `command_word + (shift<<12)`) is the SOURCE
+   of its own 512-long-word (2,048-byte) copy into `RX_BASE` (`0x2558dc`,
+   still the confirmed-by-execution buffer `FUN_1c2b24`'s own per-track
+   decode reads -- now understood to be a WORKING COPY render_frame makes
+   every frame, not the landing zone itself).
 
-3. **Writes the captured payload to the confirmed SHARC receive buffer**
-   (`RX_BASE = 0x2558dc`, docs/findings/06's "The ColdFire frame is mapped
-   into SHARC DM at 0x2558dc" -- a whole-frame mapped range
-   `[0x2558dc, 0x2560de]`, 0x802 bytes, exactly this tool's own captured
-   `tx` length): byte 0 of the payload to byte 0 of that DM range, the same
-   1:1 mapping the finding's own literal-subtraction table establishes.
-   This supersedes the two `CANDIDATE_RX_BUFFERS` an earlier version of
-   this tool poked (`0x261bac`/`0x261aa4`, docs/findings/04's "still not
-   aliased to I5" candidates from before `0x2558dc` was confirmed by
-   execution) -- kept below only as an additional, off-by-default,
-   diagnostic poke (`--poke-candidates`), not the transport this tool now
-   relies on.
+   So this tool now calls `sharc_harness.write_dma_transfer()` (writes the
+   captured frame's own TX bytes -- 16-bit-unit byte-swapped, see that
+   function's own docstring for why -- at whichever ring `command_word_
+   shift_src` is NOT currently pointing at) and `sharc_harness.
+   drive_dma_completion()` (calls `FUN_1c77b4`, the SPI service's own
+   registered completion callback, with an event code that has its own
+   bit 5 set -- the one bit that function's own 9 instructions act on --
+   toggling the ping-pong shift onto the buffer just written, and re-arming
+   `sharc_harness.COPY_GATE_ADDRESS`, a second, still-open gate lane G1
+   found guarding render_frame's own companding-copy block; see that
+   module's own section note for exactly what is, and is not, traced about
+   it) before every frame's own `call_frame_collect_all()`. It no longer
+   pokes `RX_BASE`/`command_word` directly at all -- both are now filled by
+   `render_frame`'s own execution, from the transfer this tool delivers at
+   the real hardware address.
 
-4. **Drives the real audio-task call chain**, the same one
+3. **Drives the real audio-task call chain**, the same one
    tools/sharc_harness.py's `render_frames()`/`call_frame()` already proved
    reaches render_frame (block_handler -> command_dispatch_fn ->
    cmd_handler_3 -> render_frame -- docs/findings/06's "Frame call path"),
    with `FRAME_PATCH_TABLE` (that module's own hypotheses for the stops an
    almost-empty synthetic frame hits) via
-   `sharc_harness.call_frame_collect_all()` -- every stop the frame call
-   passes is recorded (`per_frame[i]["stops"]`), not only the first, so a
-   replay's own report is a full list of what each frame depended on.
+   `sharc_harness.call_frame_collect_all_with_hits()` -- every stop the
+   frame call passes is recorded (`per_frame[i]["stops"]`), not only the
+   first, so a replay's own report is a full list of what each frame
+   depended on; a breakpoint at `0x1c60a2` (`FUN_1c60a2`, the machine-type
+   change detector docs/findings/06's Lane E2 found unreached from a
+   synthetic frame) is installed on every frame, so `per_frame[i][
+   "fun_1c60a2_hits"]` answers, with a real hit count rather than an
+   inferred one, whether a real, correctly-delivered transfer ever reaches
+   it.
 
-   **The command word now comes from each captured frame's own header**
-   (`frame_command()` below), not a hardcoded 3. docs/findings/04's "Frame
-   content: a header written at +0x00" already documents that the
-   ColdFire's own frame-build code writes a header word at TX byte offset
-   0; every `.dt2cap` capture on hand (idle, idle15M, note-track1,
-   machine2-track0, play-pretracks) has that word as `1` on the capture's
-   first frame and `3` on every frame after it -- an exact match to
-   docs/findings/06's own command semantics ("1" clears the rings and
-   stores 0, "3" renders). No static, `tools/sharc.py`-resolved data-flow
-   edge from this TX byte into `command_word`
-   (`0x264220 + (DM(command_word_shift_src=0x261ca4)<<12)`, itself written
-   only by `FUN_1c77b4`'s bit-toggle, which has no static caller of its
-   own) was found: the correlation is a same-value-sequence behavioural
-   match across every capture on hand, not a proven store-to-load edge, so
-   it is used here as the best available per-frame command signal, marked
-   `[D]` in the lane report, not claimed as `[V]`. `--force-command N`
-   keeps the old always-N behaviour for an A/B comparison.
+   **The command word itself is no longer a separate poke.** It comes from
+   whatever the delivered transfer's own header (TX byte offset 0,
+   docs/findings/04's "Frame content: a header written at +0x00") resolves
+   to once `render_frame`/`command_dispatch_fn` read it back -- `cmd` in
+   this tool's own per-frame report is `frame_command(frame.tx)` (or
+   `--force-command N`'s override, now applied to the TRANSFERRED bytes'
+   own header before delivery, not to `command_word` after the fact) purely
+   for describing what was sent, not a separate write.
 
    ONE voice is set up via `sharc_harness.setup_voice()`, with a `--freq`
    Hz sine (default 1000 Hz, at `sharc_harness.SOURCE_SAMPLE_RATE`) written
    to its sample buffer -- **not** from the captured frame, because the
    SHARC-side code path that would turn a received DSPI2 frame into an
-   active voice record (a written record word +0 / ACTIVE) is not yet
-   found: docs/findings/06's "Init writes" leaves "the firmware writer of
-   word +0 for a playing voice" open. This tool's own
-   `voice_activated_by_firmware` is therefore always `False` -- it names
-   the missing link instead of quietly working around it with a
-   hand-set-up voice and calling that "firmware-driven". `scan_voice_active`
-   reports whether the firmware itself ever marked any *other* voice record
-   ACTIVE (`+0x1b8`) while this replay ran, independent of the one this
-   tool sets up by hand.
+   active voice record (a written record word +0 / ACTIVE) is still not
+   found even with the transfer delivered correctly this time (see this
+   lane's own report). This tool's own `voice_activated_by_firmware` is
+   therefore still always `False` for voice 0 (the one it sets up by
+   hand) -- it names the missing link instead of quietly working around it
+   and calling that "firmware-driven". `scan_voice_active` reports whether
+   the firmware itself ever marked any *other* voice record ACTIVE
+   (`+0x1b8`) while this replay ran, independent of the one this tool sets
+   up by hand.
 
-5. **Collects ring A** (DAC output, `0x261cc8 + (flag<<8)`,
+4. **Collects ring A** (DAC output, `0x261cc8 + (flag<<8)`,
    docs/findings/06's "Rings": already Q31, L/R-interleaved, at the final
    output rate -- unlike the single-voice work buffer, this is NOT run
    through `sharc_harness.decimate()`) after each call, and writes an
@@ -121,48 +125,27 @@ import sharc_trace as st  # noqa: E402
 sys.path.insert(0, os.path.dirname(HERE))
 from emu import sharc_capture  # noqa: E402
 
-# docs/findings/04-coldfire-dsp-link.md, "The SHARC reads and change-tests
-# the 0x94 + 2i machine word": two candidate SHARC-side receive buffers,
-# concrete but not established as the real one -- see the module docstring,
-# point 2.
-CANDIDATE_RX_BUFFERS = {
-    "selector_1_0x261b18": 0x261BAC,
-    "selector_2_0x261a10": 0x261AA4,
-}
-
 # docs/findings/06's "The ColdFire frame is mapped into SHARC DM at
 # 0x2558dc": the confirmed (by execution) whole-frame mapped range
-# [0x2558dc, 0x2560de], 0x802 bytes -- the real-payload prefix of this tool's
-# own captured `tx` (see TX_PAYLOAD_BYTES below; tools/sharc_capture_run.py
-# now captures the whole FRAME_BYTES-byte wire frame, not only this prefix).
-# Byte i of the payload maps to DM byte RX_BASE + i, one-to-one.
+# [0x2558dc, 0x2560de], 0x802 bytes. **[C] Lane G1 (2026-09-26): this is
+# render_frame's (FUN_1c2b24) own WORKING COPY of the real transfer, made by
+# a 2,048-byte copy from the real hardware landing zone
+# (sharc_harness.dma_landing_address()) every frame it runs -- not
+# something this tool writes to any more (see the module docstring, point
+# 2, and sharc_harness.py's own section note above dma_landing_address()).
+# Kept here only for describe_frame()'s own per-track byte offsets below,
+# which are relative to this same base either way.
 RX_BASE = 0x2558DC
 
 # emu/dspiframe.py's TX_PAYLOAD_BYTES["dt2"]: the real-payload length the
 # ColdFire driver copies out of its own TX source buffer before padding the
 # rest of the FRAME_BYTES=0xabc (2,748) byte wire frame with tag-only PUSHR
 # entries (docs/findings/04-coldfire-dsp-link.md, "TX length ... are not two
-# independently sized directions"). RX_BASE's own confirmed mapping covers
-# exactly this prefix -- write only this many bytes of a captured frame
-# there; the rest (`TRANSFER_TAIL_*` below) is a separate, unconfirmed
-# question this lane's own task asks to check, not assumed to share the same
-# destination.
+# independently sized directions"). Used only by describe_frame() below to
+# find a captured frame's own tail (past the real payload) -- lane G1
+# delivers the whole transfer (up to sharc_harness.RING_SIZE_BYTES) at the
+# real hardware address, not just this prefix.
 TX_PAYLOAD_BYTES = 0x802
-
-# Lane D2's own item 1/2: DM(0x261a10) is the small (0x104-byte, confirmed by
-# tracing its own zero-fill call `FUN_1c9fd5(R12=0x261a10, R4=2)` ->
-# `FUN_1c0ccf`) control block of an on-chip SPI peripheral driver (SPI_CTL
-# bitfield writers found nearby -- CPOL/CPHA/SIZE/MSTR=0, i.e. configured as
-# an SPI *slave*, matching the ColdFire being DSPI2 master), not a payload
-# buffer: it is far too small to hold the 2,050-byte real payload, let alone
-# the full 2,748-byte transfer, and lies immediately before the SHARC's own
-# live ring A/B/C/D DMA buffers (0x261cc8-0x263938), which a naive "write the
-# whole captured transfer here" would stomp over. This tool writes at most
-# this many bytes of a captured transfer's *tail* (the part past
-# `TX_PAYLOAD_BYTES`) there -- a bounded, diagnostic-only poke
-# (`--poke-transfer-tail`), not a claim that this is the real destination.
-TRANSFER_TAIL_BASE = 0x261A10
-TRANSFER_TAIL_MAX_BYTES = 0x104
 
 # docs/findings/04's per-track TX frame map: offsets into the ColdFire's own
 # 0x802-byte payload, which is also this tool's captured `tx` bytes (see
@@ -247,6 +230,13 @@ def describe_frame(tx: bytes) -> dict:
 
 
 def _write_bytes(state, base: int, data: bytes) -> None:
+    """Byte-for-byte poke, unswapped -- `replay()` itself no longer uses
+    this (see the module docstring, point 2: it delivers a transfer at the
+    real hardware address via `sharc_harness.write_dma_transfer()` instead).
+    Kept as a small utility for `tools/sharc_inputs.py`'s own `dynamic_view()`,
+    which still models the pre-lane-G1 direct-poke behaviour for its own,
+    separate purpose (a static "no writer" audit, not a claim about where a
+    real transfer lands)."""
     for i, byte in enumerate(data):
         h._poke(state, base + i, byte, width=1)
 
@@ -303,11 +293,12 @@ def _mono(ring_a_blocks: list[list[float]]) -> list[float]:
 # staying zero because a synthetic single-command-3 test never ran the
 # commands (0-2) or repeated command-3 calls that would reach them.
 #
-# `MASTER_BUS_SOURCE` is the raw 26-field mixer/gain table this tool's own
-# `_write_bytes(state, RX_BASE, frame.tx)` already maps byte-for-byte from
-# the captured TX frame (docs/findings/06, "The ColdFire frame is mapped
-# into SHARC DM at 0x2558dc") -- checked directly against the captured
-# bytes, not via a watchpoint, since nothing in the SHARC image is a
+# `MASTER_BUS_SOURCE` is the raw 26-field mixer/gain table `render_frame`'s
+# own 2,048-byte copy (lane G1: from the real DMA landing zone, into
+# `RX_BASE`) maps byte-for-byte from the captured TX frame (docs/findings/06,
+# "The ColdFire frame is mapped into SHARC DM at 0x2558dc") -- checked
+# directly against the captured bytes, not via a watchpoint, since nothing in
+# the SHARC image is a
 # "writer" of it (it is a ColdFire input, tools/sharc_inputs.py's own
 # `frame_label()` bucket). `MASTER_BUS_DECODED` is `FUN_1c2b24`'s own
 # 0x1c2e00-0x1c2fb0 decode of that table into per-channel dynamics
@@ -429,39 +420,71 @@ def call_frame_collect_all_with_hits(
     return new_runner, result, hits
 
 
+FUN_1C60A2 = 0x1C60A2  # docs/findings/06's Lane E2 machine-type change detector.
+
+# docs/findings/06's Lane F2: the pointer FUN_1c60a2's own gate dereferences
+# -- null (via State.explicit_memory_model) everywhere this project has run
+# with an unfilled companding record. A real, correctly-delivered transfer
+# (lane G1) does not fill DM(0x266220) either (see sharc_harness.py's own
+# section note: the transfer fits inside command_word's own ring, and never
+# reaches command_record_table's), so this stays a diagnostic read, not
+# something this tool expects to change -- reported per frame either way.
+COMPANDING_GATE_POINTER = 0x254D78
+
+
 def replay(
     image: str,
     capture_path: str,
     *,
     n_frames: int | None = None,
-    poke_candidates: bool = False,
-    poke_transfer_tail: bool = False,
     command: int | None = None,
     ring_flag: int = 0,
     tone_freq: float = 1000.0,
     sample_len: int = 4096,
+    provisional_interpretations: dict[str, str] | None = None,
 ) -> dict:
     """Replay CAPTURE_PATH's DSPI2 frames from a `run_init()` state, one
     voice set up with a `tone_freq` Hz sine (`sharc_harness.SOURCE_SAMPLE_RATE`
     -- matching `sharc_harness.render_frames()`'s own CLI convention) so the
     voice actually has audible input, not the all-zero (unwritten,
     `explicit_memory_model`) PCM an earlier version of this function left at
-    `sample_base`. `poke_candidates` defaults to False now that `RX_BASE` is
-    the confirmed transport (see the module docstring); the two stale
-    candidates stay available for an explicit diagnostic comparison.
+    `sample_base`.
+
+    **Delivery (lane G1, 2026-09-26): every frame's own captured TX bytes
+    are written at the real SPI-slave receive DMA's own landing zone**
+    (`sharc_harness.write_dma_transfer()`) and the transfer is "completed"
+    the way real hardware would (`sharc_harness.drive_dma_completion()`,
+    toggling the ping-pong shift and the companding-copy gate -- see that
+    module's own section note) -- not poked into `RX_BASE`/`command_word`
+    directly any more. See the module docstring's point 2.
 
     `command` defaults to None: each frame's own command comes from
-    `frame_command(frame.tx)` (that frame's own captured header), so the
-    block handler runs whatever command that frame actually asked for
-    instead of a hardcoded 3 -- see the module docstring's point 4. Pass an
-    int to force every frame to that one command instead (the old
-    behaviour), for an A/B comparison.
+    `frame_command(frame.tx)` (that frame's own captured header) -- the
+    block handler runs whatever command that frame actually asked for,
+    read back from the transfer itself, not a hardcoded 3. Pass an int to
+    OVERRIDE that frame's own header bytes (TX offset 0-1, big-endian)
+    before delivering it, for an A/B comparison -- this still goes through
+    `write_dma_transfer()`/`drive_dma_completion()`, it does not poke
+    `command_word` after the fact.
+
+    `provisional_interpretations`, if given, is threaded through
+    `sharc_harness.run_init()` to every frame call afterward (`fresh_call()`
+    keeps a State's own `provisional_interpretations`/`provisional_
+    interpreted` -- see `tools/sharc_run.py`'s `fresh_call_state()`): an
+    opt-in way past an undocumented form this replay would otherwise stop
+    at (e.g. `{"21p_undoc16": "nop"}`), reported back per frame in
+    `provisional_hits` so a caller can tell a provisional-assisted run from
+    a clean one -- label any result built with this **[D]**, not **[V]**.
     """
     cap = sharc_capture.load(capture_path)
     frames = cap.dspi2_frames if n_frames is None else cap.dspi2_frames[:n_frames]
 
     memory = h.load_image_memory(image)
-    init = h.run_init(memory, image)
+    init = h.run_init(
+        memory,
+        image,
+        provisional_interpretations=provisional_interpretations,
+    )
     if not init.ran:
         return {
             "capture": capture_path,
@@ -480,19 +503,15 @@ def replay(
     ]
     h._write_samples(state, sample_base, tone, "int16")
     h.setup_voice(state, image, voice=0, sample_len=sample_len, sample_base=sample_base)
-    p = h.profile(image)
-    # setup_frame()'s own command=/ring_flag= pokes, without forcing a
-    # command yet -- each frame below pokes command_word for itself, from
-    # that frame's own header (or the forced override).
-    h._poke(state, p.command_word_shift_src, 0)
-    h._poke(state, p.ring_flag, ring_flag)
+    h.setup_frame_dma(state, image, ring_flag=ring_flag)
 
     per_frame = []
     ring_a_blocks = []
     first_stop = None
     other_voices_active: dict[int, int] = {}
     commands_seen: dict[int, int] = {}
-    prev_tail: bytes | None = None
+    fun_1c60a2_total_hits = 0
+    provisional_used: set[str] = set()
 
     target_lo = min(MASTER_BUS_DECODED[0], MIX_GATE[0], SLOT_TYPE_WATCH[0])
     target_hi = max(MASTER_BUS_DECODED[1], MIX_GATE[1], SLOT_TYPE_WATCH[1])
@@ -510,41 +529,34 @@ def replay(
         info["index"] = idx
         info["instr_count"] = frame.instr_count
 
-        cmd = command if command is not None else frame_command(frame.tx)
+        cmd = frame_command(frame.tx)
+        tx = frame.tx
+        if command is not None and cmd != command:
+            tx = bytearray(tx)
+            tx[0] = (command >> 8) & 0xFF
+            tx[1] = command & 0xFF
+            tx = bytes(tx)
+            cmd = command
         info["command"] = cmd
         commands_seen[cmd] = commands_seen.get(cmd, 0) + 1
 
-        payload = frame.tx[:TX_PAYLOAD_BYTES]
-        tail = frame.tx[TX_PAYLOAD_BYTES:]
-        _write_bytes(state, RX_BASE, payload)
-        if poke_candidates:
-            for addr in CANDIDATE_RX_BUFFERS.values():
-                _write_bytes(state, addr, payload)
-        if poke_transfer_tail and tail:
-            # Lane D2 item 2/3, diagnostic only -- see TRANSFER_TAIL_BASE's
-            # own docstring: this is bounded to the driver control block's
-            # own zero-filled size, not the tail's full length, since the
-            # tail (up to 698 bytes for DT2) is longer than that block and
-            # would otherwise overwrite the live ring A/B/C/D DMA buffers
-            # that start immediately after it.
-            _write_bytes(state, TRANSFER_TAIL_BASE, tail[:TRANSFER_TAIL_MAX_BYTES])
-        info["tail_changed_from_previous"] = (
-            None if prev_tail is None or not tail else tail != prev_tail
-        )
-        if tail:
-            prev_tail = tail
-        h._poke(state, p.command_word_shift_src, 0)
-        h._poke(state, p.command_word, cmd)
+        landing_base = h.write_dma_transfer(state, image, tx)
+        runner = h.drive_dma_completion(runner, image)
+        state = runner.state
+        info["landing_base"] = "%#x" % landing_base
 
         src_lo, src_hi = MASTER_BUS_SOURCE
-        info["master_bus_source_nonzero"] = any(
-            frame.tx[src_lo - RX_BASE : src_hi - RX_BASE]
-        )
+        info["master_bus_source_nonzero"] = any(tx[src_lo - RX_BASE : src_hi - RX_BASE])
 
-        runner, result = h.call_frame_collect_all(
-            runner, image, patch_table=h.FRAME_PATCH_TABLE, watchpoints=[target_watch]
+        runner, result, hits = call_frame_collect_all_with_hits(
+            runner,
+            image,
+            trace_pcs={FUN_1C60A2},
+            patch_table=h.FRAME_PATCH_TABLE,
+            watchpoints=[target_watch],
         )
         state = runner.state
+        fun_1c60a2_total_hits += len(hits)
         events = runner.watch_log
         ring_a = _read_ring_a(state, image)
         ring_a_blocks.append(ring_a)
@@ -552,6 +564,9 @@ def replay(
         other_voices_active.update(frame_voices_active)
         track_buffers = _track_buffers_nonzero(state)
         master_mix = h.read_master_mix(memory, image, runner)
+        companding_fields = h.companding_record_fields(state, image)
+        if state.provisional_interpreted:
+            provisional_used.update(state.provisional_interpreted)
 
         terminal = result.terminal
         info["handler"] = "block_handler -> command_dispatch_fn -> cmd_handler_%d" % cmd
@@ -559,11 +574,14 @@ def replay(
         info["stop_reason"] = terminal.category
         info["stop_pc"] = "%#x" % terminal.pc
         info["instructions"] = result.instructions
+        info["fun_1c60a2_hits"] = [hit["pc"] for hit in hits]
         info["voice_active_by_firmware"] = frame_voices_active
         info["track_buffers_nonzero"] = track_buffers
         info["any_track_buffer_nonzero"] = any(track_buffers.values())
         info["master_mix_nonzero"] = any(v for v in master_mix)
         info["ring_a_nonzero"] = any(v for v in ring_a)
+        info["companding_fields"] = ["%#x" % v for v in companding_fields]
+        info["companding_gate_pointer_nonzero"] = bool(companding_fields[0])
         info["mix_gate_write"] = _first_nonzero_write(events, *MIX_GATE)
         info["master_bus_decoded_write"] = _first_nonzero_write(
             events, *MASTER_BUS_DECODED
@@ -594,16 +612,22 @@ def replay(
         "frames_replayed": len(frames),
         "rx_base": "%#x" % RX_BASE,
         "tx_payload_bytes": "%#x" % TX_PAYLOAD_BYTES,
-        "transfer_tail_base": "%#x" % TRANSFER_TAIL_BASE,
-        "candidate_rx_buffers": {k: "%#x" % v for k, v in CANDIDATE_RX_BUFFERS.items()},
-        "poked_candidates": poke_candidates,
-        "poked_transfer_tail": poke_transfer_tail,
         "tone_freq_hz": tone_freq,
         "commands_seen": commands_seen,
         "forced_command": command,
         "voice_activated_by_firmware": False,
         "voice_activated_by_firmware_reason": VOICE_ACTIVATED_REASON,
         "other_voices_active_by_firmware": other_voices_active,
+        "fun_1c60a2_total_hits": fun_1c60a2_total_hits,
+        "companding_gate_pointer": "%#x" % COMPANDING_GATE_POINTER,
+        "any_companding_gate_pointer_nonzero": any(
+            f["companding_gate_pointer_nonzero"] for f in per_frame
+        ),
+        "any_signal_without_injection": any(
+            f["any_track_buffer_nonzero"] or f["master_mix_nonzero"] for f in per_frame
+        ),
+        "provisional_interpretations": provisional_interpretations,
+        "provisional_used": sorted(provisional_used),
         "per_frame": per_frame,
         "first_stop": first_stop,
         "ring_a_mono": _mono(ring_a_blocks),
@@ -631,29 +655,35 @@ def parse_args(argv=None):
         help="the hand-set-up voice's source buffer length, in samples",
     )
     p.add_argument(
-        "--poke-candidates",
-        action="store_true",
-        help="also poke the two stale candidate RX buffers (see the module "
-        "docstring) alongside the confirmed RX_BASE -- diagnostic only",
-    )
-    p.add_argument(
-        "--poke-transfer-tail",
-        action="store_true",
-        help="also write the captured transfer's tail (past TX_PAYLOAD_BYTES, "
-        "only present in captures made with tools/sharc_capture_run.py's "
-        "full-transfer capture) to TRANSFER_TAIL_BASE (0x261a10), bounded to "
-        "TRANSFER_TAIL_MAX_BYTES -- diagnostic only, see that constant's own "
-        "docstring for why it is not written in full",
-    )
-    p.add_argument(
         "--force-command",
         type=int,
         default=None,
-        help="force every frame to this command number instead of reading "
-        "it from that frame's own header (frame_command()) -- diagnostic "
-        "A/B against the old always-3 behaviour",
+        help="override every frame's own header bytes (TX offset 0-1) to "
+        "this command number before delivering the transfer, instead of "
+        "reading it from that frame's own captured header (frame_command()) "
+        "-- diagnostic A/B, still delivered through the real DMA path",
+    )
+    p.add_argument(
+        "--provisional",
+        action="append",
+        default=[],
+        metavar="FORM=MODE",
+        help="an opt-in tools/sharc_core provisional interpretation (e.g. "
+        "21p_undoc16=nop) to get a replay past an undocumented form -- may "
+        "be given more than once; any result built with this is provisional "
+        "([D], not [V]) -- see replay()'s own docstring",
     )
     return p.parse_args(argv)
+
+
+def _parse_provisional(pairs: list[str]) -> dict[str, str] | None:
+    if not pairs:
+        return None
+    out = {}
+    for pair in pairs:
+        form, _, mode = pair.partition("=")
+        out[form] = mode
+    return out
 
 
 def main(argv=None) -> int:
@@ -662,11 +692,10 @@ def main(argv=None) -> int:
         args.image,
         args.capture,
         n_frames=args.frames,
-        poke_candidates=args.poke_candidates,
-        poke_transfer_tail=args.poke_transfer_tail,
         command=args.force_command,
         tone_freq=args.freq,
         sample_len=args.sample_len,
+        provisional_interpretations=_parse_provisional(args.provisional),
     )
     if args.out and "ring_a_mono" in result:
         h.write_wav(args.out, result["ring_a_mono"], sample_rate=48000)

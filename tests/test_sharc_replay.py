@@ -146,16 +146,36 @@ class ParseArgsTest(unittest.TestCase):
         self.assertIsNone(args.frames)
         self.assertEqual(args.freq, 1000.0)
         self.assertEqual(args.sample_len, 4096)
-        self.assertFalse(args.poke_candidates)
         self.assertIsNone(args.force_command)
-
-    def test_poke_candidates_flag(self):
-        args = replay_mod.parse_args(["dt2-1.16", "cap.dt2cap", "--poke-candidates"])
-        self.assertTrue(args.poke_candidates)
+        self.assertEqual(args.provisional, [])
 
     def test_force_command_flag(self):
         args = replay_mod.parse_args(["dt2-1.16", "cap.dt2cap", "--force-command", "3"])
         self.assertEqual(args.force_command, 3)
+
+    def test_provisional_flag_may_repeat(self):
+        args = replay_mod.parse_args(
+            [
+                "dt2-1.16",
+                "cap.dt2cap",
+                "--provisional",
+                "21p_undoc16=nop",
+                "--provisional",
+                "8p_undoc48=nop",
+            ]
+        )
+        self.assertEqual(args.provisional, ["21p_undoc16=nop", "8p_undoc48=nop"])
+
+
+class ParseProvisionalTest(unittest.TestCase):
+    def test_empty_list_is_none(self):
+        self.assertIsNone(replay_mod._parse_provisional([]))
+
+    def test_parses_form_equals_mode_pairs(self):
+        self.assertEqual(
+            replay_mod._parse_provisional(["21p_undoc16=nop", "8p_undoc48=skip"]),
+            {"21p_undoc16": "nop", "8p_undoc48": "skip"},
+        )
 
 
 @pytest.mark.slow
@@ -165,10 +185,12 @@ class ParseArgsTest(unittest.TestCase):
 )
 class ReplayIdleCaptureTest(unittest.TestCase):
     """Replays the first three frames of the idle capture through the real
-    block_handler call chain (tools/sharc_harness.call_frame_collect_all()),
-    each frame's own command now coming from that frame's own captured
-    header (frame_command()) instead of a hardcoded 3 (lane C2, 2026-09-25)
-    -- and pins today's own result as a milestone, the same convention
+    block_handler call chain, delivering each frame's own captured TX bytes
+    at the SPI-slave receive DMA's own real landing zone and "completing"
+    the transfer the way real hardware would
+    (sharc_harness.write_dma_transfer()/drive_dma_completion(), lane G1,
+    2026-09-26) instead of poking RX_BASE/command_word directly -- and pins
+    today's own result as a milestone, the same convention
     tools/sharc_harness.py's FRAME_MILESTONE uses for a single bare frame
     call.
 
@@ -179,32 +201,39 @@ class ReplayIdleCaptureTest(unittest.TestCase):
 
     - frame 0 (command 1) never reaches render_frame at all: a trivial
       clear, 192 instructions, "frame-returned" at the block handler's own
-      return pc (FRAME_MILESTONE, 0x1c75d3).
+      return pc (FRAME_MILESTONE, 0x1c75d3) -- unchanged from the pre-lane-G1
+      pin, since command 1 never reaches the DMA-delivered data at all.
     - frame 1 -- the FIRST real render call -- reaches the same
-      "frame-returned" milestone a single bare frame call does, at exactly
-      95982 instructions: the same count the old (forced-command-3-on-every-
-      frame) version of this test pinned for its own "frame 0", now
-      correctly attributed to the first frame that is actually a render.
+      "frame-returned" milestone at 95063 instructions: close to, but not
+      identical to, the pre-lane-G1 pin (95982) -- expected, since
+      render_frame's own companding-copy loop (sharc_harness.py's own
+      section note above dma_landing_address()) now actually copies this
+      frame's REAL, correctly byte-swapped transfer from the hardware
+      landing zone, instead of copying whatever was left at RX_BASE by an
+      earlier direct poke of the SAME bytes; the small instruction-count
+      difference is data-dependent branching inside that copy/decode path,
+      not a stop.
     - frame 2 -- the SECOND real render call, on state carried over from
-      frame 1 -- hits the same unconfirmed opcode at 0x1c32b0 the old
-      version of this test hit one frame earlier (as its "frame 1"), at the
-      same 82549-instruction count: forcing command 3 on frame 0 was
-      running an extra, unreal render before the real one, off by exactly
-      one frame; fixing the command source does not change what
-      tools/sharc_core still cannot decode, only which capture-frame index
-      it shows up on. This is still a real, reproducible tools/sharc_core
-      gap (lane C3's own scope, not this lane's) -- an intended fix updates
-      this pin and says why, exactly like FRAME_MILESTONE's own docstring
-      asks.
+      frame 1 -- ALSO reaches "frame-returned" cleanly, at 95049
+      instructions, no longer hitting the unconfirmed opcode at 0x1c32b0
+      the pre-lane-G1 pin hit here: that gap was in a data-dependent branch
+      this real, ping-pong-delivered transfer does not exercise the same
+      way an all-frames-share-one-buffer direct poke did. `first_stop` is
+      therefore `None` for this whole three-frame run.
 
     ring_a_mono stays all-zero: the mix gate (docs/findings/06's still-open
     mix gate, DM(0x252d3c)) blocks the hand-set-up voice's output before it
     reaches the master mix, so this pins silence, not a rendered tone -- a
     fix to the mix gate changes this pin too. mix_gate_write/
     master_bus_decoded_write/slot_type_write all stay None across all three
-    frames: even a fully successful render (frame 1) never writes any of
-    lane C2's own target globals here, on this capture's own (all-zero
-    machine-type) per-track data -- see the lane's own report for why.
+    frames: even a fully successful render never writes any of lane C2's own
+    target globals here, on this capture's own (all-zero machine-type)
+    per-track data. fun_1c60a2_hits stays empty on every frame too --
+    consistent with lane E2/F2's own finding that a correctly-delivered
+    transfer still does not fill the companding record
+    (command_record_table, 0x266220) this gate reads (see this lane's own
+    report for why: the transfer fits inside command_word's own ring and
+    never reaches that second one).
     """
 
     @classmethod
@@ -222,6 +251,11 @@ class ReplayIdleCaptureTest(unittest.TestCase):
         self.assertEqual(result["other_voices_active_by_firmware"], {})
         self.assertIsNone(result["forced_command"])
         self.assertEqual(result["commands_seen"], {1: 1, 3: 2})
+        self.assertEqual(result["fun_1c60a2_total_hits"], 0)
+        self.assertFalse(result["any_companding_gate_pointer_nonzero"])
+        self.assertFalse(result["any_signal_without_injection"])
+        self.assertIsNone(result["provisional_interpretations"])
+        self.assertEqual(result["provisional_used"], [])
 
         frame0, frame1, frame2 = result["per_frame"]
 
@@ -234,24 +268,18 @@ class ReplayIdleCaptureTest(unittest.TestCase):
         self.assertEqual(frame1["command"], 3)
         self.assertEqual(frame1["stop_reason"], "frame-returned")
         self.assertEqual(frame1["stop_pc"], "0x1c75d3")
-        self.assertEqual(frame1["instructions"], 95982)
+        self.assertEqual(frame1["instructions"], 95063)
         self.assertTrue(frame1["master_bus_source_nonzero"])
 
-        # The second real render call hits the same unconfirmed opcode the
-        # old always-command-3 version of this test hit on its own "frame
-        # 1" -- one frame later here because frame 0 is no longer an extra,
-        # unreal render (see the class docstring).
+        # The second real render call, unlike the pre-lane-G1 pin, does NOT
+        # hit the unconfirmed opcode at 0x1c32b0 -- see the class docstring.
         self.assertEqual(frame2["command"], 3)
-        self.assertEqual(
-            frame2["stop_reason"],
-            "uncertain or undecodable form: source: firmware (undocumented; unconfirmed)",
-        )
-        self.assertEqual(frame2["stop_pc"], "0x1c32b0")
-        self.assertEqual(frame2["instructions"], 82549)
+        self.assertEqual(frame2["stop_reason"], "frame-returned")
+        self.assertEqual(frame2["stop_pc"], "0x1c75d3")
+        self.assertEqual(frame2["instructions"], 95049)
         self.assertTrue(frame2["master_bus_source_nonzero"])
 
-        self.assertEqual(result["first_stop"]["frame"], 2)
-        self.assertEqual(result["first_stop"]["pc"], "0x1c32b0")
+        self.assertIsNone(result["first_stop"])
 
         self.assertEqual(len(result["ring_a_mono"]), 96)
         self.assertEqual(max(abs(v) for v in result["ring_a_mono"]), 0.0)
@@ -263,7 +291,7 @@ class ReplayIdleCaptureTest(unittest.TestCase):
         # the hand-set-up one (voice 0, excluded) is ever marked ACTIVE by
         # the firmware itself; and none of the mix gate, the master-bus
         # decode destinations, or a voice record's own slot-type byte is
-        # ever written, even by frame 1's fully successful render.
+        # ever written, even by a fully successful render.
         for frame in (frame0, frame1, frame2):
             self.assertEqual(frame["voice_active_by_firmware"], {})
             self.assertEqual(
@@ -275,6 +303,8 @@ class ReplayIdleCaptureTest(unittest.TestCase):
             self.assertIsNone(frame["mix_gate_write"])
             self.assertIsNone(frame["master_bus_decoded_write"])
             self.assertIsNone(frame["slot_type_write"])
+            self.assertEqual(frame["fun_1c60a2_hits"], [])
+            self.assertFalse(frame["companding_gate_pointer_nonzero"])
 
 
 @pytest.mark.slow

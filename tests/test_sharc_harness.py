@@ -44,6 +44,22 @@ class DecimateTest(unittest.TestCase):
         self.assertEqual(h.decimate([]), [])
 
 
+class Swap16Test(unittest.TestCase):
+    """h._swap16(): swap the two bytes of every 16-bit unit -- see
+    write_dma_transfer()'s own docstring for why lane G1 needs this."""
+
+    def test_swaps_each_16_bit_unit(self):
+        self.assertEqual(
+            h._swap16(bytes([0x00, 0x03, 0x01, 0x02])), b"\x03\x00\x02\x01"
+        )
+
+    def test_odd_trailing_byte_untouched(self):
+        self.assertEqual(h._swap16(bytes([0x00, 0x03, 0xFF])), b"\x03\x00\xff")
+
+    def test_empty(self):
+        self.assertEqual(h._swap16(b""), b"")
+
+
 class WriteWavTest(unittest.TestCase):
     def test_round_trips_pcm16(self):
         SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -253,6 +269,71 @@ class FirmwareBackedTest(unittest.TestCase):
             h.companding_record_fields(init.runner.state, "dt2-1.16"),
             [0, 0, 0, 0],
         )
+
+    def test_dma_landing_address_targets_the_ring_not_pointed_at_by_shift(self):
+        # Lane G1 (2026-09-26): drive_dma_completion() toggles shift onto
+        # the buffer just filled, so the LANDING address for a NEW transfer
+        # is always the OTHER ring instance -- shift 0 (run_init()'s own
+        # starting value) lands at command_word's shift-1 instance.
+        init = h.run_init(self.memory, "dt2-1.16")
+        self.assertTrue(init.ran, init.error)
+        p = h.profile("dt2-1.16")
+        self.assertEqual(
+            h.dma_landing_address(init.runner.state, "dt2-1.16"),
+            p.command_word + 0x1000,
+        )
+        h._poke(init.runner.state, p.command_word_shift_src, 1)
+        self.assertEqual(
+            h.dma_landing_address(init.runner.state, "dt2-1.16"), p.command_word
+        )
+
+    def test_write_dma_transfer_then_drive_completion_yields_correct_command_word(
+        self,
+    ):
+        # This lane's own empirical finding: a naive byte-for-byte copy of
+        # the wire header (0x00, 0x03 big-endian for command 3) reads back
+        # as 0x300, not 3, at command_word -- block_handler's own range
+        # check (sw 0x1c750a-0x1c7511) would then always take the "clear"
+        # path. write_dma_transfer()'s own 16-bit-unit swap (default) fixes
+        # this; swap16=False reproduces the bug for the A/B.
+        init = h.run_init(self.memory, "dt2-1.16")
+        self.assertTrue(init.ran, init.error)
+        runner = h.new_runner(self.memory, "dt2-1.16", init=init)
+        payload = bytes([0x00, 0x03]) + bytes(100)
+
+        h.write_dma_transfer(runner.state, "dt2-1.16", payload)
+        new_runner = h.drive_dma_completion(runner, "dt2-1.16")
+        p = h.profile("dt2-1.16")
+        shift = h._dm_word(new_runner.state, p.command_word_shift_src)
+        cw_addr = p.command_word + (shift << 12)
+        self.assertEqual(h._dm_word(new_runner.state, cw_addr), 3)
+
+        runner2 = h.new_runner(self.memory, "dt2-1.16", init=init)
+        h.write_dma_transfer(runner2.state, "dt2-1.16", payload, swap16=False)
+        new_runner2 = h.drive_dma_completion(runner2, "dt2-1.16")
+        shift2 = h._dm_word(new_runner2.state, p.command_word_shift_src)
+        cw_addr2 = p.command_word + (shift2 << 12)
+        self.assertEqual(h._dm_word(new_runner2.state, cw_addr2), 0x300)
+
+    def test_drive_dma_completion_toggles_shift_and_rearms_copy_gate(self):
+        init = h.run_init(self.memory, "dt2-1.16")
+        self.assertTrue(init.ran, init.error)
+        runner = h.new_runner(self.memory, "dt2-1.16", init=init)
+        p = h.profile("dt2-1.16")
+        self.assertEqual(h._dm_word(runner.state, p.command_word_shift_src), 0)
+
+        new_runner = h.drive_dma_completion(runner, "dt2-1.16")
+        self.assertEqual(h._dm_word(new_runner.state, p.command_word_shift_src), 1)
+        gate = sr.st._dm_read(new_runner.state, h.COPY_GATE_ADDRESS, 1)
+        self.assertEqual(gate.value, 1)
+
+    def test_setup_frame_dma_does_not_poke_command_word(self):
+        runner = h.new_runner(self.memory, "dt2-1.16")
+        p = h.profile("dt2-1.16")
+        entry = h.setup_frame_dma(runner.state, "dt2-1.16", ring_flag=0)
+        self.assertEqual(entry, p.block_handler)
+        self.assertEqual(h._dm_word(runner.state, p.command_word_shift_src), 0)
+        self.assertEqual(h._dm_word(runner.state, p.command_word), 0)
 
     def test_setup_voice_reverse_seeds_phase_to_end_minus_one_sample(self):
         # Finding 06's "Flags and seed": "if set, it clears it and sets the

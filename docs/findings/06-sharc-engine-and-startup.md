@@ -4495,3 +4495,115 @@ independent method); no voice is armed by firmware from a real frame.
 - `tests/test_sharc_harness.py`: two new tests for the companding-record
   helpers.
 - No `tools/sharc_replay.py` or `sharc_core` changes.
+
+## Lane G1: the transfer is delivered at its real hardware address; delivery is no longer the blocker -- the mix gate / voice-arming problem is **[V][D][O]**
+
+Branch `work/sharc-emulator` @ `7b34792`. Full descriptor-chain and
+byte-order evidence is in docs/findings/04-coldfire-dsp-link.md's own new
+"Lane G1" section (it belongs there, next to lane D2's own SPI-slave driver
+work); this section covers what changed in the replay tooling and what a
+correctly-delivered transfer does, and does not, change downstream.
+
+**Summary of the address finding (full evidence in doc 04).** `0x2558dc`
+is `render_frame`'s own working copy of the real transfer, made by a
+2,048-byte copy every frame from the SPI-slave receive DMA's own real
+landing zone -- which is `command_word` itself (`0x264220`/`0x265220`,
+the SAME ping-pong pair `command_dispatch_fn`/`block_handler` already read
+their own pending command from), confirmed both from the receive
+descriptor's own construction (`FUN_1c7bd4`) and from `render_frame`'s own
+consumer-side `M10`. `FUN_1c77b4` (the driver callback this file's own
+"Task loop" section already names) is 9 instructions: it only toggles the
+ping-pong shift, on a specific event-code bit; it does not touch
+`ADDRSTART` or resubmit anything. A separate, previously-unknown gate
+(`DM(0x2567dc)`, self-clearing) guards `render_frame`'s own companding-copy
+block and had to be re-armed explicitly (`sharc_harness.
+drive_dma_completion()`) since no other writer of it was found.
+
+**Owned-file changes (this lane): `tools/sharc_harness.py`.** New section
+above `companding_record_fields()`: `dma_landing_address()` (the real
+ADDRSTART for a NEW transfer -- the ring `command_word_shift_src` is NOT
+currently pointing at), `write_dma_transfer()` (writes a captured frame's
+own TX bytes there, 16-bit-unit byte-swapped by default -- see doc 04's own
+byte-order paragraph -- `swap16=False` reproduces the pre-fix bug for an
+A/B), `drive_dma_completion()` (calls `FUN_1c77b4` with an event code that
+has bit 5 set, toggling the shift and re-arming the companding-copy gate;
+returns a fresh-call Runner the same way every other entry point in this
+module does), and `setup_frame_dma()` (like `setup_frame()` but does not
+poke `command_word` -- only `command_word_shift_src`/`ring_flag`).
+`tools/sharc_replay.py`: `replay()` now calls `write_dma_transfer()`/
+`drive_dma_completion()` per frame instead of poking `RX_BASE`/
+`command_word` directly, and uses `call_frame_collect_all_with_hits()`
+(already existed, lane E2) with a `0x1c60a2` breakpoint on every frame
+instead of the plain collect-all call, so `fun_1c60a2_hits`/
+`fun_1c60a2_total_hits` are real hit counts, not an inferred absence. The
+two stale, known-wrong candidate pokes (`--poke-candidates`,
+`--poke-transfer-tail`, `CANDIDATE_RX_BUFFERS`, `TRANSFER_TAIL_*`) are
+removed -- superseded by a confirmed real address, not merely deprioritised.
+`_write_bytes()` (the old unswapped, direct-poke helper) is kept only
+because `tools/sharc_inputs.py`'s own `dynamic_view()` still uses it for a
+separate, pre-existing purpose (a static "no writer" audit); `replay()`
+itself no longer calls it.
+
+**Replay result: `out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap`, all
+291 frames, no `--provisional` needed.** Every frame reaches
+`frame-returned` at `0x1c75d3` cleanly (`first_stop: None`) -- the
+undocumented-opcode gap earlier idle-capture replays hit (this file's own
+`ReplayIdleCaptureTest` pin, before this lane) does not recur once the
+transfer is delivered through the real ping-pong ring instead of a single,
+always-overwritten buffer. Confirms the transfer itself is genuinely
+flowing: track 2's machine-type field reads `2` (its real, kit-loaded
+value) in 290 of 291 frames, and `master_bus_source_nonzero` is true for
+the same 290 frames -- both read from `describe_frame()`'s parse of the
+DELIVERED bytes, i.e. the real per-track data is reaching the same
+DM range this document's own frame map always assumed it would.
+
+**What is STILL negative, now on much firmer footing.** With the transfer
+provably delivered at the correct address, in the correct byte order,
+every frame of a real 291-frame play capture:
+
+- `fun_1c60a2_total_hits: 0` -- `FUN_1c60a2` (the machine-type change
+  detector, lane E2) never runs, for the SAME reason lane E2/lane F2 found
+  under a synthetic/direct-poke frame: the pointer at `DM(0x254d78)`
+  (`command_record_table`'s own word +2, read by `render_frame`'s
+  companding loop) stays null on every single frame here too --
+  `any_companding_gate_pointer_nonzero: False`. This is now the EXPECTED
+  result, not merely the untested one: doc 04's own lane G1 section shows
+  the 2,748-byte transfer is smaller than the gap between `command_word`'s
+  own ring and `command_record_table`'s, so it structurally cannot reach
+  the second ring -- lane E2/F2's "no writer found" was correct, not an
+  artifact of a wrongly-delivered frame.
+- No track buffer, the master mix, or ring A ever goes nonzero on any
+  frame (`any_signal_without_injection: False`) -- real per-track data
+  reaching `render_frame`'s own decode is not, by itself, enough to make
+  a track's samples reach the master mix. This narrows this project's own
+  long-standing "no sound" problem firmly onto the mix gate
+  (`DM(0x252d3c)`, still three known writers, no runtime one found -- this
+  file's earlier sections) and the voice-arming path (still no writer of a
+  playing voice's word +0/`+0x1b8` found), NOT onto transfer delivery: that
+  explanation is now ruled out by this lane's own 291-frame run, not merely
+  unconfirmed.
+- No voice OTHER than the hand-set-up one is ever marked ACTIVE
+  (`other_voices_active_by_firmware: {}`), and none of the mix-gate/
+  master-bus-decoded/slot-type target globals (lane C2) are ever written.
+
+**Net for a future lane.** The remaining gap to audible, firmware-driven
+sound is the mix gate and/or the voice-arming trigger -- both already-named
+`[O]` items in this file's earlier sections -- not the DSPI2 transport this
+lane's own task set out to check. `tools/sharc_replay.py`'s own report
+(`--report OUT.json`) now carries `fun_1c60a2_total_hits`,
+`any_companding_gate_pointer_nonzero`, `any_signal_without_injection`,
+`companding_fields` (per frame), and `landing_base` (per frame, the real
+address each frame's transfer was delivered to) for a future lane to check
+without re-deriving this lane's own plumbing.
+
+### Tests / lint / types
+
+`uv run python -m pytest tests/test_sharc_replay.py tests/test_sharc_harness.py
+tests/test_sharc_inputs.py tests/test_lint.py tests/test_types.py
+tests/test_sharc_golden.py -q --slow`: all passing. `ReplayIdleCaptureTest`'s
+own pin is updated (both real-render frames now reach `frame-returned`
+instead of the second one hitting `0x1c32b0`) with the new numbers and why,
+per this file's own `FRAME_MILESTONE` convention. `RealFrameRingAMilestoneTest`
+(lane F2's own pin, unrelated call path -- `render_frames_to_ring_a()` does
+not go through `block_handler`/the real DMA path at all) is unaffected. No
+`sharc_core`/`sharc_symbols.py` changes; no golden hash changed.

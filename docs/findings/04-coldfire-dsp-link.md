@@ -2180,9 +2180,141 @@ R4=2)`, called from `FUN_1c7bd4`) and its sibling configuration helpers:
   that cannot hold any meaningful fraction of either the payload or the
   full transfer, and lies immediately before the live ring A/B/C/D DMA
   buffers (`0x261cc8`-`0x263938`) -- writing the full transfer there (tried
-  as a bounded, capped diagnostic poke in `tools/sharc_replay.py
-  --poke-transfer-tail`, bounded to this block's own `0x104`-byte size to
-  avoid stomping the rings) is not a plausible real destination. The two
-  addresses serve different roles of the *same* DSPI2 link: `0x261a10` is
-  the driver's own bookkeeping; `0x2558dc` is where the payload lands.
-  **[D]**
+  as a bounded, capped diagnostic poke, since removed -- see lane G1 below)
+  is not a plausible real destination. The two addresses serve different
+  roles of the *same* DSPI2 link: `0x261a10` is the driver's own
+  bookkeeping. **[C] Lane G1 (2026-09-26): `0x2558dc` is NOT where the
+  payload lands -- it is `render_frame`'s own working copy, made by a
+  2,048-byte copy every frame from the real landing zone. See lane G1
+  below for the real address and the copy itself.**
+
+## Lane G1: the receive DMA's own `ADDRSTART` is `command_word` itself; `0x2558dc` is render_frame's own working copy of it, not the landing zone **[V][D][O]**
+
+Answers lane D2's own open item ("the self-referencing sub-descriptor at
+`+0x24` is shaped like the same `DSCPTR_NXT, ADDRSTART, CFG, XCNT, XMOD,
+YCNT, YMOD` template ... but its own `ADDRSTART` field was not resolved
+statically here") from BOTH ends: the receive descriptor's own
+construction, and `render_frame`'s own consumption of it.
+
+**The descriptor-list ring, from `FUN_1c7bd4`'s own raw bytes.** This is
+the SPI-slave driver's setup routine lane D2 already names (it also calls
+`FUN_1c9fd5(R12=0x261a10)`, that lane's own control-block zero-fill). Read
+end to end (`sw` 0x1c7c60-0x1c7cc8), it builds a 2-node descriptor-list ring
+at DM `0x2641b0` (node 1) / `0x2641cc` (node 2), each node's own fields
+matching the SC58x/2158x Hardware Reference's own Descriptor-List Mode
+layout closely enough to identify them (out/refs/adsp-2156x-hwr, page
+~1262, "Table 27-10: Offsets for Descriptor-List Mode Parameters and
+Descriptors": `+0x00 DMA_DSCPTR_NXT`, `+0x04 DMA_ADDRSTART`, `+0x08
+DMA_CFG`, then `DMA_XCNT`/`DMA_XMOD` -- this lane did not pin the exact
+byte width of `CFG`/`XCNT` in this specific build, only the field
+identities and values):
+
+| field | node 1 (`0x2641b0`) | node 2 (`0x2641cc`) |
+| --- | --- | --- |
+| `DSCPTR_NXT` | `0x2641cc` (node 2) | `0x2641b0` (node 1) -- a 2-element circular list |
+| `ADDRSTART` | `0x265220` | `0x264220` |
+| `CFG` | `0x100000` | `0x100000` |
+| `XCNT` | `2` | `2` |
+
+`0x100000` = bit 20 of `DMA_CFG`, which the same HWR page (~1289, Table
+27-21) documents as `INT` field value `01` = "Interrupt When X Count
+Expires" -- i.e. "raise an interrupt on completion", not an endian/byte-
+order control (no such bit was found in `DMA_CFG`'s own documented fields
+at all -- see the byte-order paragraph below).
+
+**`ADDRSTART` is `command_word` itself.** `0x264220`/`0x265220` are
+EXACTLY `sharc_symbols.SYMBOLS`'s own `command_word + (shift<<12)`, shift
+0/1 -- the SAME address `command_dispatch_fn`/`block_handler` already read
+their own pending command from (docs/findings/06's "Task loop"). The SAME
+routine builds a second, identically-shaped ring at `0x2641e8`/(back to a
+head cell at `0x264204`) whose `ADDRSTART`s are `0x266220`/`0x267220`
+(`sw` 0x1c7cb9/0x1c7cbc) -- `command_record_table`'s own two ping-pong
+instances (docs/findings/06's lane F2). A captured DSPI2 transfer (2,748
+bytes, `dspiframe.FRAME_BYTES`) is smaller than one 0x1000-byte ring, so it
+never reaches this second ring -- consistent with lane F2's own finding
+that `command_record_table` is unwritten everywhere this project has run.
+
+**Confirmed independently from the CONSUMER side.** `render_frame`
+(`FUN_1c2b24`)'s own prologue (`sw 0x1c2b79`/`0x1c2b83`) saves its incoming
+`R12` argument (`command_word + (shift<<12)`, `command_dispatch_fn`'s first
+by-reference output, docs/findings/06's lane F2) into `M10`. Then
+`sw 0x1c2c71`-`0x1c2c8b` -- gated by a flag at `DM(0x2567dc)`, see below --
+copies 512 long-word (2,048-byte) reads starting AT `I4 = M10` into
+`I5 = 0x2558dc`. **So `0x2558dc` is `render_frame`'s own WORKING COPY of the
+real transfer, made fresh every frame it runs -- not the hardware landing
+zone this whole document's earlier sections assumed it was.** TX byte 0
+(the command header) is copied to `0x2558dc`'s own byte 0 unchanged: with
+this correction, `command_word` (word 0 of the ring) and `0x2558dc`'s own
+byte 0 are now understood to be the SAME transferred value, not two
+independently-arriving cells.
+
+**Byte order: a 16-bit-unit swap is needed for a native read to recover
+the ColdFire's own value, found empirically, not cited to a hardware bit.**
+Writing a captured frame's raw wire bytes (big-endian, `_u16be()`'s own
+convention) verbatim at `ADDRSTART` and reading `command_word` back with a
+plain 32-bit `DM` read (the SAME access `block_handler`'s own `sw 0x1c750a`
+uses) gives the WRONG value: a header of `0x00, 0x03` (command 3) reads
+back as `0x300`, not `3` -- `block_handler`'s own range check (`R1 =
+lshift(R2, -2); JUMP IF NOT SZ`) would then treat every real command as
+out-of-range and always take the "clear" path, never "render". Swapping
+each 16-bit unit's own two bytes before writing fixes this exactly
+(confirmed: reads back as `3`). No `DMA_CFG` bit documents this in the
+public HWR; this project's own tooling
+(`sharc_harness.write_dma_transfer()`) now applies the swap uniformly to
+the whole transfer (every per-track field this document's own frame map
+documents is itself 16-bit) as an **[O]** reproduction of an observed
+effect, not a cited register setting -- the real receive-side mechanism on
+silicon (a fixed property of how a 16-bit-peripheral-to-32-bit-DM DMA
+naturally lands data, most likely, given no software-configurable bit was
+found) is left open.
+
+**A second, still-open gate found while tracing this.** The whole
+companding-fields-plus-2,048-byte-copy block above is itself gated: `sw
+0x1c2c41`-`0x1c2c6e` reads `DM(0x2567dc)` (a byte) and skips the copy
+(`JUMP IF SV`) when it is 0 (PRM p.521: `leftz`'s `SV = result == 32`).
+Empirically, this byte reads `1` right after `run_init()` (so the first
+frame call after boot does run the copy), but the SAME block's own tail
+(`sw 0x1c2c88`-`0x1c2c8b`) writes it back to `M13`'s value at that point
+(`0` in every concrete run this lane made) -- so the gate SELF-CLEARS
+after one successful copy. `img.writers()` over `[0x2567dc, 0x2567dd)`
+finds no other resolved writer (several `base_only` candidates sit inside
+`unpack_track`/`FUN_1c24e9`'s own per-track decode body, close enough to be
+plausible but not resolved to this exact byte within this lane's budget).
+Real hardware must re-arm this every completed transfer, most likely
+through the same opaque ADI SSL ISR dispatch `FUN_1c77b4` (below) is
+reached through. `tools/sharc_harness.drive_dma_completion()` pokes this
+byte back to nonzero explicitly, alongside the ping-pong toggle, as the
+most faithful stand-in this lane could build -- an **[O]** substitute, not
+a traced firmware write. **[V][O]**
+
+**`FUN_1c77b4` itself is 9 instructions and does exactly one thing.**
+`R2 = btgl(R8, bit=5)` (toggle bit 5 of its own event-code argument R8,
+testing that bit's ORIGINAL value into SZ), `JUMP IF NOT SZ` skips the
+rest -- so only when bit 5 of R8 is set does it toggle
+`command_word_shift_src` (`DM(0x261ca4)`) via an XOR. No other memory is
+touched: no descriptor resubmission, no `ADDRSTART` rewrite. This lane
+reads that as "toggle the ring select on a transfer-complete event", with
+the SPI DMA channel's own descriptor-list auto-advance (the SC58x/2158x
+HWR's own "Descriptor-List Mode": the channel loads `DMA_DSCPTR_NXT` into
+`DMA_DSCPTR_CUR` on its own at the end of a work unit) doing the actual
+double-buffer re-arming in hardware, invisibly to SHARC code -- consistent
+with `has_static_caller: 0` (reached only through the ADI SSL library's own
+generic ISR dispatch). Bit 5's own ADI SSL event-code meaning was not
+decoded. **[V][D]**
+
+**Net: the exact landing map for the 2,748-byte transfer.** TX bytes
+[0, ~0x800) (the 0x802-byte real payload this document's own frame map
+already documents, 16-bit-unit swapped) land at `command_word`'s own
+active ping-pong instance (`0x264220` or `0x265220`); TX byte 0-1 (the
+command header) IS `command_word`'s own low bytes, not a separate cell.
+The transfer never reaches `command_record_table` (`0x266220`/`0x267220`)
+-- that second ring is provisioned in hardware identically, but a 2,748-
+byte transfer is smaller than the 4,096-byte gap between the two rings.
+`tools/sharc_replay.py` now delivers a captured frame there
+(`sharc_harness.write_dma_transfer()`/`drive_dma_completion()`) and lets
+`render_frame`'s own execution do the 2,048-byte copy into `0x2558dc`,
+instead of poking `0x2558dc`/`command_word` directly -- see
+docs/findings/06's own lane G1 section for the resulting replay (all 291
+frames of `dt2-1.16-play-pretracks-fulltx.dt2cap` reach `frame-returned`
+cleanly; the mix-gate/voice-arming problem, not transfer delivery, is
+confirmed as what still blocks sound). **[V]**
