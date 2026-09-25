@@ -3439,3 +3439,47 @@ the voice records.
 zero-fill unless word +0 and byte +0x1b8 are non-zero. Trigger: `0x1c6553
 compu(R6, 6)`, `0x1c6561 JUMP IF GE 0x1c65fe` (unsigned), `0x1c6579 JUMP
 (M13, I12)` through `0x8055c840`. STRETCH: **[D]**.
+
+## Voice call convention, sample pointer and init, from execution (2026-09-25)
+
+Checked with two independent agents: one from the image bytes and the
+public manual, one from database dataflow and concrete execution
+(`tools/sharc_run.py`, `tools/sharc_harness.py`).
+
+**Call convention [V][C].** `FUN_1c2b24` loads `R4 = 0x2412c8` (`0x1c3080`)
+and calls `FUN_1c642a` (`0x1c3083`), which saves it at `DM(I6-4)`
+(`0x1c6479`). The dispatch loop computes `R13 = DM(I6-4) + 4` = `0x2412cc`,
+adds `R11 = 0x1d8` (`0x1c6a80`) per voice, and passes `R4 = R13` to both
+`0x1c5576` and `0x1c4ecf`. `I5 = DM(I6-4) + 0xdc64` = `0x24ef2c` confirms the
+workspace value. So `R4` is the record base `0x2412cc + v*0x1d8`, and every
+record offset in this finding is relative to it. **[C]** An earlier
+emulator harness passed base + 4.
+
+**Word +0 is the sample pointer [V].** `0x1c4ecf` reads it (`0x1c4f15`,
+`R4 = DM(I4,M5)`) and zero-fills when it is 0 (`leftz`, `JUMP IF SV`).
+`0x1c4f81` loads it into I0 (`0x1c504a`) before rebasing I4 (`0x1c504c`);
+the `DO 64` loop (`0x1c5096`) reloads `I4 = I0` each pass (`0x1c50a4`) and
+reads the taps through it. By execution, the loop reads only the buffer
+word +0 points to, in order; with word +0 = 0 the render returns after 61
+instructions without reaching `0x1c4f81`. **[O]** The firmware writer of
+word +0 for a playing voice is not yet found.
+
+**Coefficient reads [V].** The loop's coefficient loads (`0x1c50b9`,
+`0x1c50c4`, `0x1c50c8`) are Type 15b `(lw)`: a register pair read from
+(address, address+4) with the unqualified displacement scale (SHARC+ PRM
+pp.393-395, p.191). Execution shows pairs from `0x25d940` onwards.
+
+**RFRAME in a tail call [V].** `0x1c12bc` is a delayed `JUMP` to
+`0x1c12d5`; its delay slot `0x1c12bf` holds `RFRAME` (`I7 = I6, I6 =
+DM(0,I6)`, PRM Table 17-2 p.419). The manual gives RFRAME no context
+restriction. The PRM's Figure 17-12 (Type25c) repeats Figure 17-11's bit
+pattern; the 16-bit encoding `0x1901` in the firmware matches the classic
+SHARC programming reference (rev 2.4, p.471).
+
+**Init writes [V][D].** `FUN_1c15e3` runs to its return in the emulator
+(1,243,445 instructions). It calls `0x1c7442` 32 times; `0x252d78` receives
+the 32 words at `0x24ef2c`; `0x253df8[k] = 0x252df8 + k*0x80` for k = 0..31.
+**[V]** These match the static reading above. **[D]** (one run) Every
+voice's word +0 = `0x8045a6c8` (the `R8` argument) and +0x1b8 = 0, so a
+non-null word +0 alone does not mean a sample is assigned; +0x1a4 reads 184
+for every voice. **[O]** What `0x1c7442` stores in the other record words.
