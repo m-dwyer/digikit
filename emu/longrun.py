@@ -9,6 +9,7 @@ hooks dspboot.run installs (flash HLE, completion-semaphore patch, ISA patches,
 MMIO, exceptions) and restores a snapshot onto it. Resuming onto a bare Machine
 instead silently drops those hooks and the run diverges -- see snapshot.py.
 """
+import argparse
 import struct
 import sys
 import os
@@ -57,7 +58,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
           modeled_vectors=None,
           trace=None, trace_path=None, trace_ranges=(), trace_registers=None,
           deferred_components=(), idle_yield=20000, ssi0_request_hz=None,
-          ssi0_legacy_upgrade=False, dspi2_peer=None):
+          ssi0_legacy_upgrade=False, dspi2_peer=None, ssi0_peer=None):
     """Stand up a hooked Machine and restore `snapshot` onto it.
 
     -> (m, ev, st, pc, inq, at) where `at(addr, fn)` registers a further
@@ -223,6 +224,15 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
     driver's eDMA/DSPI2 writes are unmodeled exactly as before this
     parameter existed. Pass an `emu.dspi2` peer (e.g. `ZeroPeer()` or
     `RecordingPeer()`) to install it with that peer.
+
+    ``ssi0_peer`` is the SSI0-side counterpart: forwarded to
+    `emu.ssi.install`'s own ``peer=`` (see that module's "SSI0 peer hook"),
+    so it only has any effect together with ``ssi0_request_hz``. None
+    (default): unchanged from before this parameter existed (RX destination
+    bytes untouched, TX bytes only tracked). `emu.sharc_peer.SharcServerPeer`
+    implements both this and ``dspi2_peer`` at once, so one instance wired to
+    both parameters answers the periodic control frame and the sample stream
+    together -- see that module's docstring.
     """
     if trace is not None and trace_path is not None:
         raise ValueError('pass either trace or trace_path, not both')
@@ -411,6 +421,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
             request_hz=int(ssi0_request_hz),
             instr_per_sec=INSTR_PER_SEC,
             force_rte=profile.ssi0_dma_force_rte,
+            peer=ssi0_peer,
         )
 
     if dsp:                            # see emu/dsp.py
@@ -976,9 +987,52 @@ def spin(m, pc, instrs, chunk=500_000, on_chunk=None, tick=False, pits=None,
     return pc, done, stop
 
 
-def main(snapshot, instrs, chunk=500_000, send=b'', unblock=False, fast=False):
+def main(snapshot, instrs, chunk=500_000, send=b'', unblock=False, fast=False,
+         sharc_process=False, sharc_backend='stub', sharc_audio_mode='silence',
+         sharc_python='pypy', sharc_advance_every=None, ssi0_request_hz=None,
+         ssi0_legacy_upgrade=False):
+    """Resume `snapshot` and run `instrs` instructions. -> (m, ev, done, dt, stop).
+
+    ``sharc_process=True`` wires an `emu.sharc_peer.SharcServerPeer` (see that
+    module) as both the DSPI2 and SSI0 peer -- launching `tools/sharc_proc.py`
+    as a subprocess -- and switches `spin()` to the timer-deadline (`pits`)
+    stepping that peer's `step`/`service` need, since a write-triggered chunk
+    boundary alone cannot host a peer with its own clock (see `spin`'s
+    docstring, "`async_events` require the shared timer clock"). The peer
+    itself is left running and reachable at ``ev['sharc_peer']`` (with its
+    round-trip timing on ``.exchange_count``/``.exchange_seconds`` and further
+    detail via ``.stats()``) for a caller to close explicitly; it is not
+    closed here, so a caller inspecting it after `main()` returns still can.
+    ``ssi0_request_hz`` is required with ``sharc_process=True`` (`emu.ssi`
+    needs an explicit rate; see `build`'s docstring).
+    """
+    peer = None
+    build_kwargs = {}
+    if sharc_process:
+        if ssi0_request_hz is None:
+            raise ValueError('sharc_process=True requires ssi0_request_hz')
+        from emu import config
+        from emu.sharc_peer import SharcServerPeer
+        image_path = os.path.join(config.sections_dir(), 'section_7_BLOB.bin')
+        image_sha256 = None
+        if os.path.exists(image_path):
+            image_sha256 = hashlib.sha256(open(image_path, 'rb').read()).hexdigest()
+        else:
+            image_path = None
+        peer = SharcServerPeer(
+            image_path=image_path, image_sha256=image_sha256, device='dt2',
+            prefer=sharc_python, backend=sharc_backend,
+            audio_mode=sharc_audio_mode, advance_every=sharc_advance_every)
+        build_kwargs = {
+            'dspi2_peer': peer, 'ssi0_peer': peer,
+            'ssi0_request_hz': ssi0_request_hz,
+            'ssi0_legacy_upgrade': ssi0_legacy_upgrade,
+        }
+
     m, ev, st, pc, inq, at = build(snapshot, send, unblock=unblock,
-                                   softfloat=fast, bitmap=fast)
+                                   softfloat=fast, bitmap=fast, **build_kwargs)
+    if peer is not None:
+        ev['sharc_peer'] = peer
     t0 = time.time()
 
     def note(pc_, done):
@@ -987,16 +1041,65 @@ def main(snapshot, instrs, chunk=500_000, send=b'', unblock=False, fast=False):
                   % (done//1_000_000, time.time()-t0, len(ev['tasks']),
                      len(ev['prints']), setpixel_count(ev)), flush=True)
 
-    pc, done, stop = spin(m, pc, instrs, chunk, on_chunk=note)
+    if sharc_process:
+        from emu.dtim import Dtims, Timers
+        from emu.pit import Pits
+        pits = Timers(Pits(m), Dtims(m, channels=(3,)))
+        ssi0 = ev.get('ssi0_dma')
+        if ssi0 is not None:
+            # Same alignment tools/guirun.py does after a legacy upgrade:
+            # arm_legacy() (inside build()) sets ssi0.next from ssi0.now,
+            # which is only correct if that matches the fresh Pits/Timers
+            # clock spin() is about to drive it with -- see emu/ssi.py's
+            # Ssi0Dma.align docstring.
+            ssi0.align(pits.now)
+        async_events = tuple(
+            e for e in (ev.get('dspi2'), ssi0, peer) if e is not None
+        )
+        pc, done, stop = spin(m, pc, instrs, chunk, on_chunk=note,
+                              pits=pits, async_events=async_events)
+    else:
+        pc, done, stop = spin(m, pc, instrs, chunk, on_chunk=note)
     return m, ev, done, time.time()-t0, stop
 
 
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description='Resume a snapshot and run a bounded number of instructions.')
+    p.add_argument('snapshot')
+    p.add_argument('instrs', type=lambda s: int(s, 0))
+    p.add_argument('send', nargs='?', default='',
+                    help='sent to UART8 (with a trailing CRLF) before running')
+    p.add_argument('--unblock', action='store_true',
+                    default=bool(os.environ.get('UNBLOCK')))
+    p.add_argument('--fast', action='store_true',
+                    default=bool(os.environ.get('FAST')))
+    p.add_argument('--sharc-process', action='store_true',
+                    help='wire a tools/sharc_proc.py subprocess as the DSPI2 '
+                         'and SSI0 peer (see emu/sharc_peer.py)')
+    p.add_argument('--sharc-backend', choices=('stub', 'runner'), default='stub')
+    p.add_argument('--sharc-audio-mode', choices=('silence', 'tone'), default='silence')
+    p.add_argument('--sharc-python', choices=('pypy', 'cpython'), default='pypy')
+    p.add_argument('--sharc-advance-every', type=lambda s: int(s, 0), default=None,
+                    help='ColdFire instructions between ADVANCE messages')
+    p.add_argument('--ssi0-request-hz', type=int, default=None,
+                    help='required with --sharc-process; emu.ssi request rate')
+    p.add_argument('--ssi0-legacy-upgrade', action='store_true',
+                    help='claim a pre-existing snapshot\'s already-programmed '
+                         'SSI0 TCDs (see emu.longrun.build\'s docstring)')
+    return p.parse_args(argv)
+
+
 if __name__ == '__main__':
-    snap = sys.argv[1]; n = int(sys.argv[2])
-    send = (sys.argv[3]+'\r\n').encode() if len(sys.argv) > 3 else b''
-    m, ev, done, dt, stop = main(snap, n, send=send,
-                                 unblock=bool(os.environ.get('UNBLOCK')),
-                                 fast=bool(os.environ.get('FAST')))
+    args = parse_args(sys.argv[1:])
+    send = (args.send + '\r\n').encode() if args.send else b''
+    m, ev, done, dt, stop = main(
+        args.snapshot, args.instrs, send=send, unblock=args.unblock,
+        fast=args.fast, sharc_process=args.sharc_process,
+        sharc_backend=args.sharc_backend, sharc_audio_mode=args.sharc_audio_mode,
+        sharc_python=args.sharc_python, sharc_advance_every=args.sharc_advance_every,
+        ssi0_request_hz=args.ssi0_request_hz,
+        ssi0_legacy_upgrade=args.ssi0_legacy_upgrade)
     print('\n=== %d instrs in %.0fs (%.2fM/s) stop=%s ===' % (done, dt, done/dt/1e6, stop))
     print('new tasks : %d' % len(ev['tasks']))
     print('prints    : %d' % len(ev['prints']))
@@ -1004,6 +1107,18 @@ if __name__ == '__main__':
     print('distinct TCBs scheduled: %d   pends satisfied: %d'
           % (len(ev['switch']), ev['satisfied']))
     print('uart out  : %r' % bytes(ev['uart_out'])[:200])
+    if 'sharc_peer' in ev:
+        # Printed before the framebuffer dump below: that dump assumes an
+        # early-boot framebuffer struct still lives at a fixed address, which
+        # does not hold for every resumed snapshot (pre-existing; unrelated
+        # to sharc_process) -- put this new diagnostic somewhere it is never
+        # skipped by that one failing.
+        peer = ev['sharc_peer']
+        print('sharc_peer: backend=%s pid=%s frames=%d exchange avg=%.3fms stats=%r'
+              % (peer.backend_name, peer.server_pid, peer.frames,
+                 1000.0 * peer.exchange_seconds / peer.exchange_count
+                 if peer.exchange_count else 0.0, peer.stats()))
+        peer.close()
     w,h,buf = struct.unpack('>III', m.uc.mem_read(0x4028ae98, 12))
     px = bytes(m.uc.mem_read(buf, w*h))
     print('intro framebuffer 0x%08x nonzero: %d/%d' % (buf, sum(1 for b in px if b), w*h))
