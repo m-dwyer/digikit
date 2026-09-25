@@ -850,13 +850,27 @@ class RingAMilestoneTest(unittest.TestCase):
     constant's own docstring in tools/sharc_harness.py for the full
     evidence): without it, ring A goes silent from frame 1 onward given
     this lane's blank synthetic mix configuration -- real firmware
-    behaviour, not an emulator bug, per that investigation. This changed
-    every frame's own output (the old pin was measuring a per-frame
-    cold-start declick transient repeated four times, not a continuous
-    tone), so the digest below is a new pin, not the same value. A future
-    fix to the mix gate or the master-bus parameter table (see
-    docs/findings/06) changes this pin again, and the commit that does so
-    should say why, exactly like FRAME_MILESTONE's own docstring asks.
+    behaviour, not an emulator bug, per that investigation.
+
+    **Updated again (lane D1, 2026-09-25): injection moved past the
+    per-track mixer, onto the master mix itself.** `FUN_1c207b`'s own
+    per-track dispatch never carries a track's sample values into the
+    master mix under any state this lane found (see the "why the track
+    buffer never reaches the master mix as audio" module note above
+    `MASTER_MIX_INJECT_PC` in tools/sharc_harness.py) -- what
+    `inject_track_buffer()` alone produced there was a sparse,
+    compressor-envelope-shaped signal, not the injected tone. This test
+    now checks `ring_a_left`/`ring_a_right` (not `ring_a_mono`): ring A's
+    own L channel is deliberately negated in-place by real firmware code
+    right after conversion (see that same module note), so a coherent
+    signal written identically to both master-mix channels arrives at ring
+    A as `(-L, +R)` -- `ring_a_mono`'s own `0.5*(left+right)` downmix
+    cancels such a signal to (near) silence, which is real, not a
+    regression to chase. This changed every frame's own output again, so
+    the digest below is a new pin, not the same value. A future resolution
+    of the per-track mixer/mix-gate maze (see docs/findings/06 and the
+    report) changes this pin again, and the commit that does so should say
+    why, exactly like FRAME_MILESTONE's own docstring asks.
     """
 
     @classmethod
@@ -872,20 +886,30 @@ class RingAMilestoneTest(unittest.TestCase):
             self.assertEqual(frame["halt"], "return without followed call")
             self.assertGreater(frame["injected_max_abs"], 0.0)
 
-        ring = result["ring_a_mono"]
-        self.assertEqual(len(ring), 4 * 32)
+        left = result["ring_a_left"]
+        right = result["ring_a_right"]
+        self.assertEqual(len(left), 4 * 32)
+        self.assertEqual(len(right), 4 * 32)
         # Real, non-silent signal reached ring A (the DAC-facing buffer) --
-        # this is the core claim this milestone pins.
-        self.assertGreater(max(abs(v) for v in ring), 0.0)
+        # this is the core claim this milestone pins -- on EACH channel,
+        # not just a mono downmix that can cancel a coherent signal (see
+        # the class docstring's "ring A's own L channel" note).
+        self.assertGreater(max(abs(v) for v in left), 0.0)
+        self.assertGreater(max(abs(v) for v in right), 0.0)
+        # L is the negation of R for this lane's own mono-duplicated
+        # injection (see the class docstring): pin that relationship too,
+        # not just each channel's own magnitude.
+        for l_sample, r_sample in zip(left, right, strict=True):
+            self.assertAlmostEqual(l_sample, -r_sample, places=5)
 
         # Deterministic output: pin it, rounded to 6 decimal places (float
         # repr noise only) by hash, the same convention
         # tests/test_sharc_golden.py uses for its own outputs.
-        rounded = [round(v, 6) for v in ring]
+        rounded = [round(v, 6) for v in left] + [round(v, 6) for v in right]
         digest = hashlib.sha256(repr(rounded).encode()).hexdigest()
         self.assertEqual(
             digest,
-            "cf5187104e0db4496fc40f81b67c6ba87be7dd08d1a3f007064d0c4cea72c97c",
+            "88335070b1bd16edf007a8f4e67815d50e4c64bcd9e87ab88a0020e42050d071",
         )
 
 

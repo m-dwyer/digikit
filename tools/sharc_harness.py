@@ -1428,6 +1428,175 @@ def inject_track_buffer(state, record: int, *, track: int = 0) -> list[float]:
     return decimated
 
 
+# --- Why the track buffer never reaches the master mix as audio (lane D1,
+# 2026-09-25), and injecting past it instead -----------------------------
+#
+# `inject_track_buffer()`'s own format/address assumption (32 planar L
+# floats then 32 planar R floats at `0x252df8 + t*0x100`, `TRACK_MIX_BASE`
+# above) is CORRECT -- confirmed by execution: `FUN_1c207b`'s own per-track
+# dispatch loop (`0x1c20e7`-`0x1c212a`, a `DO...UNTIL LCE` over all 16
+# tracks) walks `I13` from `TRACK_MIX_BASE` in `TRACK_MIX_STRIDE` steps and
+# reads/writes exactly the byte offsets `track_mix_address()` computes.
+# **The problem is downstream of that: this loop's own per-track branch
+# never carries the track's own sample VALUES into the master mix at all,
+# under any of the three states this lane exhaustively tried.** Per track,
+# `R2` (the loop counter, 0..15) is bit-tested against two masks read once
+# per track: `R8 = DM(0x252728)` (`0x1c20e7`) and `R4 = DM(0x252538)`
+# (`0x1c20b9`), giving exactly three outcomes, all checked by execution
+# with watchpoints on `0x252df8`-`0x253df8` and `0x25f180`-`0x25f280`:
+#
+#   1. `btst(R8, R2)` bit set -> `JUMP IF NOT SZ` (`0x1c20f4`) skips
+#      straight to `0x1c2121` (next track): the track buffer is never
+#      touched at all.
+#   2. Bit clear in (1), then `btst(R4, R2)` bit clear -> `JUMP IF SZ`
+#      (`0x1c20f9`) falls through into `FUN_1c238a` (`0x1c245b`, reached by
+#      a plain in-function JUMP, not a CALL -- `tools/sharcdb.py`'s own
+#      function-boundary split puts it in a *different* `functions` row,
+#      which is why an earlier pass of this lane's own pc-range filter
+#      wrongly reported zero track-buffer activity here). This is the
+#      DEFAULT outcome from any synthetic `run_init()` state (both masks
+#      read all-zero -- see below), and it DOES read the track buffer
+#      (confirmed: `0x1c246c`/`0x1c2472` fire on `DM(0x252df8)` range with
+#      no patches at all).
+#   3. Bit clear in (1), bit set in (2) -> falls through to `0x1c20fc`,
+#      the "normal" path this lane originally assumed was the summer: also
+#      reads the track buffer (via a hand patch setting `DM(0x252538)`
+#      bit 0, since it never happens by default).
+#
+# Both (2) and (3) run the SAME 16-iteration copy idiom (`0x1c2106`-
+# `0x1c211b` / `0x1c2466`-`0x1c247b`): per iteration the loop advances its
+# own OWN track-side pointer by only 2 words (8 bytes), so across 16
+# iterations it visits word offsets `{0, 2, 4, ..., 30}` of each 32-word
+# channel half and NEVER `{1, 3, 5, ..., 31}` -- a real, confirmed
+# half-decimation of whatever the track buffer holds. But that isn't even
+# the dominant effect: dumping the copy's own destination scratch buffer
+# (`0x254878` for path (3)) after a full run shows the copied VALUES are
+# exactly the injected samples (still smooth, still correlated with a
+# ramp/sine's own shape) -- so the copy itself is faithful, just to a
+# SCRATCH buffer, not to the master mix. **The master mix's own 64 words
+# are separately, unconditionally overwritten every frame by a THIRD piece
+# of this same function** (`0x1c2200`-`0x1c2385`, `CALL 0xb82d41`/
+# `CALL 0x1cb3d8` -- the dynamics/compressor stage docs/findings/06 and
+# lane B2 already named, and the same `R1`/`R2`/`R12` scalars
+# `CONTINUOUS_MIX_SCALAR_PATCH` pins), which reads/writes `DM(0x25f180)`/
+# `DM(0x25f200)` directly (via `I2 = R4`, `FUN_1c207b`'s own first
+# argument, confirmed `== 0x25f180` at its call site `0x1c771b`/`0x1c771e`
+# in the block handler) through a recursive envelope-follower/soft-clip,
+# NOT a read of the per-track copy's own destination buffer. **Proven by a
+# discriminating experiment, not just by reading the disassembly:**
+# injecting a CONSTANT level (0.2 into every one of a track's 64 samples)
+# in place of the ramp/sine produces the SAME sparse addressing pattern
+# (identical indices populated) but DIFFERENT, smoothly-decaying values at
+# those indices (a decay trajectory shaped like an RC/compressor
+# time-constant, not a repeated constant) -- so what reaches the master
+# mix tracks the compressor's own internal envelope state, not the track
+# buffer's per-sample content, regardless of stride or branch taken. Two of
+# the three masks feeding this whole dispatch (`0x1c2e0e`'s own write of
+# `DM(0x252728)`, `0x1c2e58`'s own write of `DM(0x252538)`) are themselves
+# decoded every frame from a >0x6ac-byte span of DM memory
+# (`0x255908`-`0x25600a`) that reads all-zero in every capture and every
+# synthetic `run_init()` state this project has -- the same class of
+# "no real kit/mixer configuration is ever loaded here" gap
+# `CONTINUOUS_MIX_SCALAR_PATCH`'s own note and lane B2's report already
+# flagged for the neighbouring master-bus parameter table. **This lane did
+# not find a way to make the real per-track summation carry audio-rate
+# content into the master mix** with the information available (the
+# control table's real bit layout, and whether a genuine "no real mixer
+# configured" state ever produces a clean signal on real hardware, are
+# both still open -- see the report). Given that, and this lane's own
+# brief (get a clean tone into ring A), the fix taken here is to inject
+# PAST this entire unresolved stage, at the one place C1's own report
+# already proved is a lossless, bit-exact copy of whatever the master mix
+# holds (`tools/sharc_dac.py`'s own module docstring) -- the same kind of
+# "bypass the not-yet-resolved stage, document the hypothesis" move
+# `inject_track_buffer()` above already makes for `FUN_1c642a`'s own
+# accumulate stage, one stage further downstream.
+#
+# `FUN_1c74a1` (the Q31/ring-A converter) is called at sw `0x1c7734`,
+# inside the audio task's block handler, immediately after `FUN_1c2b24`
+# (the whole render orchestrator -- `CALL` at sw `0x1c771e`, `R4 =
+# 0x25f180` set at `0x1c771b`) has returned for this frame; the only code
+# between those two calls (`0x1c7721`-`0x1c7731`) sets up the ring-A
+# destination pointer/flag and touches nothing in `0x25f180`-`0x25f280`
+# (confirmed by disassembly and by execution). A write placed exactly here
+# lands after `FUN_1c207b`'s own dynamics loop has already finished
+# clobbering the master mix for this frame, and before anything reads it
+# back for conversion -- the same "confirmed by execution to run after
+# this point" placement rule `MASTER_STAGE_CALL_PC` above already
+# documents, one call frame up.
+MASTER_MIX_INJECT_PC = 0x1C7734
+
+# --- Ring A's own L channel is deliberately negated after conversion
+# (lane D1, 2026-09-25; new finding, not a fix) ---------------------------
+#
+# The first render through `MASTER_MIX_INJECT_PC` produced a "silent" mono
+# downmix (`ring_a_mono` all zero, `power_ratio` 0.0) even though
+# `injected_max_abs` was clearly nonzero and `read_master_mix()` showed the
+# expected samples, in BOTH the L and R halves (this lane writes the same
+# value to both, matching `inject_track_buffer()`'s own mono convention).
+# Traced with a write watchpoint on the ring-A destination word
+# (`0x261cc8`, ring A L position 0): `FUN_1c74a1` itself stores the
+# CORRECT, positive Q31 value there (confirmed: raw store value
+# `214748368` for a `0.1` input, matching `0.1 * 2**31` to rounding) --
+# `FUN_1c74a1`/`fix_by` is NOT the bug lane C1's own isolated test already
+# said it wasn't. But a SECOND write to the SAME address happens moments
+# later, before the frame's own `RETURN`: a dedicated 16-iteration loop at
+# sw `0x1c758b`-`0x1c75a2` (`I4 = ring-half-offset + 0x261cc8`, i.e. the
+# SAME half `FUN_1c74a1` just wrote) that does `R1 = neg(R2)` /
+# `R2 = neg(R2)` on every word it touches and stores the results straight
+# back -- reached unconditionally every frame between `CALL FUN_1c74a1`
+# (`0x1c7734`) and `FRAME_MILESTONE` (`0x1c75d3`), confirmed by execution
+# to touch only the L-channel (even) words of the half just written, never
+# the R-channel (odd) ones (watched: only `0x261cc8` got a second write;
+# `0x261ccc`, R position 0, got exactly one write, from `FUN_1c74a1`
+# itself). **This is real, deliberate firmware code, not an emulator
+# artifact** -- a plain `neg()` compute op, not a decode gap or a width
+# mismatch, executed on data `FUN_1c74a1` had already written correctly.
+# The most likely explanation is a genuine hardware/output convention
+# (e.g. an inverting stage on the L channel only, or an intentional
+# stereo-phase convention); this lane did not chase why, only confirmed
+# that it happens, unconditionally, every frame, and that it means: ring
+# A's own L channel is the exact negation of `read_master_mix()`'s own L
+# channel, while R matches directly.
+#
+# **Consequence for measurement, not a bug to route around:** a coherent
+# signal written identically to both master-mix channels (as
+# `inject_master_mix()` does) arrives at ring A as `(-L, +R)` with equal
+# magnitude -- so the OLD `ring_a_mono = 0.5*(left+right)` downmix
+# `render_frames_to_ring_a()` used to compute cancels to exactly zero for
+# such a signal (which is what made this lane's own first full render look
+# completely silent). `render_frames_to_ring_a()` below now also returns
+# `ring_a_left`/`ring_a_right` (undownmixed) so a caller measures each
+# channel on its own -- exactly what the report's own brief asks for
+# ("THD+N per channel") -- instead of through a downmix that assumes the
+# channels are in phase. `ring_a_mono` is kept for callers that still want
+# it (e.g. comparing against noise-like, non-phase-related content from an
+# earlier lane), documented here as unreliable for a coherent tone.
+
+
+def inject_master_mix(state, samples: Sequence[float]) -> list[float]:
+    """Write SAMPLES (mono; up to `sharc_dac.MASTER_MIX_CHANNEL_WORDS`,
+    zero-padded if shorter) as identical float32 words into both the L and
+    R halves of the master mix (`sharc_dac.MASTER_MIX_BASE`/
+    `MASTER_MIX_R_OFFSET_WORDS`, lane C1's own confirmed format) at
+    `MASTER_MIX_INJECT_PC` -- see this section's own module note for why
+    the master mix, not the track buffer, is the right injection point
+    for a clean tone today. Returns the (possibly zero-padded) list
+    actually written, for a caller to log or compare."""
+    channel_words = sharc_dac.MASTER_MIX_CHANNEL_WORDS
+    padded = list(samples[:channel_words])
+    padded += [0.0] * (channel_words - len(padded))
+    for i, value in enumerate(padded):
+        word = _float_to_word(value)
+        _poke(state, sharc_dac.MASTER_MIX_BASE + i * 4, word)
+        _poke(
+            state,
+            sharc_dac.MASTER_MIX_BASE + (sharc_dac.MASTER_MIX_R_OFFSET_WORDS + i) * 4,
+            word,
+        )
+    return padded
+
+
 def call_frame_with_track_injection(
     runner: sr.Runner,
     image: str,
@@ -1436,6 +1605,7 @@ def call_frame_with_track_injection(
     track: int = 0,
     patch_table: sv.PatchTable | None = FRAME_PATCH_TABLE,
     max_steps: int = 4_000_000,
+    write_master_mix: bool = True,
 ) -> tuple[sr.Runner, sr.RunResult, list[float]]:
     """Like `call_frame()`, but calls `inject_track_buffer()` the instant
     `MASTER_STAGE_CALL_PC` is about to execute -- see this section's own
@@ -1448,6 +1618,17 @@ def call_frame_with_track_injection(
     function's whole point is to observe the master stage's own,
     unperturbed behaviour once it has real per-track input.
 
+    When WRITE_MASTER_MIX is true (the default), the SAME 32 samples
+    `inject_track_buffer()` just computed are also written straight into
+    the master mix (`inject_master_mix()`) the instant
+    `MASTER_MIX_INJECT_PC` is about to execute, later in this same
+    step loop -- see the "why the track buffer never reaches the master
+    mix as audio" module note above `MASTER_MIX_INJECT_PC` for why this is
+    necessary to get a clean tone out at all, not just the accumulate
+    stage's own unperturbed per-track input. Pass `False` to get the old
+    (pre-lane-D1) track-buffer-only behaviour, e.g. to keep studying
+    `FUN_1c207b`'s own per-track dispatch in isolation.
+
     Returns `(new_runner, RunResult, injected)` where `injected` is
     `inject_track_buffer()`'s own 32-float return, or `[]` if
     `MASTER_STAGE_CALL_PC` was never reached (an earlier stop)."""
@@ -1459,8 +1640,11 @@ def call_frame_with_track_injection(
     halt: sr.Halt | None = None
     t0 = time.perf_counter()
     while steps < max_steps:
-        if new_runner.state.pc_sw == MASTER_STAGE_CALL_PC:
+        pc_sw = new_runner.state.pc_sw
+        if pc_sw == MASTER_STAGE_CALL_PC:
             injected = inject_track_buffer(new_runner.state, record, track=track)
+        elif write_master_mix and pc_sw == MASTER_MIX_INJECT_PC:
+            inject_master_mix(new_runner.state, injected)
         if patch_table:
             sv.apply_patches(new_runner, patch_table)
         try:
@@ -1512,15 +1696,20 @@ def render_frames_to_ring_a(
     patch_table: sv.PatchTable | None = FRAME_PATCH_TABLE,
     mix_scalar_patch: sv.PatchTable | None = CONTINUOUS_MIX_SCALAR_PATCH,
     max_steps: int = 4_000_000,
+    write_master_mix: bool = True,
 ) -> dict:
     """Render N frames of one voice's own `freq` Hz sine on ONE continuous
     Runner (one `run_init()`, N `Runner.fresh_call()`s at block_handler via
     `call_frame_with_track_injection()`), injecting each frame's real
     decimated output into `track`'s master-mix input (see
-    `inject_track_buffer()`), and return ring A's own output -- the actual
-    DAC-facing buffer, one stage past the master mix -- concatenated across
-    frames as mono (L+R averaged) floats at the firmware's own decimated
-    output rate (`SOURCE_SAMPLE_RATE / 2` = 48 kHz).
+    `inject_track_buffer()`) AND, when WRITE_MASTER_MIX is true (the
+    default), straight into the master mix itself (see
+    `inject_master_mix()` and the module note above `MASTER_MIX_INJECT_PC`
+    for why both are needed for a clean tone), and return ring A's own
+    output -- the actual DAC-facing buffer, one stage past the master mix
+    -- concatenated across frames as mono (L+R averaged) floats at the
+    firmware's own decimated output rate (`SOURCE_SAMPLE_RATE / 2` =
+    48 kHz).
 
     **One continuous Runner (lane B2, 2026-09-25; was N independent
     post-init renders under lane A2).** That version's own two blockers
@@ -1535,6 +1724,20 @@ def render_frames_to_ring_a(
     blank synthetic mix configuration) -- fixed here via `mix_scalar_patch`
     (`CONTINUOUS_MIX_SCALAR_PATCH` by default; see that constant's own
     docstring for the full evidence and its documented-hypothesis status).
+    Kept even though `write_master_mix` now overwrites the master mix
+    downstream every frame: `FUN_1c207b` still runs its own compressor
+    loop unconditionally either way, and pinning its own scalars is what
+    keeps THAT loop itself (not our own override) from forking or
+    otherwise misbehaving across many frames -- see the module note for
+    why its own output is discarded rather than trusted.
+
+    **Master mix is no longer trusted as an audio-rate mixer (lane D1,
+    2026-09-25).** `FUN_1c207b`'s own per-track dispatch does not carry a
+    track's sample values into the master mix under any state this lane
+    found (see the module note above `MASTER_MIX_INJECT_PC`); the fix is
+    to inject the SAME decimated samples a second time, downstream of that
+    entire stage, directly into the master mix, at the point lane C1
+    already proved is a lossless, bit-exact source for ring A.
 
     **Phase continuity comes from one long source buffer plus the voice
     record's own carried state**, both true to how the firmware actually
@@ -1544,9 +1747,13 @@ def render_frames_to_ring_a(
     itself to carry phase since every frame's record restarted at
     `start=0`).
 
-    Returns `{"ring_a_mono": [...], "per_frame": [...], "any_new_stop":
-    bool}`; `per_frame[i]` is `{"frame", "instructions", "halt",
-    "injected_max_abs", "ring_a_nonzero"}`.
+    Returns `{"ring_a_mono": [...], "ring_a_left": [...], "ring_a_right":
+    [...], "per_frame": [...], "any_new_stop": bool}`; `per_frame[i]` is
+    `{"frame", "instructions", "halt", "injected_max_abs",
+    "ring_a_nonzero"}`. Measure `ring_a_left`/`ring_a_right` separately,
+    not `ring_a_mono` -- see the "ring A's own L channel is deliberately
+    negated" module note above `MASTER_MIX_INJECT_PC` for why the mono
+    downmix cancels to silence for a coherent tone.
     """
     init = run_init(memory, image)
     if not init.ran or init.runner is None:
@@ -1574,6 +1781,8 @@ def render_frames_to_ring_a(
     setup_frame(state, image, command=3, ring_flag=0)
 
     ring_a_mono: list[float] = []
+    ring_a_left: list[float] = []
+    ring_a_right: list[float] = []
     per_frame: list[dict] = []
     for frame_index in range(n_frames):
         runner, result, injected = call_frame_with_track_injection(
@@ -1583,13 +1792,17 @@ def render_frames_to_ring_a(
             track=track,
             patch_table=combined_patches,
             max_steps=max_steps,
+            write_master_mix=write_master_mix,
         )
         ring = read_ring_a(memory, image, runner)
-        floats = ring["float"]
+        left = [v or 0.0 for v in ring["left"]]
+        right = [v or 0.0 for v in ring["right"]]
         mono = [
-            0.5 * ((left or 0.0) + (right or 0.0))
-            for left, right in zip(floats[0::2], floats[1::2], strict=True)
+            0.5 * (l_sample + r_sample)
+            for l_sample, r_sample in zip(left, right, strict=True)
         ]
+        ring_a_left.extend(left)
+        ring_a_right.extend(right)
         ring_a_mono.extend(mono)
         per_frame.append(
             {
@@ -1597,11 +1810,14 @@ def render_frames_to_ring_a(
                 "instructions": result.instructions,
                 "halt": result.halt.reason,
                 "injected_max_abs": max((abs(v) for v in injected), default=0.0),
-                "ring_a_nonzero": sum(1 for v in mono if v),
+                "ring_a_nonzero": sum(1 for v in left if v)
+                + sum(1 for v in right if v),
             }
         )
     return {
         "ring_a_mono": ring_a_mono,
+        "ring_a_left": ring_a_left,
+        "ring_a_right": ring_a_right,
         "per_frame": per_frame,
         "any_new_stop": any(
             f["halt"] != "return without followed call" for f in per_frame
@@ -1650,6 +1866,18 @@ def measure_tone(
         "rms_dbfs": 20 * math.log10(rms) if rms > 0 else None,
         "peak_dbfs": 20 * math.log10(peak) if peak > 0 else None,
     }
+
+
+def _thdn_dbc(power_ratio: float) -> float | None:
+    """THD+N relative to the carrier (dBc), derived from
+    `measure_tone()`'s own `power_ratio` (fundamental power / total power):
+    THD+N power ratio = (total - fundamental) / fundamental =
+    1/power_ratio - 1, expressed in dB. `None` for a silent or a perfectly
+    pure (`power_ratio == 1.0`) signal (the latter -> -inf, not a finite
+    number worth reporting)."""
+    if power_ratio <= 0.0 or power_ratio >= 1.0:
+        return None
+    return 10 * math.log10((1.0 - power_ratio) / power_ratio)
 
 
 def flatten(blocks: Sequence[Sequence[float]]) -> list[float]:
@@ -2126,11 +2354,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         # own gain/declick ramp attenuates the very first frame or two
         # before a steady level settles, so measuring frequency/level from
         # frame 0 alone would be measuring the ramp, not the tone.
-        measurement = measure_tone(
-            result["ring_a_mono"], output_frequency_hz, sample_rate, discard=32
+        #
+        # Per-channel, not a mono downmix: see the "ring A's own L channel
+        # is deliberately negated" module note above MASTER_MIX_INJECT_PC --
+        # a coherent tone written identically to both channels arrives at
+        # ring A as (-L, +R), so a naive (L+R)/2 downmix cancels to silence.
+        measurement_left = measure_tone(
+            result["ring_a_left"], output_frequency_hz, sample_rate, discard=32
+        )
+        measurement_right = measure_tone(
+            result["ring_a_right"], output_frequency_hz, sample_rate, discard=32
         )
         if a.out:
-            write_wav(a.out, result["ring_a_mono"], sample_rate=sample_rate)
+            sharc_dac.write_wav_stereo(
+                a.out,
+                result["ring_a_left"],
+                result["ring_a_right"],
+                sample_rate=sample_rate,
+            )
         report = {
             "image": a.image,
             "voice": a.voice,
@@ -2140,7 +2381,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "output_frequency_hz": output_frequency_hz,
             "any_new_stop": result["any_new_stop"],
             "per_frame": result["per_frame"],
-            "measurement": measurement,
+            "measurement_left": measurement_left,
+            "measurement_right": measurement_right,
+            "thdn_dbc_left": _thdn_dbc(measurement_left["power_ratio"]),
+            "thdn_dbc_right": _thdn_dbc(measurement_right["power_ratio"]),
             "out": a.out,
         }
         if a.json:
@@ -2151,19 +2395,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 % (a.image, a.voice, a.track, a.frames, output_frequency_hz)
             )
             print("any_new_stop:", result["any_new_stop"])
-            print(
-                "measured: freq=%.2f Hz power_ratio=%.4f rms_dbfs=%s peak_dbfs=%s"
-                % (
-                    measurement["freq_hz"],
-                    measurement["power_ratio"],
-                    "%.2f" % measurement["rms_dbfs"]
-                    if measurement["rms_dbfs"] is not None
-                    else "-inf",
-                    "%.2f" % measurement["peak_dbfs"]
-                    if measurement["peak_dbfs"] is not None
-                    else "-inf",
+            for label, measurement, thdn in (
+                ("L", measurement_left, report["thdn_dbc_left"]),
+                ("R", measurement_right, report["thdn_dbc_right"]),
+            ):
+                print(
+                    "measured %s: freq=%.2f Hz power_ratio=%.4f rms_dbfs=%s "
+                    "peak_dbfs=%s thdn_dbc=%s"
+                    % (
+                        label,
+                        measurement["freq_hz"],
+                        measurement["power_ratio"],
+                        "%.2f" % measurement["rms_dbfs"]
+                        if measurement["rms_dbfs"] is not None
+                        else "-inf",
+                        "%.2f" % measurement["peak_dbfs"]
+                        if measurement["peak_dbfs"] is not None
+                        else "-inf",
+                        "%.2f" % thdn if thdn is not None else "n/a",
+                    )
                 )
-            )
             if a.out:
                 print("wrote", a.out)
         return 0

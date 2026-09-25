@@ -3872,3 +3872,119 @@ out ring A/the DAC conversion as a candidate cause. Not resolved by this
 lane (out of its own scope: no `sharc_core` or accumulate-loop changes were
 made); a second agent should re-run this same stage-by-stage comparison
 before promoting the "at or before the master mix" claim to `[V]`.
+
+## Why the track buffer never reaches the master mix, and a clean tone in ring A anyway (lane D1, 2026-09-25)
+
+**`FUN_1c207b`'s own per-track dispatch (`0x1c20e7`-`0x1c212a`) [V].** A
+`DO...UNTIL LCE` over all 16 tracks walks `I13` from `TRACK_MIX_BASE`
+(`0x252df8`) in `TRACK_MIX_STRIDE` (`0x100`) steps -- `inject_track_buffer()`'s
+own format/address assumption is correct, confirmed by execution. Per
+track, `R2` (the loop counter) is bit-tested against two masks read once
+per track, `R8 = DM(0x252728)` (`0x1c20e7`) and `R4 = DM(0x252538)`
+(`0x1c20b9`), giving exactly three outcomes (all three exercised by
+execution, with watchpoints on `0x252df8`-`0x253df8` and
+`0x25f180`-`0x25f280`):
+
+1. `btst(R8, R2)` bit set -> `0x1c20f4` skips the track entirely (never
+   touches its buffer).
+2. Bit clear in (1), `btst(R4, R2)` bit clear -> falls into `FUN_1c238a`
+   (`0x1c245b`, reached by a plain in-function `JUMP`, not a `CALL` --
+   `tools/sharcdb.py`'s own function-boundary split puts it in a
+   *different* `functions` row, so a pc-range filter restricted to
+   `FUN_1c207b`'s own `[entry, end)` span misses it). This is the DEFAULT
+   outcome from any synthetic `run_init()` state (both masks read
+   all-zero), and it DOES read the track buffer.
+3. Bit clear in (1), bit set in (2) -> falls into `0x1c20fc` (inside
+   `FUN_1c207b` itself): also reads the track buffer, into a different
+   scratch destination.
+
+Both (2) and (3) run the same 16-iteration copy idiom
+(`0x1c2106`-`0x1c211b` / `0x1c2466`-`0x1c247b`) and faithfully copy the
+track's own sample values (checked: dumping the destination scratch buffer
+after a full run shows the exact injected values, still smooth) into a
+SCRATCH buffer (`0x254878` for path (3)), not the master mix. **The master
+mix's own 64 words are separately, unconditionally overwritten every
+frame** by a third piece of the same function (`0x1c2200`-`0x1c2385`,
+`CALL 0xb82d41`/`CALL 0x1cb3d8` -- the dynamics/compressor stage this file
+and lane B2 already named) through a recursive envelope-follower/soft-clip
+that reads/writes `DM(0x25f180)`/`DM(0x25f200)` directly, not the
+per-track copy's own destination. **Proven with a discriminating
+experiment, not just the disassembly:** injecting a CONSTANT level (0.2
+into every sample) instead of a ramp/sine produces the SAME sparse
+addressing pattern (identical indices populated) but DIFFERENT,
+smoothly-decaying values there -- so what reaches the master mix tracks
+the compressor's own internal envelope state, not the track buffer's
+per-sample content, under any state this lane found. Two of the three
+masks feeding this whole dispatch (`0x1c2e0e`'s write of `DM(0x252728)`,
+`0x1c2e58`'s write of `DM(0x252538)`) are themselves decoded every frame,
+inside `FUN_1c2b24` (`0x1c2d78`-`0x1c2e58`), from a >0x6ac-byte span of DM
+memory (`0x255908`-`0x25600a`) that reads all-zero in every capture and
+every synthetic `run_init()` state this project has -- the same
+"no real kit/mixer configuration is ever loaded here" gap this file's
+`CONTINUOUS_MIX_SCALAR_PATCH` note and lane B2's report already flagged
+for the neighbouring master-bus parameter table (`0x255fb6`-`0x2560d0`).
+**This lane did not find a way to make the real per-track summation carry
+audio-rate content into the master mix `[O]`** -- both the control
+table's real bit layout and whether a genuine "no mixer configured" state
+ever produces signal on real hardware remain open.
+
+**The fix taken: inject past this entire stage, onto the master mix
+itself.** `tools/sharc_harness.py`'s `inject_master_mix()`, applied at
+`MASTER_MIX_INJECT_PC` (`0x1c7734`, the call site of `FUN_1c74a1`, right
+after `FUN_1c2b24` -- the whole render orchestrator -- has returned for
+this frame), writes the same 32 decimated samples `inject_track_buffer()`
+already computed straight into `DM(0x25f180)`/`DM(0x25f200)`, landing
+after `FUN_1c207b`'s own dynamics loop has already finished clobbering the
+master mix and before anything reads it back for conversion. This is the
+same "bypass the not-yet-resolved stage, document the hypothesis" move
+`inject_track_buffer()` already makes for `FUN_1c642a`'s own accumulate
+stage, one stage further downstream, at the one place this file's own
+"Dynamic cross-check" section above already proved is a lossless,
+bit-exact copy of the master mix.
+
+**New finding: ring A's own L channel is deliberately negated after
+conversion, by real firmware code, not a bug `[V]`.** The first render
+through the new injection point produced an apparently silent
+`ring_a_mono` (the old `0.5*(left+right)` downmix) despite clearly
+nonzero master-mix content. Traced with a write watchpoint on
+`0x261cc8` (ring A L position 0): `FUN_1c74a1` itself stores the correct,
+positive Q31 value there (confirmed: raw store `214748368` for a `0.1`
+input, matching `0.1 * 2**31` to rounding -- `fix_by`/`FUN_1c74a1` is not
+the bug, exactly as this file's own "Dynamic cross-check" already found).
+A SECOND write to the same address happens moments later, before the
+frame's own `RETURN`: a dedicated 16-iteration loop at sw
+`0x1c758b`-`0x1c75a2` (`I4` = the SAME ring-A half `FUN_1c74a1` just
+wrote) that does `R1 = neg(R2)` / `R2 = neg(R2)` on every word it touches
+and stores the results back -- reached unconditionally every frame between
+`CALL FUN_1c74a1` and `FRAME_MILESTONE`, confirmed by execution to touch
+only the L-channel (even) words of the half just written, never the
+R-channel (odd) ones. A plain `neg()` compute op on data `FUN_1c74a1` had
+already written correctly is not a decode gap or a width mismatch -- this
+is genuine, deliberate firmware behaviour (most likely a real
+hardware/output-stage convention, e.g. an inverting stage on the L channel
+only; this lane did not chase why). Consequence: ring A's own L channel is
+the exact negation of `read_master_mix()`'s own L channel, R matches
+directly, and a coherent signal written identically to both channels
+(as `inject_master_mix()` does) arrives at ring A as `(-L, +R)` -- a plain
+mono downmix cancels it to silence, which is real, not a regression.
+`render_frames_to_ring_a()` now also returns `ring_a_left`/`ring_a_right`
+so a caller measures each channel on its own.
+
+**Open, separate from this stage: the `freq`/`pitch_step` -> actual Hz
+calibration for `render_frames_to_ring_a()`'s own voice-render path
+`[O]`.** Once a genuinely clean tone reached ring A, direct correlation
+against the REQUESTED frequency gave a near-zero `power_ratio`; a coarse
+sweep found essentially all the energy instead at `~0.632 * requested_Hz`
+(e.g. `--freq 1000` measures cleanly at `~632 Hz`, `power_ratio > 0.996`;
+requesting `~1582.3 Hz` measures cleanly at `1000 Hz`, `power_ratio >
+0.998`, `THD+N < -29 dBc`). This is upstream of `inject_master_mix()`/
+`inject_track_buffer()` (checked: the SAME scaling is already present in
+`inject_track_buffer()`'s own decimated return, before either injection
+point) -- somewhere in `setup_voice()`/the voice interpolator's own
+pitch-step convention for this code path, not something this lane
+modified. Not root-caused here; a future lane should check whether
+`SOURCE_SAMPLE_RATE` (`96000.0`) or the interpolator's own effective
+internal rate for `pitch_step=1.0` is the one that's off, and whether
+`docs/findings/06`'s own single-voice `check_correctness` (shape-only,
+~3e-5 max error) would have caught an overall constant frequency scale
+error at all.
