@@ -2640,3 +2640,153 @@ out/captures/... --kind idle|play --instrs 30000000 --unblock [--trig-at
 2000000]`. `tests/test_dt2_reach_running.py` covers `observe()`'s check
 computation (pure, no firmware) and pins the `timers.fired`-vs-raw-`Pits`/
 `Dtims` key-shape bug this lane found and fixed while writing it.
+
+## Lane J2: the SSI0 audio clock, run naturally end to end on `running.snap` **[V][O]**
+
+Picks up "documented as a finding for whichever lane next owns
+`emu/ssi.py`'s vector-170 handler" above. The missing piece was not the
+request rate: it was that `Ssi0Dma`'s default (RX destination bytes
+preserved, no invented data) never satisfies the RX handover the generic
+vector-170 handler is waiting for, so vector 170's own RAM vector slot
+never gets replaced and the real per-block ISR never runs, regardless of
+rate. Both parts are fixed in `emu/ssi.py`, opt-in, no default behaviour
+changed. **[V]**
+
+**Audio-rate request cadence, derived from the firmware's own SSI0
+register programming plus the public MCF5441x Reference Manual.**
+`SSIn_CCR=0x16f00` decodes (Figure 35-19/Table 35-12, RM p.1080-1081) to
+`WL=0b1011` (24-bit words) and `DC=0b01111` (`DC+1=16` words/frame),
+matching this file's earlier "24-bit words, 16 words per frame" read.
+`SSIn_TMASK=SSIn_RMASK=0xffff0000` (Table 35-23/35-24, p.1089-1090): bits
+0-15 -- the frame's 16 real time slots -- are 0 = "valid time slot", so
+all 16 slots are active, none masked (the earlier reading of this register
+pair was never checked against the field tables; it is now). `SSIn_FCSR
+=0x88` (Figure 35-20, p.1081) sets `RFWM0=TFWM0=8` words, matching the
+eDMA minor loop's 8 elements, so a DMA request fires twice per SSI audio
+frame (once per 8 of 16 slots). Assuming that SSI frame itself repeats at
+48 kHz -- the codec/SHARC-driven external frame sync SSI0 is configured
+for; `SSI_CLKIN`'s own frequency is still not captured in the firmware,
+so this one step stays an explicit assumption, not a recovered board
+clock -- the request rate is `2 x 48,000 = 96,000 Hz`, and TCD48/50's
+64-minor major loop then makes vector 170 fire at `96,000 / 64 = 1,500
+Hz`. That number is not free-floating: it independently matches both the
+SHARC's own documented block cadence (32 stereo samples/block at 48 kHz)
+and, checked live below, the ColdFire's own per-block sample tick. Now
+`emu.ssi.AUDIO_SSI0_REQUEST_HZ` (96,000), with the derivation and page
+citations in its docstring. **[V][O]** (the 48 kHz frame-sync assumption
+itself remains open, as it always has been -- SSI_CLKIN is still
+unrecovered)
+
+**The RX handover marker, modelled as an `emu.ssi.RxHandoverPeer`.** The
+existing finding above ("The corresponding handover...", "A marker-only
+host calibration...") already established the mechanism by host-patching
+memory directly: the generic vector-170 handler `0x400d2f98` scans byte
+offset 0 of the RX (channel 48) bank it just completed for the literal
+`0x007fffff`; only while present does its counter at `0x43153a20`
+advance, and only once it exceeds 63 does it replace vector 170's own RAM
+vector slot (`0x400002a8` -- vector 170 = INTC1 source 42, `170*4`) with
+`0x4002d322` (`emu.symbols.ssi0_dma_force_rte`'s anchor). `RxHandoverPeer`
+answers this through the model's existing, generic `peer.rx()` hook
+instead of a host poke: it reads the RX channel's own live CITER/BITER
+before each minor (the same registers `Ssi0Dma._run_minor` itself reads),
+writes the marker only when CITER still equals BITER -- true exactly at
+the first minor of a fresh major loop, survives a checkpoint resume
+mid-loop because it derives from live TCD state rather than a private
+counter -- and leaves every other minor's payload zero. **[V]**
+
+**Measured end to end on `running.snap`, with zero host vector forcing.**
+`build(..., ssi0_request_hz=96_000, ssi0_legacy_upgrade=True)`, then
+`ev['ssi0_dma'].peer = RxHandoverPeer(m)`, then 3,000,000 further
+instructions at the snapshot's own saved rate (`ips=4,680,000`):
+
+| observation | before | after |
+|---|---|---|
+| vector 170 slot (`0x400002a8`) | `0x400d2f98` (generic) | `0x4002d322` (real ISR) |
+| handover counter (`0x43153a20`) | 0 | 64 |
+| generic-handler hits | -- | 64 (then never again) |
+| `vector_191_handler` (`0x4002dd0c`) hits | -- | **58, all natural** |
+| `Ssi0Dma.vector191` (via `_on_force_rte` only) | -- | 58 -- exact match |
+| ColdFire's own sample tick `_DAT_40966500` | 0 | 1,824 (= 57 x 32) |
+
+Every one of those 58 `vector_191_handler` completions came from the
+CPU's own vector fetch off its own vector table, through `0x4002d322`
+setting `INTFRCH1` bit 31 itself; the harness's `_on_force_rte` hook only
+completes the pending CPU vector delivery at the documented RTE boundary
+when the guest's own INTFRCH1 write already asserted it (same code as
+before this lane -- unchanged). No test in this run ever calls
+`raise_vector(191, ...)` directly. This is the first time this chain has
+run start to finish without a host-forced entry. **[V]**
+
+**The block-rate ISR is far more expensive, in ColdFire instructions,
+than the emulator's default instruction-rate proxy allows per block.**
+At `ips=4,680,000` (`emu.pit.INSTR_PER_SEC`, unchanged from the
+snapshot), one block period is `4,680,000/1,500=3,120` instructions, but
+Lane H1 separately measured `vector_191_handler` itself at
+45,000-60,000 ColdFire instructions per call -- the table above is
+exactly this tension made visible: 961 major loops complete in 3,000,000
+instructions, only 716 reach the CPU (interrupt-masked while the handler
+runs), and only 58 of those fit a complete handler call in the budget.
+Raising `ips` (the same knob `emu/gui.py`/`tools/guirun.py` already use
+post-intro, at 4x) gives the RTOS proportionally more room without
+changing the *real-Hz* relationship between the audio rate and any other
+timer: at `ips=50xINSTR_PER_SEC` (234,000,000; docs/findings/07's own
+"200-264M instructions/s" real-rate estimate), block period rises to
+156,000 instructions, comfortably past the handler's fixed cost, and 224
+natural `vector_191_handler` completions occur in a 45,000,000-instruction
+run (32 before + 192 after a PLAY press) -- confirmed by the exact match
+`tick_after / 32 = 224`. This is a pacing choice for a caller to make
+(no default in `emu/longrun.py` changed), not a new mechanism. **[V][O]**
+(no default `ips` was chosen for general use; a lane that needs RTOS
+throughput alongside audio should raise it explicitly, same as
+`--post-intro-ips` already does elsewhere)
+
+**PLAY does reach the tick-driven event scheduler now that it has a
+working tick -- but the destination event pool is empty.**
+`FUN_40139b78` (this file's earlier "note-scheduling consumer" finding)
+runs once per block from `vector_191_handler`, unconditionally draining
+any node in the pending list (`_DAT_47e2033c`/`_DAT_47e20340`) whose due
+time (ticks since boot, in the same 32-per-block unit as
+`_DAT_40966500`) has passed, via `FUN_4013a52a()` (pop a destination
+record from free list `_DAT_44e6b494`) then `FUN_4013a78a()` (append it
+to the ColdFire's own output queue). At the raised `ips` above: with PLAY
+never pressed, `FUN_4013a52a` is called **zero** times in a 45,000,000-
+instruction run; with PLAY pressed (`emu.panelin.press(m, profile, 2, 3)`)
+partway through, `FUN_4013a52a` is called exactly **5** times, all within
+a single `FUN_40139b78` call at tick 1,792 (800 ticks -- 16.7 ms of
+audio-tick time -- after the press), and all five calls **return 0**
+(`_DAT_44e6b494`, the destination pool's free-list head, is null), so
+`FUN_4013a78a` never runs and nothing reaches the output queue. This
+narrows Lane H1's "`FUN_4013a52a`/`FUN_4013a78a` called zero times" (measured
+without a working tick clock at all) to something more specific: PLAY
+*does* cause the pending-event list to have due nodes by the time this
+lane's tick reaches them, but the destination pool that would turn a due
+node into a real queued event is exhausted in this snapshot. **[V][O]**
+
+Two things remain open, for whoever picks this up: (1) no direct call
+into `FUN_40139b78` was ever observed with a nonzero first argument in
+either run (0/416 total calls across both experiments), so whatever
+inserts those due nodes into the pending list is not `FUN_40139b78`
+itself (only its own `-0x14`/bit-`0x10` branch and `FUN_40139b16`'s init
+touch those list globals in Ghidra's static data-ref table) -- either a
+different, unidentified function does it through addressing this image's
+static analysis does not attribute to those literals (this file already
+has one precedent for that, "`0x40042fe2`... an artifact:
+`tools/refscan.py` finds two real callers"), or the insert happens
+synchronously inside the panel RX-vector ISR itself. (2) Why
+`_DAT_44e6b494` is empty on `running.snap` -- exhausted during the
+785,000,000-instruction boot this snapshot was built from, e.g. because
+`unblock=True` skips whatever consumer would normally free pool entries
+back, or a genuine firmware limit -- was not investigated.
+
+**Reproduced with:** `emu.longrun.build(snap, unblock=True, softfloat=True,
+bitmap=True, dsp=True, deferred_components=('timers',),
+ssi0_request_hz=emu.ssi.AUDIO_SSI0_REQUEST_HZ, ssi0_legacy_upgrade=True)`,
+then `ev['ssi0_dma'].peer = emu.ssi.RxHandoverPeer(m)`, then
+`emu.longrun.spin(m, pc, N, pits=timers, async_events=(ev['ssi0_dma'],))`.
+Unit tests: `tests/test_ssi.py`'s `RxHandoverPeerTest` and
+`AudioSsi0RequestHzTest` (synthetic TCD state, no firmware). The end-to-end
+numbers above are this lane's own scratch verification against the real
+1.16 image and are not yet re-checked by a second agent or captured as a
+committed tool -- flagged `[O]` on that basis, not on the numbers
+themselves, which are exactly reproducible (re-run twice, identical
+counts both times).

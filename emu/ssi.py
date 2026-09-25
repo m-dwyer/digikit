@@ -68,6 +68,43 @@ RX_CHAN, TX_CHAN = 48, 50
 RX_REGISTER, TX_REGISTER = 0xFC0BC008, 0xFC0BC000
 RX_VECTOR, TX_VECTOR, FORCE_VECTOR = 168, 170, 191
 
+# Audio-rate SSI0 request cadence, derived from the firmware's own SSI0
+# register programming (docs/findings/04-coldfire-dsp-link.md, "The 1.16
+# post-gesture checkpoint's SSI0 configuration is externally clocked") plus
+# the public MCF5441x Reference Manual, and cross-checked against the
+# firmware's own audio-block tick (below). Not a firmware-recovered board
+# clock: SSI_CLKIN's real frequency is still unrecovered, so this stays an
+# explicit, opt-in assumption -- see the module docstring.
+#
+#   SSIn_CCR = 0x16f00 (MCF5441XRM Figure 35-19/Table 35-12, p.1080-1081):
+#     WL[16:13]=0b1011 -> 24-bit words; DC[12:8]=0b01111 -> DC+1 = 16 words
+#     per network-mode frame (matches the documented "24-bit words, 16 words
+#     per frame").
+#   SSIn_TMASK = SSIn_RMASK = 0xffff0000 (MCF5441XRM Table 35-23/35-24,
+#     p.1089-1090): bits 0-15 (the frame's 16 real time slots) are 0 =
+#     "valid time slot", so all 16 slots are active, none masked.
+#   SSIn_FCSR = 0x88 (MCF5441XRM Figure 35-20, p.1081): RFWM0=TFWM0=8 words,
+#     matching the eDMA minor loop's 32 bytes / 4-byte elements = 8 elements
+#     (docs/findings/04). With all 16 slots active and an 8-word watermark, a
+#     DMA request fires twice per SSI audio frame (once per 8 of the 16
+#     slots).
+#   Assuming that SSI audio frame itself repeats at 48 kHz (the codec/SHARC
+#   frame sync SSI0 is externally clocked from -- TCR/RCR select external
+#   bit clock and frame sync; SSI_CLKIN's own frequency is not captured in
+#   the firmware, see docs/findings/04), the request rate is
+#   2 x 48,000 = 96,000 Hz.
+#   TCD48/TCD50's major loop is 64 minors (docs/findings/04), so the TX
+#   major-loop-complete interrupt (vector 170) then fires at
+#   96,000 / 64 = 1,500 Hz -- which independently matches the SHARC's own
+#   known block cadence (32 stereo samples/block at 48 kHz -> 1,500
+#   blocks/s), and, checked live, the ColdFire's own per-block sample tick
+#   `_DAT_40966500` (advanced by exactly 0x20 = 32 in the vector-191 handler,
+#   `docs/findings/04`) -- three independently-derived numbers agreeing is
+#   what makes 96,000 Hz a meaningfully better opt-in default than the
+#   1,000 Hz / 48,000 Hz placeholders earlier tools used, though it remains
+#   an assumption, not a recovered board clock.
+AUDIO_SSI0_REQUEST_HZ = 96_000
+
 
 def _signed(value, bits):
     sign = 1 << (bits - 1)
@@ -396,6 +433,60 @@ class Ssi0Dma:
             self.vector191 += 1
             return True
         return False
+
+
+class RxHandoverPeer:
+    """Supplies the external RX synchronization marker the generic vector-170
+    handler `0x400d2f98` scans for, so vector 170 can hand itself over to the
+    real per-block ISR `0x4002d322` (`emu.symbols` calls its RTE point
+    `ssi0_dma_force_rte`) without any host-side vector forcing.
+
+    docs/findings/04-coldfire-dsp-link.md ("The same checkpoint has no
+    0x007fffff row head...") documents the mechanism this peer answers: at
+    every RX (channel 48) major-loop completion, `0x400d2f98` checks byte
+    offset 0 of the bank it just filled for the literal `0x007fffff`; only
+    while that marker is present does its counter at `0x43153a20` advance,
+    and only once that counter exceeds 63 does it replace vector 170's own
+    RAM vector slot (`0x400002a8`, i.e. vector 170 = INTC1 source 42) with
+    `0x4002d322`. Every vector-170 delivery after that point runs
+    `0x4002d322` directly out of the guest's own vector table -- a real,
+    firmware-driven handoff, not a host-forced one.
+
+    Without a marker (`Ssi0Dma`'s default of leaving RX destination bytes
+    untouched), that handoff counter never advances and `0x400002a8` keeps
+    pointing at the generic handler forever: this is the root cause Lane I1
+    measured on `running.snap` ("Ssi0Dma delivered vector 170 400 times ...
+    force_asserted never went True") once the RTOS is genuinely running,
+    independent of the request rate used.
+
+    Marker placement is derived from live TCD state, not a private counter,
+    so it survives a checkpoint resume mid-major-loop: element 0 of a major
+    loop is exactly the call where the channel's CITER (read before this
+    call's own decrement) still equals BITER -- the pre-decrement reload
+    value -- which is true immediately after a fresh arm and after every
+    major-loop reload, and only there.
+    """
+
+    MARKER = 0x007FFFFF
+
+    def __init__(self, machine, channel=RX_CHAN):
+        self.m = machine
+        self.channel = channel
+
+    def _at_major_start(self):
+        base = TCD_BASE + self.channel * 0x20
+        citer = struct.unpack(">H", self.m.uc.mem_read(base + CITER, 2))[0] & 0x7FFF
+        biter = struct.unpack(">H", self.m.uc.mem_read(base + BITER, 2))[0] & 0x7FFF
+        return citer == biter
+
+    def rx(self, nbytes):
+        payload = bytearray(nbytes)
+        if self._at_major_start():
+            struct.pack_into(">I", payload, 0, self.MARKER)
+        return bytes(payload)
+
+    def tx(self, data):
+        pass
 
 
 def install(machine, at, events, request_hz, instr_per_sec, force_rte, peer=None):

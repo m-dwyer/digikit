@@ -21,7 +21,16 @@ from emu.edma import (
     SOFF,
     TCD_BASE,
 )
-from emu.ssi import INTFRCH1, RX_CHAN, RX_REGISTER, Ssi0Dma, TX_CHAN, TX_REGISTER
+from emu.ssi import (
+    AUDIO_SSI0_REQUEST_HZ,
+    INTFRCH1,
+    RX_CHAN,
+    RX_REGISTER,
+    RxHandoverPeer,
+    Ssi0Dma,
+    TX_CHAN,
+    TX_REGISTER,
+)
 
 
 class FakeUc:
@@ -250,6 +259,59 @@ class Ssi0DmaTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "TCD50 shape mismatch"):
             source.arm_legacy()
+
+
+class RxHandoverPeerTest(unittest.TestCase):
+    def test_marker_written_only_at_major_loop_start(self):
+        machine = FakeMachine()
+        put_tcd(machine, RX_CHAN, source=RX_REGISTER, dest=0x5000, citer=64)
+        peer = RxHandoverPeer(machine, channel=RX_CHAN)
+
+        first = peer.rx(32)
+        self.assertEqual(struct.unpack(">I", first[:4])[0], 0x007FFFFF)
+        self.assertEqual(first[4:], bytes(28))
+
+        # Simulate the mid-major-loop state _run_minor would leave behind:
+        # CITER decremented, BITER unchanged.
+        machine.uc.mem_write(TCD_BASE + RX_CHAN * 0x20 + CITER, struct.pack(">H", 63))
+        second = peer.rx(32)
+        self.assertEqual(second, bytes(32))
+
+    def test_marker_reappears_after_reload_survives_resume(self):
+        machine = FakeMachine()
+        put_tcd(machine, RX_CHAN, source=RX_REGISTER, dest=0x5000, citer=64)
+        peer = RxHandoverPeer(machine, channel=RX_CHAN)
+
+        # A resumed checkpoint may hand the peer a fresh instance mid-major
+        # loop; only the *reload* (CITER restored to BITER), not object
+        # construction order, decides where the marker lands.
+        machine.uc.mem_write(TCD_BASE + RX_CHAN * 0x20 + CITER, struct.pack(">H", 5))
+        self.assertEqual(peer.rx(32), bytes(32))
+        machine.uc.mem_write(TCD_BASE + RX_CHAN * 0x20 + CITER, struct.pack(">H", 64))
+        self.assertEqual(struct.unpack(">I", peer.rx(32)[:4])[0], 0x007FFFFF)
+
+    def test_integrates_with_run_minor_major_loop_boundary(self):
+        machine, source = Ssi0DmaTest().make_source()
+        machine.uc.mem_write(0x5000, bytes(32))
+        put_tcd(machine, RX_CHAN, source=RX_REGISTER, dest=0x5000, citer=2)
+        source.enabled.add(RX_CHAN)
+        source.peer = RxHandoverPeer(machine, channel=RX_CHAN)
+
+        source._run_minor(RX_CHAN, capture_tx=False)  # first of 2: marker
+        self.assertEqual(
+            struct.unpack(">I", machine.uc.mem_read(0x5000, 4))[0], 0x007FFFFF
+        )
+        source._run_minor(RX_CHAN, capture_tx=False)  # second: no marker
+        self.assertEqual(machine.uc.mem_read(0x5020, 4), bytes(4))
+
+
+class AudioSsi0RequestHzTest(unittest.TestCase):
+    def test_matches_documented_block_cadence(self):
+        # 96 kHz requests / 64-minor major loop = 1,500 Hz vector 170, the
+        # SHARC's own documented block cadence (32 stereo samples/block at
+        # 48 kHz). See emu/ssi.py's AUDIO_SSI0_REQUEST_HZ derivation.
+        self.assertEqual(AUDIO_SSI0_REQUEST_HZ, 96_000)
+        self.assertEqual(AUDIO_SSI0_REQUEST_HZ / 64, 1500)
 
 
 if __name__ == "__main__":
