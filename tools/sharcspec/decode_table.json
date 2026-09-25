@@ -915,6 +915,11 @@
    "fixed_bits": 8,
    "fields": [
     {
+     "label": "w",
+     "hi": 39,
+     "lo": 39
+    },
+    {
      "label": "g",
      "hi": 38,
      "lo": 38
@@ -945,6 +950,11 @@
      "lo": 24
     },
     {
+     "label": "l",
+     "hi": 23,
+     "lo": 23
+    },
+    {
      "label": "compute[22:16]",
      "hi": 22,
      "lo": 16
@@ -955,7 +965,7 @@
      "lo": 0
     }
    ],
-   "source": "pgr values + prm layout",
+   "source": "pgr values + prm layout; w/l added from PRM p.348's \"BH (Type 7a)\" encode table (w,l -> blank/(sw)/(nw)) after cross-checking dt2-1.16's voice-render loop (finding: docs/findings -- MODIFY's short-word/normal-word address scale, previously undecoded and hardcoded normal-word in sharc_core.forms_dag._type_7a)",
    "classic_keys": [
     "Type 7a"
    ],

@@ -1343,3 +1343,26 @@ tests/test_sharc_symbols.py tests/test_sharc_contract.py
 tests/test_sharc_index.py tests/test_sharc_discover.py
 tests/test_sharcwriters.py tests/test_sharcinv.py tests/test_sharc_import.py
 tests/test_sharcflow.py -q --slow`: 444 passed, 5 subtests passed. **[V]**
+
+## Type 7a MODIFY was missing its `(sw)`/`(nw)` scale bits **[V][C]**
+
+Found while tracing the voice render loop `FUN_1c4f81` (finding 06, "One
+voice renders correctly"): a plain `I = MODIFY(I, imm)` should leave the
+loop's sample and coefficient pointers 2 and 24 bytes apart per iteration,
+but the decoded immediates were all 4x too large.
+
+Type 7a `MODIFY` has two scale bits the decode table lacked: `w` at bit 39
+and `l` at bit 23. The PRM's "BH (Type 7a)" encode table (p.13-48) gives
+`(w,l) = (0,1)` -> `(sw)` (the modify value is scaled x2, half-word/int16
+addressing) and `(w,l) = (1,0)` -> `(nw)` (unscaled, normal-word
+addressing); `(0,0)` is the plain, undecorated form our table already
+covered, scaling every modify by 4 (normal-word units) regardless of these
+two bits. In the render loop, `0x1c50af`, `0x1c50ca`, `0x1c50cf` and
+`0x1c50d4` are `(sw)`; `0x1c50b6` is `(nw)`.
+
+Checked against the raw bytes independently of the tracer: decoding each of
+the five sites' 48-bit words by the PRM's bit positions alone reproduces the
+`(sw)`/`(nw)` suffix and the corrected immediate scale, and matches what
+execution needs for the sample pointer (2-byte int16 steps) and the
+coefficient-table pointer (24-byte row steps) to land where the "One voice
+renders correctly" section shows they must. **[V]**

@@ -79,26 +79,84 @@ def _canonical_dm_address(
     the boot stream is keyed at ``SW_ALIAS_BASE + 0x26968c``.  Keep an already
     mapped direct address (notably external memory and MMRs) unchanged; only
     retry an unmapped low address through the alias.
+
+    SHARC+ byte address space is the chip's one universal address map: "[a]ll
+    physical memory can be addressed using the byte addressable memory space"
+    and "[d]ata access of all sizes can be done using byte address space"
+    (SHARC+ Core Programming Reference, out/refs/sharc-plus-prm, "Byte
+    Address Space Overview of Data Accesses", p.7-4, extraction page 221);
+    for a plain direct address (no DAG modify/index arithmetic -- Type14a/
+    14d's own ``addr`` field, as opposed to ``Ia+mod``) the accessed byte
+    range is always ``[address, address+width)`` unscaled, and only the
+    opcode's own size suffix -- (bw)/(sw)/unqualified/(lw) -- picks WIDTH:
+    "[t]he address space does not select the memory word size for byte
+    addresses. Accesses to byte addresses obey the size of the opcode ...
+    not the address space" (p.6-3, extraction page 187); Table 6-2 "Legal
+    and Illegal Accesses to Byte Space With or Without Address Scaling"
+    (p.6-10/6-11, extraction pages 194-195) and Table 6-3 "Operand Addressed
+    in Non-Byte Space or Byte Space for Extended Precision Accesses" (p.6-13,
+    extraction page 197) scale a MODIFY's own offset/index by the access
+    size when the I-register is in byte-addressed space, never the base
+    address of a direct/absolute access like this one. So which of the two
+    physical locations a DM pointer resolves to -- raw, or the loader's
+    ``SW_ALIAS_BASE``-relative mirror -- is a property of the address alone,
+    not of which width happens to be asking: WIDTH governs only how many of
+    those bytes this call needs, checked separately below. Deciding the
+    family from a WIDTH-wide presence probe (as this function used to) lets
+    two different-width accesses to the identical address disagree about
+    which physical location it names -- reproduced directly (a 1-byte write
+    then a 2-byte read at the same fresh low address;
+    tests/test_sharc_memory.py's ``test_family_choice_is_width_independent``)
+    -- which is exactly backwards for a universal byte-addressed space where
+    every access size names the same underlying bytes.
     """
     concrete = state.concrete
     if concrete is None:
         return None
 
-    def mapped(base: int) -> bool:
-        return all(
-            here in state.overlay or concrete.read(here, 1) is not None
-            for here in range(base, base + width)
-        )
+    def present(here: int) -> bool:
+        return here in state.overlay or concrete.read(here, 1) is not None
 
-    if mapped(address):
-        return address
-    if 0 <= address < SW_ALIAS_BASE:
+    def fully_present(base: int) -> bool:
+        return all(present(here) for here in range(base, base + width))
+
+    # Single-byte probe: which family ADDRESS belongs to, not whether this
+    # particular WIDTH-wide access is fully backed there yet (that is
+    # ``fully_present``, checked once the family is settled, below).
+    if not present(address) and 0 <= address < SW_ALIAS_BASE:
         alias = SW_ALIAS_BASE + address
-        if for_write or mapped(alias):
-            return alias
+        if for_write or present(alias):
+            address = alias
     # Runtime RAM and MMR destinations need not have loader initializer bytes.
     # A concrete write creates those bytes in this path's overlay.
-    return address if for_write else None
+    if for_write:
+        return address
+    return address if fully_present(address) else None
+
+
+def dm_write_range(state: State, address: int, width: int) -> tuple[int, int] | None:
+    """The canonical ``[start, end)`` byte range a WIDTH-byte write to
+    architectural DM ADDRESS actually lands in -- exactly what
+    ``_dm_write()``/``_canonical_dm_address(..., for_write=True)`` resolve
+    to, without performing a write.
+
+    A watchpoint or a harness poke that wants to observe a real store to
+    ADDRESS, rather than to whatever ``_dm_write`` happens to print as its
+    own address, must watch/poke this range, not ``[address,
+    address+width)``: an unmapped low DM pointer -- most application data
+    below ``SW_ALIAS_BASE`` -- is silently redirected to ``SW_ALIAS_BASE +
+    address`` (see ``_canonical_dm_address``'s docstring), so a
+    :class:`~tools.sharc_run.Watchpoint` built from the raw address never
+    fires and a poke at the raw address, while it does take effect, lands
+    at a different overlay key than the one a caller inspecting ``address``
+    directly would look at.
+
+    Returns ``None`` only when STATE has no backing image at all
+    (``state.concrete is None``); unlike a read, a write does not need its
+    destination bytes to already exist, so this never fails on that account.
+    """
+    start = _canonical_dm_address(state, address, width, for_write=True)
+    return None if start is None else (start, start + width)
 
 
 def _dm_read(

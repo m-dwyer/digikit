@@ -60,6 +60,7 @@ this module works wherever that database does.
 """
 import os
 import sys
+from typing import Protocol
 
 _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
@@ -71,7 +72,17 @@ REFERENCE_IMAGE = 'dt2-1.16'
 
 REQUIRED_COMMON = frozenset({'dt2', 'dn2'})
 REQUIRED_DT2 = frozenset({'dt2'})
-OPTIONAL = frozenset()
+OPTIONAL: frozenset[str] = frozenset()
+
+
+class _Rule(Protocol):
+    """What every rule class below (FuncMatch, LiteralAt, ...) implements --
+    named here only so SYMBOLS can be typed as a plain list of these,
+    instead of the union mypy would otherwise infer from the list literal."""
+
+    def resolve(
+        self, img: 'sharc.Image', ref: 'sharc.Image', got: dict[str, int | None]
+    ) -> tuple[int | None, str]: ...
 
 
 class SymbolResolutionError(RuntimeError):
@@ -242,7 +253,7 @@ class EnclosingFunction:
 #   machine_type_cache=0x255970
 # --------------------------------------------------------------------------
 
-SYMBOLS = [
+SYMBOLS: list[tuple[str, _Rule, frozenset[str]]] = [
     # ---- platform: audio task / command dispatch, shared by both devices.
     # docs/findings/06 "Task loop": the Audio Task at 0x1c7749 (inside this
     # function's body) runs block_handler when a notify-take returns 1;
@@ -384,7 +395,8 @@ def resolve(img, device=None, reference=None):
     else:
         ref = sharc.load(REFERENCE_IMAGE)
 
-    got, detail = {}, {}
+    got: dict[str, int | None] = {}
+    detail: dict[str, str] = {}
     for name, rule, _required in SYMBOLS:
         val, why = rule.resolve(img, ref, got)
         got[name] = val

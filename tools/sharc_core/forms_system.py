@@ -19,6 +19,7 @@ from .encoding import (
     _wide,
 )
 from .flags import (
+    _astatx_bit_test,
     _astatx_define,
     _astatx_forget,
 )
@@ -58,11 +59,13 @@ def _type_18a(
         operation = "bit-test" if bop == 4 else "xor-test"
         code = UREG_CODES["USTAT1"] + sreg
         mask = _wide(f, "data")
-        source = _ureg(state.uregs, code)
-        if isinstance(source, Const):
-            result = (source.value & mask) == mask if bop == 4 else source.value == mask
-        else:
-            result = None
+        # _ureg_raw, not _ureg: ASTATX/ASTATY can hold a PartialConst, and
+        # _astatx_bit_test can decide a result from the known bits alone
+        # (see its docstring), so collapsing that to Unknown here would
+        # throw away information _ureg's generic callers don't need but
+        # this one does.
+        source = _ureg_raw(state.uregs, code)
+        result = _astatx_bit_test(source, mask, xor=(bop == 5))
         mode1 = _ureg(state.uregs, UREG_CODES["MODE1"])
         simd = bool(mode1.value & (1 << 21)) if isinstance(mode1, Const) else None
         astatx_code = UREG_CODES["ASTATX"]
@@ -74,19 +77,19 @@ def _type_18a(
                 astatx, 1 << BTF_BIT, (1 << BTF_BIT) if result else 0
             )
         # In SIMD mode the complementary STKY/ASTAT pair is evaluated
-        # independently.  Preserve that uncertainty unless both MODE1
-        # and the complementary source are concrete.
+        # independently. Preserve that uncertainty unless MODE1 is known
+        # SIMD; _astatx_bit_test then decides from whatever bits of the
+        # complementary source (possibly a PartialConst) are known.
         if sreg in (6, 7, 8, 9) and simd is not False:
             complement = {6: 7, 7: 6, 8: 9, 9: 8}[sreg]
-            complement_source = _ureg(state.uregs, UREG_CODES["USTAT1"] + complement)
-            if simd is True and isinstance(complement_source, Const):
-                complement_result = (
-                    (complement_source.value & mask) == mask
-                    if bop == 4
-                    else complement_source.value == mask
-                )
-            else:
-                complement_result = None
+            complement_source = _ureg_raw(
+                state.uregs, UREG_CODES["USTAT1"] + complement
+            )
+            complement_result = (
+                _astatx_bit_test(complement_source, mask, xor=(bop == 5))
+                if simd is True
+                else None
+            )
             astaty_code = UREG_CODES["ASTATY"]
             astaty = _ureg_raw(state.uregs, astaty_code)
             if complement_result is None:

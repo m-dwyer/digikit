@@ -14,7 +14,9 @@ Ad hoc SQL from the shell, without writing a script:
 
 from __future__ import annotations
 
+import bisect
 import collections
+import json
 import os
 import sqlite3
 import sys
@@ -29,6 +31,7 @@ import networkx as nx  # noqa: E402
 import sharc_trace  # noqa: E402
 import sharcdb  # noqa: E402
 import sharcfn  # noqa: E402
+import sharcinv  # noqa: E402
 import sharcldr  # noqa: E402
 
 SECTIONS_DIR = "out/sections"
@@ -49,15 +52,27 @@ _DEFAULT_TRACE_REGS: dict[str | int, int] = {
 # here verbatim rather than re-derived: walk basic blocks backwards over
 # succ, stopping expansion at the first block on each path that already has
 # a regdef of REG before the search's upper bound there.
+#
+# The recursive step's upper_sw for a predecessor block must be that
+# predecessor's OWN end_sw, not the block it is being entered from: a
+# predecessor executes in full before control reaches the current block, so
+# every def in [predecessor.start_sw, predecessor.end_sw) is "before" the
+# original sw, and nothing in the current block should be re-admitted. Using
+# the current block's end_sw here (as an earlier version of this query did)
+# widens the search range for a contiguous predecessor (whose end_sw equals
+# the current block's start_sw) out past the current block's own end,
+# re-admitting that block's later defs -- including, when sw itself defines
+# reg, a "last def of reg before sw" that is sw itself.
 _LAST_DEF_SQL = """
 WITH RECURSIVE walk(block_sw, upper_sw) AS (
   SELECT b0.start_sw, ?
   FROM bblocks b0 WHERE b0.image = ? AND b0.start_sw <= ? AND b0.end_sw > ?
   UNION
-  SELECT s.from_block, b.end_sw
+  SELECT s.from_block, pb.end_sw
   FROM walk w
   JOIN bblocks b ON b.image = ? AND b.start_sw = w.block_sw
   JOIN succ s ON s.image = ? AND s.to_block = w.block_sw
+  JOIN bblocks pb ON pb.image = ? AND pb.start_sw = s.from_block
   WHERE NOT EXISTS (
     SELECT 1 FROM regdef d
     WHERE d.image = ? AND d.reg = ? AND d.sw >= b.start_sw AND d.sw < w.upper_sw
@@ -140,6 +155,145 @@ def _hex(value):
     return "0x%x" % value if isinstance(value, int) else value
 
 
+# --- ASTATX/ASTATY bit-group modelling for defuse()/slice() ----------------
+#
+# PRM ch.4 (REGF_ASTATX/REGF_ASTATY) and tools/sharcspec/compute_table.json's
+# opcode tables split ASTATx into disjoint per-compute-unit bit groups --
+# ALU (AZ/AV/AN/AC/AS/AI/AF), MULT (MN/MV/MU/MI), SHIFT (SV/SZ/SS) -- plus
+# BTF, which only the system bit-test/xor-test op (Type18a, bop 4/5) sets,
+# an entirely separate mechanism from any compute unit. tools/sharc_core/
+# flags.py already encodes these exact groups (ALU_FLAGS_MASK,
+# MULT_FLAGS_MASK, SHIFT_FLAGS_MASK, BTF_BIT) for the concrete/symbolic
+# tracers; this reuses those same bit numbers (via sharc_trace's re-export)
+# rather than re-deriving them, so a slice()/defuse() bit group can never
+# disagree with what tools/sharc_run.py's Halt actually reads.
+_ASTAT_GROUPS = ("ALU", "MULT", "SHIFT", "BTF")
+# "ASTAT.ALU" etc. -- the per-group pseudo-register names defuse()/slice()
+# def/use (see Image._ASTAT's docstring); built once here so Image doesn't
+# need a class-body dict comprehension (which cannot see a sibling class
+# attribute -- comprehensions get their own scope).
+_ASTAT_GROUP_REG = {group: "ASTAT.%s" % group for group in _ASTAT_GROUPS}
+_ASTAT_GROUP_BIT = {
+    sharc_trace.AZ_BIT: "ALU",
+    sharc_trace.AV_BIT: "ALU",
+    sharc_trace.AN_BIT: "ALU",
+    sharc_trace.AC_BIT: "ALU",
+    sharc_trace.AS_BIT: "ALU",
+    sharc_trace.AI_BIT: "ALU",
+    sharc_trace.AF_BIT: "ALU",
+    sharc_trace.MN_BIT: "MULT",
+    sharc_trace.MV_BIT: "MULT",
+    sharc_trace.MU_BIT: "MULT",
+    sharc_trace.MI_BIT: "MULT",
+    sharc_trace.SV_BIT: "SHIFT",
+    sharc_trace.SZ_BIT: "SHIFT",
+    sharc_trace.SS_BIT: "SHIFT",
+    sharc_trace.BTF_BIT: "BTF",
+}
+
+
+def _astat_groups_written(t, f):
+    """Which of _ASTAT_GROUPS aligned instruction (type_name t, its own
+    merged decode fields f -- tools/sharcinv.py's merge_fields() over the
+    `insn.fields` this row's build already stored, never mnemonic text, per
+    tools/sharcdb.py's own Type3c rule) writes, cross-checked against
+    tools/sharc_core/flags.py/compute_alu.py/compute_mult.py/
+    compute_shift.py/compute_multi.py/forms_system.py, which is where each
+    of these actually gets applied:
+
+      - A COMPUTE_FORMS instruction's parallel compute field: classified
+        exactly the way tools/sharcdb.py's own `_compute_regdef_reguse`
+        does, through the same tools/sharcinv.classify_compute() (PRM Table
+        18-5/18-9/18-18/18-19 by the field's own cu/opcode bits) --
+        'ALU'/'MULT'/'SHIFT' map directly; 'MULTIFN' (a MUL+ALU or
+        MUL+dual-add/subtract multifunction op) always touches both ALU
+        (the ALU sub-op's own flags, PRM's "flags from the ALU op") and
+        MULT (compute_multi.py always also forgets MN/MV/MU/MI, since the
+        multiplier result format is unmodelled for a multifunction op too)
+        -- including a MULTIFN row tools/sharcdb.py itself leaves as
+        `unknown: multifn_alu_compute` for its DATA effect (the ALU sub-op's
+        variable-width operand table isn't modelled there), since the flags
+        effect is unconditional regardless of whether the data effect could
+        be named.
+      - Type2c's 12-bit short-compute field (never in COMPUTE_FORMS):
+        opcode 0x7/0xF (mul_ssi/fmul) is MULT; every other opcode there
+        (add/sub/pass/comp/not/inc/dec/fadd/fsub/float/fcomp) is ALU.
+      - Type6a_mem's ShiftImm sub-instruction (PRM Table 18-9): always
+        SHIFT for a recognised opcode (tools/sharcfn._SHIFTIMM_MNEMONICS),
+        including btst (register bit-test sets SZ, PRM p.513 -- an entirely
+        different flag from Type18a's BTF below) and the "[status only]"
+        case tools/sharcdb.py's own `_shiftimm_regdef_reguse` leaves with no
+        data regdef row at all.
+      - Type18a's system bit-test/xor-test (bop 4/5, forms_system.py's
+        `_type_18a`): BTF. tools/sharcdb.py's `register_effects` records no
+        regdef row for this case either (it only reads its source register
+        into BTF, never writes one) -- the gap the frame-render survey
+        found: a slice for a BTF-reading branch used to walk back through
+        the block's last *unrelated* compute (any kind='compute' regdef, on
+        the old whole-ASTAT rule) instead of the real Type18a bit-test.
+
+    Returns () for a compute field this file/tools/sharcdb.py doesn't model
+    at all (field absent/zero, or an sharcinv.classify_compute() cu this
+    table has no PRM-sourced group for -- 'CU3' -- or a Type6a_mem opcode
+    outside _SHIFTIMM_MNEMONICS): left unmodelled, not guessed, exactly like
+    tools/sharcdb.py's own regdef/reguse `unknown` tags.
+    """
+    if t in sharcinv.COMPUTE_FORMS:
+        field23 = f.get("compute")
+        if not field23:
+            return ()
+        cu, _detail = sharcinv.classify_compute(field23)
+        if cu == "ALU":
+            return ("ALU",)
+        if cu == "MULT":
+            return ("MULT",)
+        if cu == "SHIFT":
+            return ("SHIFT",)
+        if cu == "MULTIFN":
+            return ("ALU", "MULT")
+        return ()
+    if t == "2c":
+        field12 = f.get("compute")
+        if field12 is None:
+            return ()
+        opcode = (field12 >> 8) & 0xF
+        return ("MULT",) if opcode in (0x7, 0xF) else ("ALU",)
+    if t == "6a_mem":
+        field = f.get("shiftimm", 0) & 0x7FFFFF
+        opcode = (field >> 16) & 0x3F
+        if opcode not in sharcfn._SHIFTIMM_MNEMONICS:
+            return ()
+        return ("SHIFT",)
+    if t == "18a":
+        return ("BTF",) if f.get("bop") in (4, 5) else ()
+    return ()
+
+
+def _cond_astat_groups(cond):
+    """Which _ASTAT_GROUPS a Type2a-family IF-cond field (PGR Table 10-4)
+    reads: the same cond encoding, and the same PRM p.4-53 LT/GE/LE/GT
+    special case, tools/sharc_run.py's _fork_diagnosis() reads for a Halt
+    message -- this returns group names for defuse()/slice() instead of the
+    register/flag names _fork_diagnosis reports. MODE1 (also read by
+    EQ/NE's PEYEN check and LT/GE/LE/GT's ALUSAT term) is a plain UREG, not
+    an ASTATx bit group, so it is out of scope here -- defuse()/slice()
+    already track a real UREG like MODE1 through its own ordinary reguse
+    rows when one exists, same as before this function existed."""
+    if cond is None or cond == sharcfn.ALWAYS_TRUE_COND:
+        return ()
+    if cond in (0x00, 0x10):  # EQ / NE: AZ
+        return ("ALU",)
+    if cond in (0x01, 0x02, 0x11, 0x12):  # LT / GE / LE / GT: AF, AN, AZ, AV
+        return ("ALU",)
+    bits = sharc_trace.SIMPLE_COND_BITS.get(cond)
+    if bits is not None:
+        bit, _negate = bits
+        group = _ASTAT_GROUP_BIT.get(bit)
+        if group is not None:
+            return (group,)
+    return ()
+
+
 def load(
     name,
     sections_dir=SECTIONS_DIR,
@@ -202,6 +356,9 @@ class Image:
         self._succ_cache = None
         self._notes_attached = False
         self._cross_cache = {}
+        self._cfg_cache = {}
+        self._callgraph_cache = None
+        self._defuse_cache = {}
 
     def close(self):
         for other in self._cross_cache.values():
@@ -315,12 +472,523 @@ class Image:
             return False, None
         return True, [_hex(b) for b in nx.shortest_path(g, b1, b2)]
 
+    # --- graphs (networkx layer) -------------------------------------------------
+    #
+    # cfg()/callgraph()/defuse() build small networkx graphs in-process from
+    # tables tools/sharcdb.py already fills (bblocks/succ/edges/regdef/
+    # reguse/insn/mem_access/ptr/literals), the same reasoning that file's
+    # own _detect_callgraph/_detect_dominators_and_loops already apply
+    # internally at build time -- exposed here, cached per Image, so an
+    # analysis question is a networkx call on an already-open image instead
+    # of a fresh ad hoc SQL query or a throwaway script every time. Nothing
+    # here is persisted: sharcdb.py's schema and DB_VERSION are untouched.
+
+    def _bblocks_for(self, func):
+        """[(start_sw, end_sw, n_insns), ...] for one function, sorted."""
+        return self.db.execute(
+            "SELECT start_sw, end_sw, n_insns FROM bblocks WHERE image=? AND function_sw=? ORDER BY start_sw",
+            (self.name, func),
+        ).fetchall()
+
+    def cfg(self, func):
+        """The basic-block CFG of one function: bblocks/succ restricted to
+        it. Nodes are block start sws (attrs start/end/n_insns as hex/int,
+        is_loop_header from `loops`); edges carry succ's own `kind`
+        (fallthrough/jump/cond_taken/cond_not_taken/call_return/loop_back/
+        loop_exit/return/indirect -- see sharcdb.py's SCHEMA comment on
+        `succ`). Cached per function entry sw."""
+        if func in self._cfg_cache:
+            return self._cfg_cache[func]
+        g = nx.DiGraph()
+        for start, end, n_insns in self._bblocks_for(func):
+            g.add_node(
+                start,
+                start=_hex(start),
+                end=_hex(end),
+                n_insns=n_insns,
+                is_loop_header=False,
+            )
+        for from_block, to_block, kind in self.db.execute(
+            "SELECT s.from_block, s.to_block, s.kind FROM succ s "
+            "JOIN bblocks b ON b.image = s.image AND b.start_sw = s.from_block "
+            "WHERE s.image=? AND b.function_sw=?",
+            (self.name, func),
+        ).fetchall():
+            if to_block is not None and to_block in g.nodes:
+                g.add_edge(from_block, to_block, kind=kind)
+        for (header,) in self.db.execute(
+            "SELECT header_block FROM loops WHERE image=? AND function_sw=?",
+            (self.name, func),
+        ).fetchall():
+            if header in g.nodes:
+                g.nodes[header]["is_loop_header"] = True
+        self._cfg_cache[func] = g
+        return g
+
+    def callgraph(self):
+        """The whole image's function-level CALL graph (edges.kind='call'),
+        built once and cached -- the same construction cards() and
+        tools/sharcdb.py's own _detect_callgraph use, now shared instead of
+        each building its own copy."""
+        if self._callgraph_cache is not None:
+            return self._callgraph_cache
+        g = nx.DiGraph()
+        g.add_nodes_from(
+            r[0]
+            for r in self.db.execute(
+                "SELECT entry_sw FROM functions WHERE image=?", (self.name,)
+            ).fetchall()
+        )
+        g.add_edges_from(
+            self.db.execute(
+                "SELECT DISTINCT from_function, to_function FROM edges WHERE image=? AND kind='call' "
+                "AND from_function IS NOT NULL AND to_function IS NOT NULL",
+                (self.name,),
+            ).fetchall()
+        )
+        self._callgraph_cache = g
+        return g
+
+    # A family of pseudo-registers standing in for ASTATX/ASTATY: SCHEMA's
+    # `regdef` has no flags entry at all (see sharcdb.py's own comment on
+    # regdef.kind -- compute/mem_load/literal/move/swap/dag_modify/unknown,
+    # never a condition-code register), because tools/sharcdb.py's
+    # register_effects never models one. But PGR Table 10-4's IF-cond field
+    # (insn.cond, see sharcfn.COND_NAMES) reads ASTATX/ASTATY, and PRM:
+    # every ALU/MULT/SHIFT compute updates its own group of those bits as a
+    # side effect (see the module-level _astat_groups_written()/
+    # _cond_astat_groups() docstrings above for exactly which). `_ASTAT`
+    # ("ASTAT") is the old whole-register pseudo-register -- kept, and still
+    # def'd/used alongside the per-group ones below, so a caller that wants
+    # "anything that could have touched any flag" (e.g. a quick survey, or
+    # code written before the per-group split) still gets that. `_ASTAT_GROUPS`
+    # ("ALU"/"MULT"/"SHIFT"/"BTF", pseudo-register names "ASTAT.ALU" etc. --
+    # see _ASTAT_GROUP_REG) are the precise ones: defuse()/slice() def each
+    # group a compute/system-bit-test instruction actually writes (per
+    # _astat_groups_written()), and use only the group(s) a conditional
+    # instruction's own cond actually reads (per _cond_astat_groups()) --
+    # so a slice for a BTF-reading branch (reg="ASTAT.BTF") walks back only
+    # through a real Type18a bit-test/xor-test, never an unrelated ALU/MULT/
+    # SHIFT compute that is architecturally unable to touch BTF (PRM: "BTF
+    # is unaffected" by every ALU op -- see flags.py's _astatx_btst
+    # docstring). An explicit move into ASTATX/ASTATY (Type5a_move/17a's
+    # dstureg == ASTATX/ASTATY, already a real regdef row for that named
+    # ureg) overwrites every bit at once, so it is treated as a def of every
+    # group plus the whole-register pseudo-register, not just one.
+    # Known gap: a compute this file's classifier does not recognise (an
+    # sharcinv.classify_compute() cu of 'CU3', or a Type6a_mem opcode
+    # outside tools/sharcfn._SHIFTIMM_MNEMONICS) is not seen as any ASTAT
+    # source; not silently declared correct, just not modelled -- see the
+    # module docstring's "never from mnemonic text" rule, which rules out
+    # falling back to scanning the rendered mnemonic instead.
+    _ASTAT = "ASTAT"
+    _ASTAT_GROUPS = _ASTAT_GROUPS
+    _ASTAT_GROUP_REG = _ASTAT_GROUP_REG
+
+    def _defuse_inputs(self, entry, end):
+        """Bulk-fetch everything one defuse() build needs for [entry, end):
+        ordered (sw, cond) per instruction, reg lists per sw for regdef/
+        reguse, mem_access/literals rows for node attrs on a mem_load/
+        literal def, and the ASTAT bit group(s) (see _astat_groups_written())
+        each sw's own decoded form/fields write -- a handful of range-scan
+        queries instead of one query per instruction. `insn`'s already-
+        stored `form`/`fields` columns (the same typed decode
+        tools/sharcdb.py's own register_effects() used to build regdef/
+        reguse) are reused here rather than re-decoding the image bytes."""
+        insn_rows = self.db.execute(
+            "SELECT sw, cond, mnemonic, form, fields FROM insn "
+            "WHERE image=? AND function_sw=? AND aligned=1 ORDER BY sw",
+            (self.name, entry),
+        ).fetchall()
+        insns = [
+            (sw, cond, mnemonic) for sw, cond, mnemonic, _form, _fields in insn_rows
+        ]
+        astat_groups_by_sw = {}
+        for sw, _cond, _mnemonic, form, fields_json in insn_rows:
+            if form is None or fields_json is None:
+                continue
+            f = sharcinv.merge_fields(json.loads(fields_json))
+            groups = _astat_groups_written(form, f)
+            if groups:
+                astat_groups_by_sw[sw] = groups
+        regdef_by_sw = collections.defaultdict(list)
+        for sw, reg, kind in self.db.execute(
+            "SELECT sw, reg, kind FROM regdef WHERE image=? AND sw>=? AND sw<? ORDER BY sw",
+            (self.name, entry, end),
+        ).fetchall():
+            regdef_by_sw[sw].append((reg, kind))
+        reguse_by_sw = collections.defaultdict(list)
+        for sw, reg in self.db.execute(
+            "SELECT sw, reg FROM reguse WHERE image=? AND sw>=? AND sw<? ORDER BY sw",
+            (self.name, entry, end),
+        ).fetchall():
+            reguse_by_sw[sw].append(reg)
+        mem_by_sw = {}
+        for (
+            sw,
+            space,
+            direction,
+            base_reg,
+            modifier,
+            width,
+            abs_address,
+        ) in self.db.execute(
+            "SELECT sw, space, direction, base_reg, modifier, width, abs_address FROM mem_access "
+            "WHERE image=? AND sw>=? AND sw<?",
+            (self.name, entry, end),
+        ).fetchall():
+            mem_by_sw[sw] = {
+                "space": space,
+                "direction": direction,
+                "base_reg": base_reg,
+                "modifier": modifier,
+                "width": width,
+                "abs_address": _hex(abs_address) if abs_address is not None else None,
+            }
+        ptr_by_sw = {}
+        for sw, base_reg, base_value, address, width in self.db.execute(
+            "SELECT sw, base_reg, base_value, address, width FROM ptr WHERE image=? AND sw>=? AND sw<?",
+            (self.name, entry, end),
+        ).fetchall():
+            ptr_by_sw[sw] = {
+                "base_reg": base_reg,
+                "base_value": _hex(base_value) if base_value is not None else None,
+                "address": _hex(address) if address is not None else None,
+                "width": width,
+            }
+        lit_by_sw = {}
+        for sw, value, form in self.db.execute(
+            "SELECT sw, value, form FROM literals WHERE image=? AND sw>=? AND sw<?",
+            (self.name, entry, end),
+        ).fetchall():
+            lit_by_sw[sw] = {"value": _hex(value), "form": form}
+        return (
+            insns,
+            regdef_by_sw,
+            reguse_by_sw,
+            mem_by_sw,
+            ptr_by_sw,
+            lit_by_sw,
+            astat_groups_by_sw,
+        )
+
+    def _mem_label(self, sw, mem_by_sw, ptr_by_sw):
+        """'record+0x1bc'-style text for a mem_load def at sw, from `ptr`
+        when this pass resolved a concrete address, else the raw base/
+        modifier `mem_access` recorded (see writers()/readers()'s own
+        'resolved' vs 'base_only' distinction)."""
+        ptr = ptr_by_sw.get(sw)
+        if ptr and ptr["address"] is not None:
+            return "%s @ %s" % (
+                _describe_address(int(ptr["address"], 16)),
+                ptr["address"],
+            )
+        mem = mem_by_sw.get(sw)
+        if mem is None:
+            return None
+        if mem["abs_address"] is not None:
+            return _describe_address(int(mem["abs_address"], 16))
+        base = (
+            ptr["base_value"]
+            if ptr and ptr["base_value"] is not None
+            else mem["base_reg"]
+        )
+        if mem["modifier"] is not None:
+            return "%s(%s,%s)" % (mem["space"] or "DM", base, mem["modifier"])
+        return "%s(%s)" % (mem["space"] or "DM", base)
+
+    def defuse(self, func):
+        """Intra-procedural reaching-definitions over one function's cfg():
+        an nx.DiGraph whose nodes are instruction sws (attrs mnemonic, cond,
+        def_kinds: the regdef kinds this sw sets) and whose edges are
+        def -> use, labelled reg=<register, _ASTAT, or one of _ASTAT_GROUPS'
+        "ASTAT.ALU"/"ASTAT.MULT"/"ASTAT.SHIFT"/"ASTAT.BTF">. Built as a
+        standard forward reaching-definitions dataflow (gen/kill per
+        instruction, meet=union, iterated to a fixpoint over cfg()'s cycles
+        -- a hardware DO loop's loop_back edge is just another predecessor
+        at that point, no special-casing needed) with two SHARC-specific
+        gen/kill rules:
+
+          - A conditionally-executed def (insn.cond real, not
+            sharcfn.ALWAYS_TRUE_COND -- a Type2a-family IF-cond compute, a
+            conditional memory form, or a hardware-loop DAG modify) is a
+            may-def: it ADDS itself to the reaching set for that register
+            rather than replacing it (an unconditional def replaces/kills).
+            The same insn.cond also generates a use of the whole-register
+            _ASTAT pseudo-register AND of the specific _ASTAT_GROUPS
+            pseudo-register(s) that cond's own bit(s) read (see
+            _cond_astat_groups()) at that sw, so a conditional branch's or
+            store's condition source shows up in the graph like any other
+            input -- and a slice by the precise group (reg="ASTAT.BTF")
+            never drags in an unrelated compute's ALU/MULT/SHIFT flags, or
+            vice versa.
+          - Any instruction whose own decoded form/fields write one of
+            _ASTAT_GROUPS (see _astat_groups_written(): every COMPUTE_FORMS
+            compute, Type2c's short compute, Type6a_mem's ShiftImm, and
+            Type18a's system bit-test/xor-test -- independent of whether
+            regdef itself has a row there, which it does not for a
+            "[status only]" ShiftImm or a bit-test/xor-test, both of which
+            read a source into a flag but write no data register) is a def
+            of that group's pseudo-register AND of _ASTAT. An explicit move
+            into ASTATX/ASTATY (already an ordinary regdef row for that
+            named ureg, kind 'move'/'literal') is a def of every group at
+            once, since it overwrites the whole register.
+          - A CALL site (edges.kind='call') has no regdef row of its own
+            (register_effects() models no register effect for a call), so
+            it is never a kill here either -- definitions from before a
+            call reach after it unless this file's own decode later adds a
+            call regdef; there is no general caller/callee-saved convention
+            recorded for this ABI to apply instead (docs/findings/06 only
+            pins down R4-as-argument and explicit save/restore spills, both
+            already visible as ordinary regdef/reguse rows).
+
+        A mem_load def's node also carries a `mem` attr (see _mem_label) and
+        a literal def's a `literal` attr (its value), so a slice ending at
+        one prints an address/value, not just a bare sw. Delayed-branch slot
+        instructions need no special handling: sharcdb.py's bblocks already
+        include them as ordinary sequential instructions of the block they
+        end (see its SCHEMA comment on `bblocks`).
+
+        Cached per function entry sw."""
+        if func in self._defuse_cache:
+            return self._defuse_cache[func]
+        fn = self.func(func)
+        if fn is None or int(fn["entry_sw"], 16) != func:
+            raise ValueError("defuse(): 0x%x is not a function entry" % func)
+        entry, end = func, int(fn["end_sw"], 16)
+        cfg = self.cfg(entry)
+        (
+            insns,
+            regdef_by_sw,
+            reguse_by_sw,
+            mem_by_sw,
+            ptr_by_sw,
+            lit_by_sw,
+            astat_groups_by_sw,
+        ) = self._defuse_inputs(entry, end)
+        starts = sorted(b for b in cfg.nodes)
+        insns_by_block = collections.defaultdict(list)
+        for sw, cond, _m in insns:
+            idx = bisect.bisect_right(starts, sw) - 1
+            block = starts[idx] if idx >= 0 else starts[0]
+            insns_by_block[block].append((sw, cond))
+
+        def is_conditional(cond):
+            return cond is not None and cond != sharcfn.ALWAYS_TRUE_COND
+
+        def transfer(block, in_state):
+            """in_state/out_state: {reg: frozenset(def_sw)}. Also returns
+            the def -> use edges this block generates given in_state (a
+            pure function of (block, in_state), recomputed fresh -- never
+            mutated across fixpoint iterations)."""
+            state = dict(in_state)
+            edges = []
+            unresolved = collections.defaultdict(set)
+            for sw, cond in insns_by_block.get(block, ()):
+                cond_here = is_conditional(cond)
+                used = list(reguse_by_sw.get(sw, ()))
+                if cond_here:
+                    used = used + [self._ASTAT]
+                    used = used + [
+                        self._ASTAT_GROUP_REG[group]
+                        for group in _cond_astat_groups(cond)
+                    ]
+                for reg in used:
+                    writers = state.get(reg)
+                    if writers:
+                        for w in writers:
+                            edges.append((w, sw, reg))
+                    else:
+                        unresolved[sw].add(reg)
+                defined = list(regdef_by_sw.get(sw, ()))
+                groups = set(astat_groups_by_sw.get(sw, ()))
+                if any(reg in ("ASTATX", "ASTATY") for reg, _kind in defined):
+                    groups |= set(self._ASTAT_GROUPS)
+                if groups:
+                    defined = defined + [(self._ASTAT, "flags")]
+                    defined = defined + [
+                        (self._ASTAT_GROUP_REG[group], "flags")
+                        for group in sorted(groups)
+                    ]
+                for reg, _kind in defined:
+                    if cond_here:
+                        state[reg] = state.get(reg, frozenset()) | {sw}
+                    else:
+                        state[reg] = frozenset((sw,))
+            return state, edges, unresolved
+
+        # Standard worklist fixpoint: IN[b] = union of OUT[pred] per reg;
+        # monotonic (gen/kill fixed per instruction, meet=union) over a
+        # finite domain (this function's own instruction sws), so this
+        # always terminates.
+        RegState = dict[str, frozenset]
+        IN: dict[int, RegState] = {b: {} for b in cfg.nodes}
+        OUT: dict[int, RegState] = {b: {} for b in cfg.nodes}
+        order = list(cfg.nodes)
+        worklist = collections.deque(order)
+        in_queue = set(order)
+        guard = 0
+        max_iters = 200 * (len(order) + 1)
+        while worklist:
+            guard += 1
+            if guard > max_iters:
+                raise RuntimeError(
+                    "defuse(): fixpoint did not converge for 0x%x after %d iterations"
+                    % (func, guard)
+                )
+            b = worklist.popleft()
+            in_queue.discard(b)
+            preds = list(cfg.predecessors(b))
+            new_in: RegState = {}
+            for p in preds:
+                for reg, sws in OUT[p].items():
+                    new_in[reg] = new_in.get(reg, frozenset()) | sws
+            if new_in != IN[b]:
+                IN[b] = new_in
+            new_out, _edges, _unresolved = transfer(b, IN[b])
+            if new_out != OUT[b]:
+                OUT[b] = new_out
+                for s in cfg.successors(b):
+                    if s not in in_queue:
+                        in_queue.add(s)
+                        worklist.append(s)
+
+        g = nx.DiGraph()
+        for sw, cond, mnemonic in insns:
+            g.add_node(sw, mnemonic=mnemonic, cond=cond, def_kinds=[])
+        for block in order:
+            _out, edges, unresolved = transfer(block, IN[block])
+            for w, sw, reg in edges:
+                if g.has_edge(w, sw):
+                    if reg not in g.edges[w, sw]["regs"]:
+                        g.edges[w, sw]["regs"].append(reg)
+                else:
+                    g.add_edge(w, sw, regs=[reg])
+            for sw, regs in unresolved.items():
+                g.nodes[sw].setdefault("unresolved", set()).update(regs)
+            for sw, _cond in insns_by_block.get(block, ()):
+                for reg, kind in regdef_by_sw.get(sw, ()):
+                    g.nodes[sw]["def_kinds"].append((reg, kind))
+                    if kind == "mem_load":
+                        label = self._mem_label(sw, mem_by_sw, ptr_by_sw)
+                        if label:
+                            g.nodes[sw]["mem"] = label
+                    elif kind == "literal" and sw in lit_by_sw:
+                        g.nodes[sw]["literal"] = lit_by_sw[sw]["value"]
+
+        self._defuse_cache[func] = g
+        return g
+
+    def slice(self, sw, reg=None, depth=None):
+        """Backward data/flag slice ending at sw: the sub-nx.DiGraph of
+        defuse() reachable backward from sw, seeded by sw's own def -> use
+        in-edges (all of them, or only `reg`'s -- pass reg=self._ASTAT, or
+        just reg='ASTAT', for the old whole-register slice; reg="ASTAT.ALU"/
+        "ASTAT.MULT"/"ASTAT.SHIFT"/"ASTAT.BTF" (self._ASTAT_GROUP_REG['ALU'/
+        'MULT'/'SHIFT'/'BTF']) for the precise group the branch's own cond
+        actually reads -- e.g. a BTF-reading branch's slice(reg="ASTAT.BTF")
+        walks back only to a real Type18a bit-test/xor-test, not the last
+        unrelated ALU/MULT/SHIFT compute in the block, which is
+        architecturally unable to touch BTF), then closed over every
+        ancestor's OWN inputs regardless of register (once you are at the
+        instruction that produced a value, everything that fed it matters,
+        not just the one edge that led there). `depth` bounds the number of
+        def-edge hops walked backward from the seed frontier (None:
+        unbounded, i.e. the whole reaching slice)."""
+        fn = self.func(sw)
+        if fn is None:
+            raise ValueError("slice(): no function contains sw=0x%x" % sw)
+        entry = int(fn["entry_sw"], 16)
+        g = self.defuse(entry)
+        if sw not in g:
+            raise ValueError(
+                "slice(): sw=0x%x has no defuse node (not an aligned instruction?)" % sw
+            )
+        seed_edges = [(u, d) for u, _v, d in g.in_edges(sw, data=True)]
+        if reg is not None:
+            seed_edges = [(u, d) for u, d in seed_edges if reg in d.get("regs", ())]
+        frontier = {u for u, _d in seed_edges}
+        visited = set(frontier) | {sw}
+        q = collections.deque((u, 1) for u in frontier)
+        while q:
+            node, hop = q.popleft()
+            if depth is not None and hop >= depth:
+                continue
+            for u, _v, _d in g.in_edges(node, data=True):
+                if u not in visited:
+                    visited.add(u)
+                    q.append((u, hop + 1))
+        return g.subgraph(visited).copy()
+
+    def print_slice(self, sw, reg=None, depth=None):
+        """Text render of slice(sw, reg, depth): one line per instruction
+        (sw, mnemonic, a mem/literal address suffix when the defuse node
+        carries one, an 'unresolved: REG' note for a use with no reaching
+        def in this function -- a parameter or an external value), each
+        line indented under the def(s) that feed it, walked depth-first
+        from sw. A node already printed in full is shown again (dependents
+        can share an ancestor) but not re-expanded, marked '(...)'."""
+        g = self.slice(sw, reg=reg, depth=depth)
+        lines = []
+        expanded = set()
+
+        def line_for(n):
+            d = g.nodes[n]
+            bits = ["0x%x" % n, d.get("mnemonic") or "?"]
+            if d.get("mem"):
+                bits.append("[%s]" % d["mem"])
+            if d.get("literal") is not None:
+                bits.append("[literal=%s]" % d["literal"])
+            if d.get("unresolved"):
+                bits.append("[unresolved: %s]" % ",".join(sorted(d["unresolved"])))
+            return "  ".join(bits)
+
+        def visit(n, indent, via_reg):
+            prefix = "  " * indent + ("<- [%s] " % via_reg if via_reg else "")
+            if n in expanded:
+                lines.append(prefix + line_for(n) + "  (...)")
+                return
+            expanded.add(n)
+            lines.append(prefix + line_for(n))
+            preds = sorted(
+                (
+                    (u, r)
+                    for u, _v, d in g.in_edges(n, data=True)
+                    for r in d.get("regs", ())
+                ),
+                key=lambda t: (-t[0], t[1]),
+            )
+            for u, r in preds:
+                visit(u, indent + 1, r)
+
+        visit(sw, 0, None)
+        text = "\n".join(lines)
+        print(text)
+        return text
+
     # --- registers and data references ------------------------------------------
 
     def last_def(self, reg, sw):
         """The last writer(s) of reg before sw. A bare int when there is one
         unambiguous writer, a list when several distinct blocks disagree,
-        None when there is none."""
+        None when there is none.
+
+        A cheaper, less precise sibling of defuse(): a block-granularity
+        "does any regdef of reg exist between here and there" walk, not a
+        flow-sensitive dataflow -- it has no notion of a conditional def
+        (see defuse()'s docstring on may-defs), so a block containing one is
+        still treated as a hard stop that kills every earlier reaching def
+        on that path. Cross-checked against defuse() over every (use sw,
+        reg) pair in FUN_1c4f81/FUN_1c642a/FUN_1c2b24 (2526 pairs, 2026-09):
+        95% agree exactly; all 129 disagreements are this gap, split
+        ~roughly 60/40 into last_def missing an older def a may-def kept
+        alive for defuse (its result a subset of defuse's reaching set) and
+        last_def keeping a block-level candidate defuse's per-instruction
+        analysis determines is shadowed before it actually reaches sw (a
+        superset, or overlapping-but-different, of defuse's set) -- never a
+        case where last_def found nothing defuse could. For a precise
+        answer, or when reg's conditionality matters, use defuse()/slice()
+        instead."""
         rows = self.db.execute(
             _LAST_DEF_SQL,
             (
@@ -328,6 +996,7 @@ class Image:
                 self.name,
                 sw,
                 sw,
+                self.name,
                 self.name,
                 self.name,
                 self.name,
@@ -775,18 +1444,7 @@ class Image:
             raise ValueError(
                 "cards(): order must be 'bottom_up' or 'top_down', got %r" % order
             )
-        fn_rows = self.db.execute(
-            "SELECT entry_sw FROM functions WHERE image=?", (self.name,)
-        ).fetchall()
-        G = nx.DiGraph()
-        G.add_nodes_from(r[0] for r in fn_rows)
-        G.add_edges_from(
-            self.db.execute(
-                "SELECT DISTINCT from_function, to_function FROM edges WHERE image=? AND kind='call' "
-                "AND from_function IS NOT NULL AND to_function IS NOT NULL",
-                (self.name,),
-            ).fetchall()
-        )
+        G = self.callgraph()
         if root is not None:
             roots = root if isinstance(root, (list, tuple, set)) else [root]
             keep = set()
@@ -882,8 +1540,38 @@ class Image:
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if len(argv) >= 2 and argv[1] == "--slice":
+        if len(argv) < 3:
+            print(
+                "usage: sharc.py IMAGE --slice SW [--reg REG] [--depth N]",
+                file=sys.stderr,
+            )
+            return 1
+        img = load(argv[0])
+        sw = int(argv[2], 0)
+        reg, depth = None, None
+        rest = argv[3:]
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--reg" and i + 1 < len(rest):
+                reg = rest[i + 1]
+                i += 2
+            elif rest[i] == "--depth" and i + 1 < len(rest):
+                depth = int(rest[i + 1])
+                i += 2
+            else:
+                print(
+                    "usage: sharc.py IMAGE --slice SW [--reg REG] [--depth N]",
+                    file=sys.stderr,
+                )
+                return 1
+        img.print_slice(sw, reg=reg, depth=depth)
+        return 0
     if len(argv) != 2:
         print('usage: sharc.py IMAGE "SQL"', file=sys.stderr)
+        print(
+            "       sharc.py IMAGE --slice SW [--reg REG] [--depth N]", file=sys.stderr
+        )
         return 1
     img = load(argv[0])
     for row in img.sql(argv[1]):

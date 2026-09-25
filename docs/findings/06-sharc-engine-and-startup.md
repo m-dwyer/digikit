@@ -3418,10 +3418,20 @@ sets +0x1ba = 1 and the short 1 at +0x1b8 (`0x1c4eb9`, `0x1c4ebb`).
 `0x1c4f81` never reads +0x1ba; +0x1bb != 0 selects the descending loop
 `0x1c52ab` (`0x1c507f`); past the limit with +0x1bc = 0 it clears +0x1b8
 (`0x1c5008`, `0x1c5048`); a wrap copies +0x1bc to +0x1b8 (`0x1c50fe`,
-`0x1c530a`, `0x1c5325`). It tests +0x1b9 (`0x1c526d`); fade-out: **[D]**.
+`0x1c530a`, `0x1c5325`). An execution run seemed to refute this; the cause
+was an emulator bug (`_type_3d` read 4 bytes instead of 1), so the claim
+stands: see "Wrap copies +0x1bc" below. It tests +0x1b9 (`0x1c526d`);
+fade-out: **[D]**.
 
 **Render and declick [C][V].** `DO 64`; six `(swse)` int16 taps, 6
-coefficient words at `0x25d940 + idx*24` bytes, `float_by -15`. `0xb80000`
+coefficient words at `0x25d940 + idx*24` bytes, `float_by -15`. **[C]** The
+coefficient reads and the `float_by -15` are both wrong: the six int16
+`(swse)` taps are the sample reads (confirmed, forward window from the
+sample pointer, not centred), and the six coefficients are Q31, read as
+three Type15b `(lw)` register-pair loads, not individually or as int16;
+`float_by -15` applies once, to the summed MAC output after saturation, not
+per coefficient. The table has 256 rows, not 128. See "One voice renders
+correctly" below. `0xb80000`
 reads 64, writes 32, x0.5. +0x17d zeroes samples until a sign change
 against word 0x60 or |x| <= 0.001, then clears; +0x17e reseeds word 0x60;
 +0x17c runs one linear fade-in, then clears. **[C]** Declick flags, not
@@ -3483,3 +3493,114 @@ the 32 words at `0x24ef2c`; `0x253df8[k] = 0x252df8 + k*0x80` for k = 0..31.
 voice's word +0 = `0x8045a6c8` (the `R8` argument) and +0x1b8 = 0, so a
 non-null word +0 alone does not mean a sample is assigned; +0x1a4 reads 184
 for every voice. **[O]** What `0x1c7442` stores in the other record words.
+
+## One voice renders correctly (2026-09-25)
+
+Two agents checked this round: one against the raw image bytes and the
+public PRM encode tables, one by concrete execution
+(`tools/sharc_run.py`/`tools/sharc_harness.py` from the post-init state).
+This corrects the coefficient-table claim above and closes the 6-tap render
+loop `FUN_1c4f81` end to end.
+
+**Sample reads [V][C].** The render loop's sample reads (sw `0x1c50b4`,
+`0x1c50c2`, `0x1c50cd`, `0x1c50d2`, `0x1c50d7`, `0x1c50db`; the reverse loop
+`0x1c52c9`-`0x1c52f0`) are Type3b `(swse)` int16 loads, checked against the
+PRM's BHSE encode table (p.14-19/14-20; the `(1,1,0)` -> `(swse)` row is
+split across the page break) and by execution (an impulse sweep gives
+I3/I4 = `0x310000 + 2t`). Samples are packed int16 at 2-byte steps from the
+sample base; tap `t` pairs with `sample[base+t]` -- a forward window from
+the current position, not a centred one.
+
+**Coefficient table `0x25d940` [V][C].** 256 rows of 24 bytes, each row six
+32-bit Q31 coefficients, read as three (LW) register-pair loads (`0x1c50b9`,
+`0x1c50c4`, `0x1c50c8`; PRM p.6-6, Type15b). The row index is
+`floor(frac(phase) * 256) mod 256` (`I5` after `0x1c50b6`, 80/80 matches in
+execution). This corrects "Render and declick" above: the coefficients are
+not `(swse)` int16 taps with `float_by -15`, and the table has 256 rows, not
+128. The table has no bytes in the static image; init fills it at run time.
+
+**Interpolated output [V].** `MRF` accumulates six SSF (signed fractional)
+products (`0x1c50bb` then MACs `0x1c50c6`-`0x1c50dd`); `0x1c50df` `R2 = SAT
+MRF (SF)` (compute `cu=1`, opcode `0x09`, `Rn=2`); `0x1c50e3` `F2 = FLOAT R2
+BY R6` (compute field `0x0DA226`: `cu=0`, opcode `0xDA`, `Rn=2`, `Rx=2`,
+`Ry=6`), with `R6 = -15` set at `0x1c508c`. Bit-exact against register
+values in 3 execution cases. A decode reading this as `float_by(F2,F6)` or
+`R0 = SAT MRF` is wrong.
+
+**Type 7a MODIFY `(sw)`/`(nw)` [V].** Type 7a MODIFY has `(sw)`/`(nw)` bits
+`w=bit39`, `l=bit23` (PRM "BH (Type 7a)" encode table p.13-48: `(0,1)` ->
+`(sw)` (M x2), `(1,0)` -> `(nw)`); our decode table lacked them and scaled
+every MODIFY by 4. In the render loop, `0x1c50af`, `0x1c50ca`, `0x1c50cf`,
+`0x1c50d4` are `(sw)`; `0x1c50b6` is `(nw)`. Recorded in finding 05 (ISA);
+this is where it was found.
+
+**Sample-length bound [V].** Record words 0x62/0x63 (byte offsets
++0x188/+0x18C) are a sample-length bound, Q31 int64 low word first, merged
+as `(w63<<31)|(w62>>1)` at `0x1c4f97`/`0x1c4f9d`; the play bound is
+`min(END, LENGTH)` (execution: LENGTH alone deactivates the voice at
+`0x1c5008`). Init writes +0x188 = `0x170` (368 samples) and +0x1A4 = 184
+(END high word; Q31 int64, so 184 in the high word is 368 samples) for
+every voice. Q31 position fields are plain Q31 int64 counts of samples.
+
+**Past-limit doubling, mechanism confirmed / source [D].** The render's
+second argument `R12` (set at `FUN_1c642a`'s call sites `0x1c6aee`/`0x1c6afd`:
+`R4 = ` pass `R13`, `R12 = R15`) is doubled at `0x1c4ef8` (`R0 = R2+R2`, `R2 = `
+pass `R12` at `0x1c4ef5`), stored at `0x1c4f1b` `DM(I6-5)`, and used by the
+past-limit test (`0x1c4fb1`/`0x1c4fb7`/`0x1c4fbc`). `R15 = DM(I2)` at
+`0x1c6501`; `I2` is a live-in of `FUN_1c642a`, reported to resolve to
+`0x252d3c` (init writes 32 there at `0x1c1643`) -- **[D]**, not checked by a
+second agent. By execution, the value selects which code path clears ACTIVE
+(the `0x1c5008` look-ahead vs the `0x1c50fe` in-loop path) but did not
+change the outcome with generous bounds.
+
+**Wrap copies +0x1bc [D].** The wrap stores `DM(I1-3) = R2` (`0x1c50fe`,
+forward) and `DM(I2-3) = R2` (`0x1c5325`, reverse) are Type4d byte stores to
++0x1b8. `R2` comes from the Type3d load at `0x1c50fb`/`0x1c5322`
+(`R2 = DM(I1,M6)`), whose fields l=0, x=0, w=0 select a byte access: one
+byte at +0x1bc (LOOP). The emulator's `_type_3d` ignored l/x and read a
+normal word at `I1 + M6*4` (+0x1bf, zero padding), which made ACTIVE clear
+on every wrap and looked like a refutation. With the byte read, ACTIVE keeps
+LOOP's value across the wrap, as "Flags and seed" says. Checked by one agent
+(field decode and a register override at the load); **[O]** until the
+emulator fix and a second check.
+
+**BITEXT, still open [O].** The frame-render fcomp at `0x1c4969`
+(`FUN_1c4914`, `IF LT`) does not depend on `BITEXT`: its flags are ALU-group,
+`BITEXT` writes only shifter flags, and the `BITEXT` result `R0` from the
+call at `0x1c4949` is overwritten before use -- that part is **[V]**. The
+five `BITEXT (NU)` sites (opcode `0x19`) all carry `BITLEN12` outside 0..32
+(95, 535, 384, 192, 256) in dt2-1.16, dt2-1.15C and dn2-1.11 (192, 256); the
+two opcode `0x14` sites (`0xb884b7`/`0xb884ba`) are `BITEXT 32` after a
+`BFFWRP` read, matching the manual's example. The width decode is
+unambiguous (a single 48-bit match) -- either an encoding row error in our
+compute table for `BITEXT (NU)`, or real use of that range. `0xb88fe6` is
+unreachable (after an unconditional delayed jump). Both remain **[O]**.
+
+**Frame call path [D].** The audio task loop `0x1c7749`-`0x1c775d` waits
+(`CALL 0xb86b1e`) then calls the block handler `0x1c74cd`, which dispatches
+through the table at `0x25f7b0` = `{0x1c7524, 0x1c75d8, 0x1c763c,
+0x1c7671}`; command 3 (`0x1c7671`) converts ring B (`0x261ec8 + (flag<<8)`)
+and ring D (`0x263138 + (flag<<11)`) from Q31 to float (5 calls to
+`0x1c7462`), where `flag = DM(0x25f780) & 1`, then at `0x1c771e` calls
+`FUN_1c2b24` with `R4 = 0x25f180` (master mix input), `R12 = DM(I6-3)`
+written by the command dispatcher `0x1c778a` (ring C pointer), `R1 =
+DM(I6-2)`. `FUN_1c2b24` stores `R4 -> DM(I6-17)`, `R12 -> DM(I6-19)`, `R1 ->
+DM(I6-18)`; `M9` (from `R1`) feeds stores to
+`0x254d78`/`0x254d80`/`0x254d88`/`0x254d90`; the load at
+`0x1c2d06`/`0x1c2d0b` reads `DM(R12 + 0x73c)`. Harness entry point used
+here: poke `DM(0x261ca4) = 0`, `DM(0x264220) = 3`, `DM(0x25f780) = 0`, then
+call `0x1c74cd`. This is consistent with "The audio path from the task loop
+to the rings" above and adds the harness entry.
+
+**MMR 0x300c0, not reproduced [O].** The claim that the render reads core
+MMR `0x300c0` (written only by ISR `0x1c0b1d`) was not reproduced this
+round: there is no static access to `0x300c0` anywhere in the image.
+`0x1c0b1d`, which is ISR-shaped, reads and writes core MMR `0x300eb`
+(`0x1c0b8f`/`0x1c0b92`) and writes `0x3108900c`.
+
+**One voice renders correctly, end to end [V].** From the post-init state
+(init `FUN_1c15e3` run to return, then setup), one voice renders 8+ blocks
+at rates 0.5, 0.75, 1.0, 1.5, 2.0 with max error 2.4e-5..3.0e-5 against a
+reference built from the rules above; a 1 kHz sine source gives a clean
+periodic output with no block-boundary glitches. The output rate after 2:1
+decimation is taken to be 48 kHz **[D]**.

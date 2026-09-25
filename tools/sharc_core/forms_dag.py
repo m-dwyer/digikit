@@ -65,6 +65,19 @@ def _type_7a(
     destination_low = source_low ^ _field(f, "idis")
     source, destination = source_low + bank, destination_low + bank
     modifier = _field(f, "m") + bank
+    # PRM p.348's "BH (Type 7a)" encode table (bits 39/23, labels "w"/"l"
+    # here): (w, l) = (0, 0) blank, (0, 1) "(sw)", (1, 0) "(nw)" -- MODIFY's
+    # own short-word/normal-word address-scale selector, previously
+    # undecoded (decode_table.json had no field at either bit) so this form
+    # always scaled M as normal-word. dt2-1.16's voice-render inner loop
+    # (0x1c50af/0x1c50ca/0x1c50cf/0x1c50d4, all indexing a 16-bit PCM
+    # sample buffer through I4) decodes w=0, l=1 -- "(sw)" -- at every one
+    # of its MODIFY-with-compute and bare MODIFY instructions. l is not in
+    # every hand-built test fixture's fields dict, so default it to 0
+    # (normal-word, the previous behaviour) rather than raise. (1, 1) is
+    # not in the manual's table; treat it like l alone (short-word) since
+    # that is the only bit this tracer has evidence for.
+    access_width = "short-word" if f.get("l") else "normal-word"
     conditional = cond == 0x17
     circular_wrap: Const | None = None
     if conditional:
@@ -79,7 +92,7 @@ def _type_7a(
             base = _ureg(state.uregs, UREG_CODES["B%d" % source])
             index_now = _ureg(state.uregs, 16 + source)
             modifier_now = _ureg(state.uregs, 32 + modifier)
-            scale_now = _access_modifier_scale("normal-word", state.assume_nw32)
+            scale_now = _access_modifier_scale(access_width, state.assume_nw32)
             if (
                 isinstance(base, Const)
                 and isinstance(index_now, Const)
@@ -160,7 +173,7 @@ def _type_7a(
     else:
         index_value = _ureg(state.uregs, 16 + source)
         modifier_value = _ureg(state.uregs, 32 + modifier)
-        scale = _access_modifier_scale("normal-word", state.assume_nw32)
+        scale = _access_modifier_scale(access_width, state.assume_nw32)
         scaled_modifier = _multiply(
             modifier_value, Const(scale), "M%d * %d" % (modifier, scale)
         )

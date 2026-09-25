@@ -170,6 +170,32 @@ def _float_alu_updates(
     return updates
 
 
+def _astatx_bit_test(source: Value, mask: int, xor: bool) -> bool | None:
+    """BIT TST / BIT XOR (SHARC+ Core Programming Reference, "Type 18a
+    ISA/VISA (register bit manipulation)", p.401/16-2-16-3): the test
+    operation sets BTF if every bit set in the data value (MASK) is also
+    set in the system register; the XOR operation sets BTF if the system
+    register equals the data value exactly.
+
+    Both predicates only ever need specific bits of SOURCE -- TST only the
+    ones MASK sets, XOR all 32 -- so a PartialConst (ASTATX/ASTATY are the
+    only registers ever stored that way, per ``PartialConst``'s docstring)
+    can still decide the result when just those bits are known, and a
+    single known bit that already disagrees decides it even with the rest
+    unknown.
+    """
+    tested = range(32) if xor else (bit for bit in range(32) if mask & (1 << bit))
+    unknown = False
+    for bit in tested:
+        want = bool(mask & (1 << bit))
+        known = _astatx_known_bit(source, bit)
+        if known is None:
+            unknown = True
+        elif known != want:
+            return False
+    return None if unknown else True
+
+
 def _astatx_from_updates(updates: dict[int, bool | None]) -> Callable[[Value], Value]:
     """Wrap a pre-built updates dict as an ASTATX updater function, matching
     the ``Callable[[Value], Value]`` contract every other compute-table

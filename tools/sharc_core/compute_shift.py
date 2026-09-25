@@ -86,6 +86,128 @@ def _field_deposit_or(
     return Const((dest.value & 0xFFFFFFFF) | deposited)
 
 
+_BFF_WORD_MASK = 0xFFFFFFFF
+_BFF_MASK64 = (1 << 64) - 1
+
+
+def _as_operand(value: Operand | MR, label: str) -> Operand:
+    """Narrow a special-dict value (``Mapping[str, Operand | MR]``, shared
+    with MRF/MRB) down to Operand for mypy. BFF_HI/BFF_LO/BFFWRP are never
+    modelled as MR -- only the multiplier accumulator is -- so this is
+    always a no-op in practice; it reports Unknown instead of raising if
+    that invariant is ever broken, rather than letting an MR silently reach
+    arithmetic that assumes a 32-bit Operand."""
+    return value if not isinstance(value, MR) else Unknown(label)
+
+
+def _bff_words(
+    special: Mapping[str, Operand | MR] | None,
+) -> tuple[Operand, Operand]:
+    """The bit FIFO's current 64-bit content as (hi, lo) 32-bit halves.
+
+    PRM p.3-18 (out/refs/sharc-plus-prm/all.txt:3507-3511) / PGR p.11-86
+    (pgr.txt:23287): "The bit FIFO consists of a 64-bit register internal
+    to the shifter and an associated write pointer register... The bit
+    FIFO register and write pointer can be accessed only through the
+    BITDEP and BITEXT instructions." New bits pack in from the write
+    pointer's boundary (MSB-first); BITEXT always reads from the top.
+    Tracked in STATE.special (see this module's own docstring) as
+    "BFF_HI" (bits [63:32]) and "BFF_LO" (bits [31:0]), the same dict
+    BFFWRP already uses. Absent -- nothing in dt2-1.16 ever executes a
+    BITDEP, so this is the default in every trace of this image; see
+    _bff_deposit's docstring -- reads as Unknown, matching BFFWRP's own
+    uninitialized default below."""
+    absent = Unknown("uninitialized bit FIFO")
+    hi = (special or {}).get("BFF_HI", absent)
+    lo = (special or {}).get("BFF_LO", absent)
+    return _as_operand(hi, "BFF_HI is an MR"), _as_operand(lo, "BFF_LO is an MR")
+
+
+def _bff_extract(
+    hi: Operand, lo: Operand, bitlen: int
+) -> tuple[Operand, Operand, Operand]:
+    """BITEXT's documented pseudocode (PGR p.11-91, pgr.txt:23446-23452):
+
+        1. Rn = FEXT BFF[63:32] BY <(32-bitlen)>:<bitlen>
+        2. BFF = BFF << bitlen
+
+    (step 3, BFFWRP -= bitlen, is the caller's job -- it runs independently
+    of whether the FIFO content itself is known). Folding BFF's two 32-bit
+    halves into one 64-bit int and shifting that reproduces step 1 exactly
+    for any BITLEN in [0, 32]: with HI/LO known, ``combined >> (64 -
+    bitlen)`` keeps only HI's top BITLEN bits (LO's 32 bits fall off the
+    bottom of a right shift of 32 or more), the same bits step 1's FEXT on
+    BFF[63:32] alone would read; the same combined value left-shifted by
+    BITLEN and re-split is step 2. Returns (extracted, new_hi, new_lo).
+
+    A BITLEN outside 0..32 is documented "prohibited" (PGR p.11-91) for
+    step 1 -- FEXT on a single 32-bit word cannot return more than 32 bits
+    -- but step 2's 64-bit shift has no such limit, and dt2-1.16 does
+    decode BITEXT/BITEXT(NU) with BITLEN12 values as large as 535 (see
+    tests/test_sharc_compute_shift.py), so this function stays crash-safe
+    (no negative Python shift) for any non-negative BITLEN and still
+    returns the shifted FIFO; the ShiftImm opcode 0x14/0x19 handler below
+    is the one that discards EXTRACTED and substitutes Unknown when BITLEN
+    is out of range, per this file's own module docstring on staying
+    Unknown only where the manual actually says so."""
+    if bitlen == 0:
+        return Const(0), hi, lo
+    if not isinstance(hi, Const) or not isinstance(lo, Const):
+        unknown = Unknown("bitext: bit FIFO content unknown")
+        return unknown, unknown, unknown
+    combined = (hi.value << 32) | lo.value
+    shift_out = 64 - bitlen
+    extracted = combined >> shift_out if shift_out >= 0 else combined << -shift_out
+    extracted &= (1 << bitlen) - 1
+    shifted = (combined << bitlen) & _BFF_MASK64
+    return (
+        Const(extracted),
+        Const((shifted >> 32) & _BFF_WORD_MASK),
+        Const(shifted & _BFF_WORD_MASK),
+    )
+
+
+def _bff_deposit(
+    hi: Operand, lo: Operand, wrp: int, source: Operand, bitlen: int
+) -> tuple[Operand, Operand]:
+    """BITDEP's documented pseudocode (PGR p.11-87, pgr.txt:23313-23319):
+
+        BFF = BFF OR FDEP Rx BY <64-(BFFWRP+bitlen)>:<bitlen>
+
+    (step 2, BFFWRP += bitlen, is the caller's job). BITDEP has no shiftop
+    or shiftimm encoding in either public table this project transcribed in
+    full -- tools/sharcspec/compute_table.json's own shiftop_shiftimm
+    cross_check note records that PGR omits it entirely ("may be a
+    214xx-only op") -- and none of dt2-1.16's decoded SHARC+ instructions is
+    one, so this project has no opcode to wire it to (this is also why
+    _bff_words above always finds "BFF_HI"/"BFF_LO" absent on this image).
+    Implemented anyway, sharing _bff_extract's 64-bit-int model, purely so
+    tests/test_sharc_compute_shift.py can hand-verify that model against
+    the PRM/PGR's BITDEP+BITEXT pairing (out/refs/sharc-plus-prm/
+    all.txt:3495-3545's header extraction/creation listings) without a
+    decode site to drive it through."""
+    if bitlen == 0:
+        return hi, lo
+    if (
+        not isinstance(hi, Const)
+        or not isinstance(lo, Const)
+        or not isinstance(source, Const)
+    ):
+        unknown = Unknown("bitdep: operand unknown")
+        return unknown, unknown
+    position = 64 - (wrp + bitlen)
+    if position < 0:
+        # "Attempts to append more bits than the bit FIFO has room for
+        # results in an undefined bit FIFO and write pointer. SV is set in
+        # that case" (PGR p.11-87).
+        unknown = Unknown("bitdep: fifo overflow (wrp=%d, bitlen=%d)" % (wrp, bitlen))
+        return unknown, unknown
+    combined = (hi.value << 32) | lo.value
+    field = source.value & ((1 << bitlen) - 1)
+    combined |= (field << position) & _BFF_MASK64
+    return Const((combined >> 32) & _BFF_WORD_MASK), Const(combined & _BFF_WORD_MASK)
+
+
 def _shift_immediate(
     f: Mapping[str, int],
     values: Mapping[int, Value],
@@ -94,9 +216,11 @@ def _shift_immediate(
     """Execute the documented ShiftImm subset seen on qualifying paths.
 
     SPECIAL is the same special-register mapping ``_compute`` reads MRF
-    from (currently just "BFFWRP", the bit-FIFO write pointer opcodes 0x14/
-    0x19/0x1f below read and update); it defaults to None for every caller
-    that does not need those opcodes."""
+    from: "BFFWRP" (the bit-FIFO write pointer; opcodes 0x14/0x19/0x1f
+    below read and update it) and "BFF_HI"/"BFF_LO" (the bit FIFO's own
+    64-bit content, tracked as two 32-bit halves; opcodes 0x14/0x19 read
+    and update these too -- see _bff_words/_bff_extract below). Defaults to
+    None for every caller that does not need those opcodes."""
     field = (_field(f, "shiftimm[22:16]") << 16) | _field(f, "shiftimm[15:0]")
     opcode = (field >> 16) & 0x3F
     data8 = (field >> 8) & 0xFF
@@ -252,32 +376,105 @@ def _shift_immediate(
         return "BFFWRP", new_wrp, "bffwrp-write", _astatx_from_updates(updates)
     if opcode in (0x14, 0x19):
         # compute_table.json shiftop_shiftimm rows 010100/011001 / PGR
-        # p.11-86/11-90 (pgr.txt:23271-23336): RN = BITEXT RX|BITLEN12(,NU).
-        # Extracts the top BITLEN12 bits of the internal 64-bit bit FIFO
-        # into RN, left-shifts the FIFO by that amount, and decrements
-        # BFFWRP by the same amount; 0x19's NU modifier skips the FIFO/
-        # pointer update (and leaves SF untouched -- PGR: "the SF flag is
-        # not updated"). This tracer does not model the FIFO's 64-bit
-        # content (no instruction in this image's coverage scan writes it --
-        # BITDEP never appears), so RN is always Unknown; BFFWRP itself is
-        # still tracked from BFFWRP= writes (opcode 0x1f above / 0x7c in
-        # _compute) where known, so SF/SV stay meaningful even though RN
-        # does not.
+        # p.11-90/11-91 (pgr.txt:23402-23481; PRM p.3-18, all.txt:
+        # 3507-3511): RN = BITEXT RX|BITLEN12(,NU). Extracts the top
+        # BITLEN12 bits of the shifter's internal 64-bit bit FIFO into RN,
+        # left-shifts the FIFO by that amount, and decrements BFFWRP by the
+        # same amount; 0x19's NU modifier skips the FIFO/pointer update
+        # (PGR: "does not modify the bit FIFO or Write pointer") and leaves
+        # SF reflecting the un-updated pointer instead. The FIFO is tracked
+        # via _bff_words/_bff_extract above (special["BFF_HI"/"BFF_LO"]);
+        # it starts Unknown/absent in every dt2-1.16 trace because nothing
+        # in this image ever executes a BITDEP to fill it (see
+        # _bff_deposit's docstring), so RN, and the FIFO/BFFWRP once a
+        # caller does track them, come out exactly as before this change
+        # whenever the FIFO was never tracked to begin with (BFF_HI/BFF_LO
+        # are only added to the returned destinations when SPECIAL already
+        # carries them, so a caller that never seeds the FIFO keeps the
+        # pre-existing 2-destination (RN, "BFFWRP") shape). What changes
+        # unconditionally: SV now also follows PGR's "attempts to get more
+        # bits than those in the bit FIFO" case (bitlen12 > the current
+        # BFFWRP -- previously ignored entirely), and SZ follows the
+        # manual's actual formula instead of being hardcoded Unknown.
         no_update = opcode == 0x19
         bitlen12 = (_field(f, "dataex[3:0]") << 8) | data8
-        value = Unknown("bitext by %d%s" % (bitlen12, " (nu)" if no_update else ""))
-        updates = {SS_BIT: False, SV_BIT: bitlen12 > 32, SZ_BIT: None}
-        if no_update:
-            return rn, value, "bit-extract-nu", _astatx_from_updates(updates)
+        over_32 = bitlen12 > 32
+        hi, lo = _bff_words(special)
         old_wrp = (special or {}).get("BFFWRP")
+        # PGR p.11-91 documents two distinct, independent error conditions
+        # with two distinct consequences:
+        #   "A value of more than 32 ... is prohibited and use of such a
+        #   value sets SV" (OVER_32) -- invalidates RN (the FEXT-based
+        #   pseudocode only extracts from a single 32-bit word), but the
+        #   pointer/FIFO bookkeeping (step 2/3) is not itself declared
+        #   undefined, so it still runs mechanically.
+        #   "Attempts to get more bits than those in the bit FIFO results
+        #   in undefined pointer and bit FIFO. SV is set in that case"
+        #   (UNDERFLOW) -- explicitly undefines the pointer *and* FIFO too
+        #   (None when BFFWRP is not known, so this tracer cannot tell).
+        underflow = None if not isinstance(old_wrp, Const) else bitlen12 > old_wrp.value
+        pointer_and_fifo_undefined = underflow is True
+        # _bff_extract's 64-bit shift (its pseudocode step 2) is well
+        # defined for any BITLEN12, even one PGR calls "prohibited" for
+        # step 1's FEXT -- Python's shift does not care, and mechanical
+        # pointer/FIFO bookkeeping is exactly what OVER_32 alone leaves
+        # intact. Only actually use its "extracted" element when BITLEN12
+        # is in the documented 0..32 range.
+        extracted, new_hi, new_lo = _bff_extract(hi, lo, bitlen12)
+        value = (
+            Unknown("bitext: undefined (bitlen %d > 32)" % bitlen12)
+            if over_32
+            else extracted
+        )
+        fifo_after: tuple[Operand, Operand] = (
+            (Unknown("undefined bit FIFO"), Unknown("undefined bit FIFO"))
+            if pointer_and_fifo_undefined
+            else (new_hi, new_lo)
+        )
+        if over_32:
+            sv: bool | None = True
+        elif underflow is None:
+            sv = None
+        else:
+            sv = underflow
+        updates = {
+            SS_BIT: False,
+            SV_BIT: sv,
+            SZ_BIT: (value.value == 0) if isinstance(value, Const) else None,
+        }
+        # Only thread BFF_HI/BFF_LO through the result when SPECIAL already
+        # tracks the FIFO (see this branch's opening comment); otherwise
+        # keep the pre-existing 2-destination (RN, "BFFWRP") shape.
+        track_fifo = "BFF_HI" in (special or {}) or "BFF_LO" in (special or {})
+        if no_update:
+            # PGR p.11-91: NU "returns the requested number of bits as
+            # usual" (VALUE above already reflects that) "but does not
+            # modify the bit FIFO or Write pointer", and "the SF flag is
+            # not updated" -- it keeps reflecting the pointer from before
+            # this instruction, not the hypothetical post-decrement value.
+            updates[SF_BIT] = (
+                old_wrp.value >= 32 if isinstance(old_wrp, Const) else None
+            )
+            return rn, value, "bit-extract-nu", _astatx_from_updates(updates)
         wrp_after: Operand = (
             Const(old_wrp.value - bitlen12)
-            if isinstance(old_wrp, Const)
-            else Unknown("uninitialized BFFWRP")
+            if isinstance(old_wrp, Const) and not pointer_and_fifo_undefined
+            else Unknown(
+                "undefined BFFWRP"
+                if isinstance(old_wrp, Const)
+                else "uninitialized BFFWRP"
+            )
         )
         updates[SF_BIT] = (
             wrp_after.value >= 32 if isinstance(wrp_after, Const) else None
         )
+        if track_fifo:
+            return (
+                (rn, "BFFWRP", "BFF_HI", "BFF_LO"),
+                (value, wrp_after, fifo_after[0], fifo_after[1]),
+                "bit-extract",
+                _astatx_from_updates(updates),
+            )
         return (
             (rn, "BFFWRP"),
             (value, wrp_after),

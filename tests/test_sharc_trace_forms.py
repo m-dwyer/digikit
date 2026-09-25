@@ -561,5 +561,66 @@ class Type7aCircularModifyTest(unittest.TestCase):
         self.assertEqual(result.stopped, "unsupported Type7a circular modify")
 
 
+class Type7aShortWordScaleTest(unittest.TestCase):
+    """MODIFY's (sw)/(nw) address-scale selector (PRM p.348's "BH (Type 7a)"
+    encode table, bits 39/23 -- decode_table.json's "w"/"l" fields): real SW
+    0x1c50af (dt2-1.16, the voice-render inner loop's ``modify(I4, M3)``
+    that seeks I4 to the current sample before this loop's short-word
+    reads) decodes w=0, l=1 -- "(sw)" -- so M3 must scale by 2 (short-word),
+    not 4 (normal-word, this tracer's behaviour before l was decoded)."""
+
+    def test_short_word_modify_scales_by_2_not_4(self):
+        fields = {
+            "w": 0,
+            "l": 1,
+            "cond[4:0]": 31,
+            "g": 0,
+            "idis[2:0]": 0,
+            "is[1:0]": 0,
+            "is[2:2]": 1,
+            "m[2:0]": 3,
+            "compute[22:16]": 0,
+            "compute[15:0]": 0,
+        }
+        state = T.State(
+            0x10,
+            {
+                T.UREG_CODES["I4"]: T.Const(0x2000),
+                T.UREG_CODES["M3"]: T.Const(6),
+            },
+            assume_nw32=True,
+        )
+        [result] = T._execute(state, insn("7a", fields, length=6))
+        self.assertIsNone(result.stopped)
+        # source is[2:2],is[1:0] = 0b100 -> I4; idis=0 -> destination I4 too.
+        self.assertEqual(result.uregs[T.UREG_CODES["I4"]], T.Const(0x2000 + 6 * 2))
+
+    def test_normal_word_modify_unaffected_by_l_absent(self):
+        # Same shape with l omitted (as every other hand-built Type7a
+        # fixture in this file has it): must still scale by 4, unchanged.
+        fields = {
+            "w": 0,
+            "cond[4:0]": 31,
+            "g": 0,
+            "idis[2:0]": 0,
+            "is[1:0]": 0,
+            "is[2:2]": 1,
+            "m[2:0]": 3,
+            "compute[22:16]": 0,
+            "compute[15:0]": 0,
+        }
+        state = T.State(
+            0x10,
+            {
+                T.UREG_CODES["I4"]: T.Const(0x2000),
+                T.UREG_CODES["M3"]: T.Const(6),
+            },
+            assume_nw32=True,
+        )
+        [result] = T._execute(state, insn("7a", fields, length=6))
+        self.assertIsNone(result.stopped)
+        self.assertEqual(result.uregs[T.UREG_CODES["I4"]], T.Const(0x2000 + 6 * 4))
+
+
 if __name__ == "__main__":
     unittest.main()

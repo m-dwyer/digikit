@@ -411,6 +411,62 @@ class TraceTest(unittest.TestCase):
         )
         self.assertIsNone(T._predicate(unknown, 0x0D))
 
+    def test_type18a_bit_test_resolves_from_partial_astatx(self):
+        # Regression for a frame-render stop at 0x1c088e (dt2-1.16,
+        # FUN_1c0874): ASTATX was PartialConst(mask=0xFFDFFF, bits=0x400)
+        # -- every bit BIT TST 0x20 needs (just bit 5) known False -- so the
+        # bit-test/xor-test branch must resolve a definite result from the
+        # PartialConst's own known bits (SHARC+ Core Programming Reference,
+        # "Type 18a ISA/VISA (register bit manipulation)", pp.16-2/16-3,
+        # extraction pages 400-401: TST is true iff every bit DATA sets is
+        # also set in the register), not report Unknown just because the
+        # whole 32-bit register isn't a plain Const.
+        mode1 = T.UREG_CODES["MODE1"]
+        astatx = T.UREG_CODES["ASTATX"]
+        # sreg 8 selects STKYX (tested by USTAT1+sreg) as the source; the
+        # BTF result always lands in ASTATX regardless of which sreg was
+        # tested -- matching test_type18a_bit_tests_drive_tf_predicates
+        # above, which uses the same sreg=8/stkyx pairing.
+        stkyx = T.UREG_CODES["STKYX"]
+
+        def bit_test(bop, mask, source_value):
+            return self.run_one(
+                T.State(0x10, {mode1: T.Const(0), stkyx: source_value, astatx: T.Const(0)}),
+                insn(
+                    "18a",
+                    {
+                        "bop[2:0]": bop,
+                        "sreg[3:0]": 8,
+                        "data[31:16]": mask >> 16,
+                        "data[15:0]": mask & 0xFFFF,
+                    },
+                    length=6,
+                ),
+            )
+
+        # TST 0x20: bit 5 is known (False) even though bit 13 is not --
+        # the tested bit alone decides the result, definitely False.
+        partial = T.PartialConst(0xFFDFFF, 0x400)
+        state = bit_test(4, 0x20, partial)
+        self.assertEqual(state.trace[-1]["result"], False)
+        self.assertEqual(state.uregs[astatx], T.Const(0))
+
+        # TST needing a bit the PartialConst does not know (bit 13, 0x2000)
+        # stays Unknown.
+        state = bit_test(4, 0x2000, partial)
+        self.assertIsNone(state.trace[-1]["result"])
+
+        # TST over several known-set bits within the PartialConst's mask
+        # (0x400 itself, bit 10) resolves True.
+        state = bit_test(4, 0x400, partial)
+        self.assertEqual(state.trace[-1]["result"], True)
+
+        # XOR (full-register equality) is False as soon as one known bit
+        # disagrees with DATA (bit 5 wants 1, is known 0), even though bit
+        # 13 stays unknown.
+        state = bit_test(5, 0x20, partial)
+        self.assertEqual(state.trace[-1]["result"], False)
+
     def test_type20a_pushes_and_pops_status_registers(self):
         codes = {
             name: T.UREG_CODES[name]
@@ -4004,6 +4060,92 @@ class TraceTest(unittest.TestCase):
             os.unlink(path)
 
 
+class DmCanonicalizationTest(unittest.TestCase):
+    """``_canonical_dm_address``'s raw-vs-``SW_ALIAS_BASE`` family choice and
+    ``dm_write_range``, the helper watchpoint/poke code should use to find
+    where a write to an architectural DM address actually lands.
+
+    SHARC+ byte address space is one universal address map (SHARC+ Core
+    Programming Reference, out/refs/sharc-plus-prm, "Byte Address Space
+    Overview of Data Accesses", p.7-4/extraction page 221): the same bytes
+    back every access width at a given address, so which physical location
+    -- raw, or the loader's SW_ALIAS_BASE-relative mirror -- a DM pointer
+    resolves to must not depend on how wide the particular access happens
+    to be.
+    """
+
+    ADDR = 0x1000
+
+    def test_family_choice_is_width_independent(self):
+        # ADDR has exactly one real byte at the RAW location (not the
+        # alias) -- an "already mapped direct address" per
+        # _canonical_dm_address's docstring -- so every width must agree
+        # it is the raw family, not just the width that happens to match
+        # what's actually backed there.
+        memory = loader_memory(loader_block(1, self.ADDR, 1, payload=b"\x99"))
+        state = T.State(1, concrete=memory)
+        self.assertEqual(T._canonical_dm_address(state, self.ADDR, 1), self.ADDR)
+        for width in (1, 2, 4):
+            with self.subTest(width=width):
+                self.assertEqual(
+                    T._canonical_dm_address(
+                        state, self.ADDR, width, for_write=True
+                    ),
+                    self.ADDR,
+                )
+
+    def test_family_choice_agrees_between_a_narrow_write_and_a_wide_read(self):
+        # A 1-byte write to a fresh (nowhere-backed) low address aliases,
+        # like any other unmapped low pointer; a subsequent differently
+        # sized access to the very same address must resolve to the same
+        # physical family the write used, not silently split across two
+        # locations.
+        memory = loader_memory()
+        state = T.State(1, concrete=memory)
+        self.assertTrue(T._dm_write(state, self.ADDR, 1, T.Const(0xAB)))
+        alias = L.SW_ALIAS_BASE + self.ADDR
+        self.assertIn(alias, state.overlay)
+        for width in (1, 2, 4):
+            with self.subTest(width=width):
+                self.assertEqual(
+                    T._canonical_dm_address(state, self.ADDR, width, for_write=True),
+                    alias,
+                )
+
+    def test_dm_write_range_aliases_an_unmapped_low_address(self):
+        memory = loader_memory()
+        state = T.State(1, concrete=memory)
+        alias = L.SW_ALIAS_BASE + self.ADDR
+        self.assertEqual(
+            T.dm_write_range(state, self.ADDR, 4), (alias, alias + 4)
+        )
+
+    def test_dm_write_range_keeps_an_already_mapped_direct_address(self):
+        memory = loader_memory(loader_block(1, 0x310CA300, 4, payload=b"\0" * 4))
+        state = T.State(1, concrete=memory)
+        self.assertEqual(
+            T.dm_write_range(state, 0x310CA300, 4), (0x310CA300, 0x310CA304)
+        )
+
+    def test_dm_write_range_none_without_concrete_memory(self):
+        self.assertIsNone(T.dm_write_range(T.State(1), self.ADDR, 4))
+
+    def test_watchpoint_on_raw_or_aliased_address_sees_an_aliased_write(self):
+        # _dm_write redirects a store to an unmapped low DM pointer through
+        # SW_ALIAS_BASE. sr.Watchpoint canonicalises its range at attach
+        # time, so a watch on the raw address fires, and so does one built
+        # from dm_write_range's (already canonical) range.
+        sr = import_module("sharc_run")
+        memory = loader_memory()
+        runner = sr.Runner(memory, 0x10, watchpoints=[sr.Watchpoint(self.ADDR, self.ADDR + 4)])
+        with self.assertRaises(sr._WatchpointStop):
+            T._dm_write(runner.state, self.ADDR, 4, T.Const(0x11223344))
+        start, end = T.dm_write_range(runner.state, self.ADDR, 4)
+        runner.attach_watchpoints([sr.Watchpoint(start, end)])
+        with self.assertRaises(sr._WatchpointStop):
+            T._dm_write(runner.state, self.ADDR, 4, T.Const(0x55667788))
+
+
 class PokeDmTest(unittest.TestCase):
     """--poke-dm / --poke-dm-file: seed the concrete-memory overlay up front."""
 
@@ -6111,6 +6253,40 @@ class TypeCacheCompareRealBlobTest(unittest.TestCase):
         result2 = self.run_type_cache_compare(cached=6, live=7, m14=0x5555)
         self.assertIsNotNone(result2)
         self.assertEqual(result2.value, 0x5555)
+
+
+class StateCopyPreservesEveryFieldTest(unittest.TestCase):
+    """sharc_core.state._copy() used to build its State(...) with positional
+    args that stopped before explicit_memory_model (and any field added
+    after it), so a fork silently reset that field to its default -- see
+    tools/sharc_harness.py's _clone_state docstring, which worked around
+    this by not calling _copy() at all. Every conditional/predicated fork
+    inside forms_move.py/sequencer.py/forms_flow.py/forms_compute.py/
+    forms_dag.py goes through _copy(), so this was live on any run that set
+    explicit_memory_model=True and then hit one of those forks."""
+
+    def test_explicit_memory_model_survives_a_copy(self):
+        state = T.State(0x10, {}, explicit_memory_model=True)
+        copied = T._copy(state)
+        self.assertTrue(copied.explicit_memory_model)
+
+    def test_approx_recips_survives_a_copy(self):
+        state = T.State(0x10, {}, approx_recips=True, approx_recips_used=True)
+        copied = T._copy(state)
+        self.assertTrue(copied.approx_recips)
+        self.assertTrue(copied.approx_recips_used)
+
+    def test_mutable_containers_are_independent_copies(self):
+        state = T.State(0x10, {T.UREG_CODES["R0"]: T.Const(1)})
+        state.overlay[0x1000] = 0xAB
+        state.call_stack.append(0x20)
+        copied = T._copy(state)
+        copied.overlay[0x1000] = 0xCD
+        copied.call_stack.append(0x30)
+        copied.uregs[T.UREG_CODES["R0"]] = T.Const(2)
+        self.assertEqual(state.overlay[0x1000], 0xAB)
+        self.assertEqual(state.call_stack, [0x20])
+        self.assertEqual(state.uregs[T.UREG_CODES["R0"]], T.Const(1))
 
 
 if __name__ == "__main__":

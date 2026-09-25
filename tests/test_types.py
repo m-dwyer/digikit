@@ -20,6 +20,8 @@ TYPED = [
     "tools/sharc_harness.py",
     "tools/sharc_proc.py",
     "tools/sharc_run.py",
+    "tools/sharc_survey.py",
+    "tools/sharc_symbols.py",
     "tools/sharc_trace.py",
     "tools/sharcldr.py",
 ]

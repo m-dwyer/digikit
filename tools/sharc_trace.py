@@ -117,6 +117,7 @@ from sharc_core.memory import (  # noqa: E402, F401
     _load_normal_ureg,
     _read_px48,
     _simd_ureg_mem_companion,
+    dm_write_range,
 )
 from sharc_core.floats import (  # noqa: E402, F401
     _FLOAT_ALL_ONES,
@@ -150,6 +151,7 @@ from sharc_core.flags import (  # noqa: E402, F401
     _astatx_alu_logical,
     _astatx_apply_bits,
     _astatx_bit_field,
+    _astatx_bit_test,
     _astatx_btst,
     _astatx_compare,
     _astatx_compare_float,

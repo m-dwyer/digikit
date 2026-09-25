@@ -5,6 +5,7 @@ Moved verbatim from tools/sharc_trace.py.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -296,35 +297,30 @@ def _stop(state: State, insn: Instruction | None, reason: str) -> State:
 
 
 def _copy(state: State) -> State:
-    return State(
-        state.pc_sw,
-        dict(state.uregs),
-        [dict(event) for event in state.trace],
-        state.pending,
-        state.steps,
-        state.stopped,
-        state.concrete,
-        dict(state.overlay),
-        state.base_sw,
-        state.follow_loaded_calls,
-        state.continue_external_calls,
-        state.dossier_bytes,
-        state.max_call_depth,
-        list(state.call_stack),
-        state.skip_provisional_entries,
-        state.at_loaded_entry,
-        state.assume_nw32,
-        list(state.loops),
-        list(state.status_stack),
-        state.core_reset_state,
-        dict(state.mmrs),
-        state.data_memory_tainted,
-        dict(state.special),
-        state.provisional_forms,
-        state.provisional_used,
-        state.approx_recips,
-        state.approx_recips_used,
-        state.record_events,
+    """A fork of STATE safe to advance independently (the symbolic tracer's
+    own conditional/predicated-instruction forks in forms_move.py,
+    sequencer.py, forms_flow.py, forms_compute.py and forms_dag.py).
+
+    Built with dataclasses.replace() so every field State has -- including
+    ones added after this function was last touched, such as
+    ``explicit_memory_model`` -- is carried over by default; only the
+    mutable containers a step can write through need an explicit fresh
+    copy (an unlisted field just keeps the source's own value/object,
+    which is correct for every immutable field and for ``concrete``, the
+    shared boot image forks must never copy). A stale positional
+    ``State(...)`` call here silently dropped any field added after it was
+    written -- see tools/sharc_harness.py's ``_clone_state`` docstring,
+    which worked around exactly this by not calling this function."""
+    return dataclasses.replace(
+        state,
+        uregs=dict(state.uregs),
+        trace=[dict(event) for event in state.trace],
+        overlay=dict(state.overlay),
+        call_stack=list(state.call_stack),
+        loops=list(state.loops),
+        status_stack=list(state.status_stack),
+        mmrs=dict(state.mmrs),
+        special=dict(state.special),
     )
 
 
