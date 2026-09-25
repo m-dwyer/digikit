@@ -94,5 +94,58 @@ class NaturalRefreshConstantsTest(unittest.TestCase):
         self.assertTrue(callable(scr.run_natural_track_refresh))
 
 
+class _FakeUc:
+    """Just enough of Unicorn's `uc` surface for ready_to_force(): one
+    register, SR, whose value is fixed at construction."""
+
+    def __init__(self, sr):
+        self._sr = sr
+
+    def reg_read(self, _reg):
+        return self._sr
+
+
+class _FakeMachine:
+    def __init__(self, sr):
+        self.uc = _FakeUc(sr)
+
+
+class ReadyToForceTest(unittest.TestCase):
+    """ready_to_force() guards tools/sharc_capture_run.py's periodic
+    vector-191 forcing against re-entering vector_191_handler on top of an
+    unfinished previous call (Lane H1, docs/findings/04-coldfire-dsp-link.md
+    "Lane H1: the DSPI2 forcing loop re-entered its own handler"): measured
+    by execution, one call costs 45,000-60,000 ColdFire instructions to
+    return, comparable to or larger than --force-period's own 50,000
+    default, and Machine.raise_vector() does not itself check the current
+    interrupt mask before jumping to the handler."""
+
+    def _sr(self, ipl):
+        return (ipl & 0x07) << 8
+
+    def test_level_none_always_ready(self):
+        # An unresolved profile keeps the old unconditional behaviour --
+        # silently refusing every forced frame would be worse.
+        self.assertTrue(scr.ready_to_force(_FakeMachine(self._sr(7)), None))
+
+    def test_ready_when_ipl_below_level(self):
+        m = _FakeMachine(self._sr(3))
+        self.assertTrue(scr.ready_to_force(m, 5))
+
+    def test_not_ready_when_ipl_at_level(self):
+        # Already inside a same-priority handler (most likely a previous
+        # forced call that has not returned yet) -- do not re-enter it.
+        m = _FakeMachine(self._sr(5))
+        self.assertFalse(scr.ready_to_force(m, 5))
+
+    def test_not_ready_when_ipl_above_level(self):
+        m = _FakeMachine(self._sr(6))
+        self.assertFalse(scr.ready_to_force(m, 5))
+
+    def test_ready_at_ipl_zero(self):
+        m = _FakeMachine(self._sr(0))
+        self.assertTrue(scr.ready_to_force(m, 5))
+
+
 if __name__ == "__main__":
     unittest.main()

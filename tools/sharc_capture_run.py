@@ -49,12 +49,35 @@ mechanisms, both always on:
 2. **Forcing it directly, for DSPI2** (always on, and what actually
    produces every DSPI2 frame this tool captures): every `--force-period`
    instructions, from inside `spin()`'s own `on_chunk` hook, clear the
-   handler's pacing counter and call `Machine.raise_vector(191)` directly
-   -- the same "force it, run the handler like anything else" technique
-   `tools/sharcframe.py` already uses and has proven safe, just paced
-   through the normal instruction stream (so it shares one Machine and one
-   instruction clock with kind='note' below) instead of a separate
-   call/return dance per frame.
+   handler's pacing counter and call `Machine.raise_vector(191, level=...)`
+   directly -- the same "force it, run the handler like anything else"
+   technique `tools/sharcframe.py` already uses for a single call/return,
+   paced through the normal instruction stream here (so it shares one
+   Machine and one instruction clock with kind='note' below) instead of a
+   separate call/return dance per frame.
+
+   **The repeated forcing must not re-enter the handler on top of itself.**
+   Measured by execution (Lane H1): one call to `vector_191_handler`
+   (`prof["handler"]`) costs on the order of 45,000-60,000 ColdFire
+   instructions before it returns -- comparable to, or larger than,
+   `--force-period`'s own default of 50,000. Forcing unconditionally, as
+   this loop did before Lane H1, calls `Machine.raise_vector()` with no
+   `level=` and no interrupt-mask check, unlike every legitimate timer
+   source in this codebase (`emu.pit.Pits.service()`); it recurses into
+   the still-running previous call, indefinitely, so the CPU never
+   actually returns to RTOS/task code between forced frames. `on_chunk`
+   now calls `ready_to_force()` (this module's own function) first and
+   defers -- retrying next chunk, not dropping the frame -- when the
+   current interrupt level is already at or above vector 191's own
+   configured level. See docs/findings/04-coldfire-dsp-link.md, "Lane H1:
+   the DSPI2 forcing loop re-entered its own handler", for the measurement
+   and its consequence: fixing this alone does not make every downstream
+   ColdFire task (kit-load, panel dispatch, sequencer scheduling) start
+   running within a bounded capture, because a ~50,000-instruction-costing
+   level-5 handler firing every `--force-period` instructions still spends
+   most of the CPU's time in that one handler at the default period --
+   raising `--force-period` trades frame density for RTOS progress, it
+   does not remove the tension.
 
 **Triggering a note deterministically, with no framebuffer reading.**
 `--kind note` injects a panel "TRIG 1" press+release at ColdFire instruction
@@ -156,13 +179,14 @@ from unicorn.m68k_const import (  # noqa: E402
     UC_M68K_REG_A7,
     UC_M68K_REG_D0,
     UC_M68K_REG_PC,
+    UC_M68K_REG_SR,
 )
 
 import framelink  # noqa: E402
 from emu import config, dspiframe, panelin, symbols  # noqa: E402
 from emu.dtim import Dtims, Timers  # noqa: E402
 from emu.longrun import build, spin  # noqa: E402
-from emu.pit import Pits  # noqa: E402
+from emu.pit import Pits, interrupt_level  # noqa: E402
 from emu.sharc_capture import CaptureWriter, CapturingPeer  # noqa: E402
 
 # The DSPI1 driver, docs/findings/04-coldfire-dsp-link.md "eDMA and DSPI
@@ -302,6 +326,47 @@ def poke_track_type(m, track: int, type_: int) -> None:
         TRACK_9A_BASE + track * TRACK_9A_STRIDE + TRACK_TYPE_OFFSET,
         bytes([type_ & 0xFF]),
     )
+
+
+def ready_to_force(m, level) -> bool:
+    """-> False if forcing vector 191 now would re-enter a same-or-higher-
+    priority handler that has not returned yet.
+
+    `run()`'s own docstring says forcing raises vector 191 directly every
+    `--force-period` instructions, `Machine.raise_vector()`-style, "the
+    same technique tools/sharcframe.py already uses and has proven safe" --
+    true for a single call/return, but not for the periodic forcing here.
+    Measured by execution (Lane H1, boot400M.snap, no `--syx` bytes stored
+    since the .syx is Elektron's copyright): one call to
+    `vector_191_handler` (`prof["handler"]`) costs on the order of
+    45,000-60,000 ColdFire instructions before it returns to its
+    interrupted caller -- comparable to, or larger than, `--force-period`'s
+    own default of 50,000. `Machine.raise_vector()` unconditionally pushes
+    a fresh exception frame and jumps to the handler regardless of the
+    current interrupt mask; a real DSPI2 controller signalling vector 191
+    at its own configured level would not do that while the CPU is
+    already servicing that same level (`emu.pit.Pits.service()` checks
+    this for every legitimate timer source, via this same
+    `emu.pit.interrupt_level()` -- forcing here previously did not).
+    Left unguarded, the periodic force recurses into the handler on top of
+    an unfinished previous call, indefinitely, so the CPU never actually
+    returns to RTOS/task code between forced frames -- which starves every
+    ColdFire task this project has tried to observe during a forced
+    capture, not only sequencer-related ones. See docs/findings/04-
+    coldfire-dsp-link.md, "Lane H1: the DSPI2 forcing loop re-entered its
+    own handler".
+
+    LEVEL is the vector's own configured INTC level (this module's own
+    callers pass `interrupt_level(m, prof["vector"], respect_mask=False)`,
+    read once; the mask itself is irrelevant here since this is a forced,
+    not a real, delivery). `None` (the level could not be read, e.g. an
+    unresolved profile) keeps the old unconditional behaviour -- silently
+    refusing every forced frame would be worse than the rare unprotected
+    call this predates."""
+    if level is None:
+        return True
+    sr = m.uc.reg_read(UC_M68K_REG_SR)
+    return ((sr >> 8) & 0x07) < level
 
 
 def run_natural_track_refresh(m, pc: int, budget: int, *, chunk: int = 200_000) -> int:
@@ -499,7 +564,11 @@ def run(
         install_mem_write_watch(m, writer, lambda: pits.now, lo, hi)
 
     triggered = {"done": False}
-    forced = {"last": 0}
+    forced = {"last": 0, "skipped": 0}
+    # Read once: the vector's configured INTC level, ignoring its mask bit
+    # (this is a forced, not a real, delivery -- see ready_to_force()'s own
+    # docstring for why the mask is irrelevant here).
+    vector_level = interrupt_level(m, prof["vector"], respect_mask=False)
 
     def on_chunk(pc_, done):
         if kind in ("note", "play") and not triggered["done"] and done >= trig_at:
@@ -514,9 +583,18 @@ def run(
             panelin.feed(m, panel_profile, data)
             triggered["done"] = True
         if done - forced["last"] >= force_period:
-            m.uc.mem_write(prof["counter"], bytes(4))
-            m.raise_vector(prof["vector"])
-            forced["last"] = done
+            if ready_to_force(m, vector_level):
+                m.uc.mem_write(prof["counter"], bytes(4))
+                m.raise_vector(prof["vector"], level=vector_level)
+                forced["last"] = done
+            else:
+                # Still inside a previous forced call (see ready_to_force()'s
+                # own docstring) -- try again next chunk instead of
+                # re-entering the handler on top of itself. Not counted
+                # against `forced["last"]`, so the next chunk boundary
+                # retries immediately once the handler actually returns,
+                # rather than silently dropping this frame for good.
+                forced["skipped"] += 1
 
     async_events = tuple(e for e in (ssi0,) if e is not None)
     try:
@@ -541,6 +619,7 @@ def run(
         "dspi1_calls": writer.counts["dspi1_calls"],
         "mem_writes": writer.counts["mem_writes"],
         "ssi0_status": ssi0_status,
+        "forced_frames_deferred": forced["skipped"],
         "triggered": triggered["done"] if kind in ("note", "play") else None,
         "image_sha256": image_sha256,
         "out": out_path,
@@ -630,13 +709,15 @@ def main(argv=None) -> int:
     )
     print(
         "%s: %d frame(s), %d ssi0-rx, %d dspi1-calls, %d mem-writes, "
-        "stop=%s, instructions=%d, ssi0=%s%s"
+        "%d forced-frame(s) deferred (re-entrant), stop=%s, instructions=%d, "
+        "ssi0=%s%s"
         % (
             args.out,
             result["frames"],
             result["ssi0_rx"],
             result["dspi1_calls"],
             result["mem_writes"],
+            result["forced_frames_deferred"],
             result["stop"],
             result["instructions"],
             result["ssi0_status"],

@@ -2318,3 +2318,172 @@ docs/findings/06's own lane G1 section for the resulting replay (all 291
 frames of `dt2-1.16-play-pretracks-fulltx.dt2cap` reach `frame-returned`
 cleanly; the mix-gate/voice-arming problem, not transfer delivery, is
 confirmed as what still blocks sound). **[V]**
+
+## Lane H1: the note-scheduling consumer, and why no capture has ever seen it run **[V][O]**
+
+Task: decide whether the emulated ColdFire generates note events during
+PLAY, and if not, why. Builds on Lane A3 (the kit-load timing stall) and
+Lane D2 (no edge-triggered byte anywhere in the DSPI2 transfer). All
+findings below are from execution against `snapshots/dt2-1.16/boot400M.snap`
+with the real 1.16 `.syx` (sha-256 `278541e4...`, matching
+`sections/.source-sha256`), via `tools/sharc_capture_run.py` and small
+probe scripts built on the same `emu.longrun.build()`/`spin()` primitives
+(not committed; scratch, per this lane's own scope).
+
+**The note-event consumer is `FUN_40139b78`, and its only static caller is
+`vector_191_handler` itself.** Read from `out/ghidra/dt2-1.16-emac`: the
+function walks a doubly-linked, time-ordered pending-event list (head/tail
+sentinels at `0x44e678f4`/`0x44e678e0`, referenced through scratch globals
+`0x47e2033c`/`0x47e20338`/`0x47e20340`, initialized empty by
+`FUN_40139b16`), and for every node whose scheduled time (`node[4]`) is at
+or before "now" (`DAT_40966500 + 0x20`), allocates a `0x6c`-byte record from
+the same fixed-size pool `FUN_40139878` (the panel-input immediate path,
+`docs/findings/03`'s "A panel-path track trigger joins machine invalidation
+to the refresh queue") uses (`FUN_4013a52a`), fills in track/machine-type/
+velocity-shaped fields (including a per-track step byte read at
+`track*0x6a5 + 0x485`, the same `0x6a5` pattern-track stride
+`docs/findings/09-runtime-state.md` documents), and appends it
+(`FUN_4013a78a`) to the same queue `vector_191_handler` itself drains into
+the SRAM mirror row / TX frame. Ghidra's caller table (`functions.jsonl`)
+shows exactly one static caller of `FUN_40139b78`: `vector_191_handler`
+(`0x4002dd0c`) itself, in its non-USB-streaming branch (`FUN_40006c4a() !=
+5`, a mode flag -- `_DAT_40965a60` -- written only from the USB EP0
+SETUP dispatcher `docs/findings/04`'s own "USB audio streaming" section
+already names; read as `2`, not `5`, in every run below, so this branch is
+the one taken). **[V]**
+
+**By execution, this consumer runs on every forced DSPI2 tick, but its
+list is permanently empty.** Hooking `vector_191_handler`, `FUN_40139b78`,
+`FUN_4013a52a`, `FUN_4013a78a` and the list-head global, then running
+`--kind play` and `--kind note` (with and without Lane A3's `--pre-instrs`
+so the per-track kit-load-and-refresh has already happened) for budgets up
+to 30,000,000 ColdFire instructions: `FUN_40139b78` is called once per
+forced `vector_191_handler` entry (as expected), but `FUN_4013a52a` and
+`FUN_4013a78a` are called **zero** times, and the list-head global never
+differs from its boot-time empty-sentinel value, for the entire run,
+whether or not PLAY or TRIG 1 was pressed. Whatever function feeds this
+list (a producer this lane did not locate -- not `FUN_40139878`, which
+always pairs its own alloc with its own append inline, never touching the
+sorted list) never ran in any of these captures. **[V]**
+
+**Two independent, real causes, both upstream of the sequencer question,
+fully explain this -- neither is fixed by this lane.**
+
+1. **`boot400M.snap`'s intro animation is still running at the snapshot
+   instant** (`emu.pit.intro_running(m, profile.intro_pit3_isr)` returns
+   `True` reading the snapshot with zero instructions executed). `emu/
+   pit.py`'s own `Pits` class docstring already measured, on this exact
+   snapshot over 90,000,000 instructions, that delivering PIT2 or PIT3
+   while the intro still owns them reaches **zero** spawned RTOS tasks,
+   against six for `channels=()` or `channels=(0,)` -- and documents the
+   fix used by every other tool in this repository (`emu/gui.py`, `emu/
+   panel.py`, `emu/uiprobe.py`, `emu/run.py`, `tools/guirun.py`, `tools/
+   addrtrace.py`, `tools/emucheck.py`, `tools/inputlag.py`, `tools/
+   memdump.py`, `tools/bootcheck.py`, `tools/memfind.py`, `tools/
+   panelsweep.py`, `tools/machinepatch.py`, `tools/mmiotrace.py`, `tools/
+   steptrace.py`, `tools/uidrive.py`): construct `Pits`/`Dtims` with
+   `hold=intro_running(...)` and release them from a hook on
+   `profile.intro_done`. **`tools/sharc_capture_run.py` is the one tool in
+   this repository that does not do this** -- `run()` builds
+   `Timers(Pits(m), Dtims(m, channels=(3,)))` unconditionally. Every
+   capture this project has produced from `boot400M.snap` (Lane A3's, Lane
+   D2's, and this lane's own) has therefore been running in the exact
+   configuration `Pits`' own docstring measured as reaching zero spawned
+   tasks. **[V]**
+2. **The DSPI2 forcing loop was re-entering its own handler.** Measured
+   directly (bisecting `uc.emu_start(..., count=N)` for increasing `N`
+   from a fresh `raise_vector(191)`, watching for PC/A7 to return to the
+   pre-interrupt values): one call to `vector_191_handler` costs on the
+   order of 45,000-60,000 ColdFire instructions before it returns --
+   comparable to, or larger than, `--force-period`'s own default of
+   50,000. `Machine.raise_vector()` (`emu/harness.py`) unconditionally
+   pushes a fresh exception frame and jumps to the handler regardless of
+   the current interrupt mask; unlike every legitimate timer source in
+   this codebase (`emu.pit.Pits.service()`, which checks
+   `emu.pit.interrupt_level()` against the live SR before firing),
+   `tools/sharc_capture_run.py`'s own forcing loop called
+   `m.raise_vector(prof["vector"])` with no `level=` and no mask check.
+   Directly instrumented: at the default `--force-period`, 52 of several
+   hundred forced attempts in a 20,000,000-instruction `--kind note` run
+   land while the CPU is still inside a previous, unfinished forced call
+   (confirmed inside `[ready-check, level 5]` since vector 191 is
+   configured at INTC level 5) -- the handler was being recursively
+   re-entered on top of itself, indefinitely, so the CPU essentially never
+   returns to RTOS/task code between forced frames. **Fixed** in this
+   lane: `tools/sharc_capture_run.py` now reads vector 191's configured
+   level once (`interrupt_level(m, prof["vector"], respect_mask=False)`)
+   and calls a new `ready_to_force()` before every forced entry, deferring
+   (retrying next chunk, not dropping the frame) rather than recursing
+   when the current SR IPL is already at or above that level; `run()`
+   reports the deferred count as `forced_frames_deferred`. Existing
+   captures are a strict subset of what the fixed loop still produces
+   (frame count/content unaffected when the guard never triggers), so this
+   is a correctness fix, not an opt-in flag: it removes an unconditional,
+   proven re-entrancy bug, the same class the codebase's own timer sources
+   already guard against. **[V]**
+
+**Fixing (2) alone, or (1) and (2) together, does not make the sequencer
+run within a bounded capture either** -- tried up to 150,000,000
+instructions, both with and without Lane A3's `--pre-instrs`, with and
+without `unblock=True` (the mechanism `emu/panel.py`'s own `main()` pairs
+with the intro-hold dance, which force-satisfies the intro's own frame
+semaphore so it can exit without needing real PIT3 delivery -- confirmed,
+in isolation with **no** DSPI2 forcing at all, to reach `intro_done` at
+instruction 56,000,000 on this exact snapshot). With the DSPI2 forcing
+loop re-added (even correctly guarded per (2)), `intro_done` did not fire
+within 150,000,000 instructions in this lane's testing: a ~50,000-
+instruction-costing, INTC-level-5 handler firing every `--force-period`
+(default 50,000) instructions consumes the large majority of available
+CPU time regardless of the guard, competing with whatever the intro/
+unblock mechanism needs to run. Raising `--force-period` (tried up to
+1,000,000, i.e. the handler then costs roughly 5-10% of the budget) did
+not unblock kit-load or note-scheduling within 60,000,000 instructions
+either in this lane's own testing, though it was not exhaustively swept.
+**[V][O]**
+
+**Net answer to the task's own question.** Under every configuration this
+lane tried, from `boot400M.snap` via `tools/sharc_capture_run.py`'s
+recipe, the ColdFire's RTOS does not reach a state where kit-load, panel
+dispatch, or the sequencer's own event-scheduling producer run at all --
+independent of whether PLAY or TRIG 1 is pressed. This is a sufficient,
+alternative explanation for every prior "no signal" result (Lane A3's
+kit-load stall, Lane D2's byte-for-byte-identical DSPI2 tail regardless of
+PLAY, and this lane's own zero `alloc`/`append` counts): none of those
+captures ever reached a running system, not that the firmware has no
+trigger mechanism. Whether the ColdFire's sequencer creates notes during
+PLAY on real hardware (or under a capture that actually reaches a running
+RTOS) remains **open**. **[O]**
+
+**Open, for a future lane, roughly in order of leverage:**
+
+- Start from a **post-intro** snapshot (this project already has
+  `postintro.snap`, referenced throughout `emu/pit.py`/`emu/dtim.py`'s own
+  docstrings) instead of `boot400M.snap`, so the intro-hold question does
+  not arise at all -- likely higher leverage than continuing to chase the
+  intro/unblock interaction from a live-intro snapshot. `postintro.snap`
+  has no loaded kit/pattern the way `boot400M.snap` does, so reaching the
+  same "kit already loaded, one track configured, pattern trigs on 3/12/
+  13/15" state needs either a fresh boot-and-load sequence or poking
+  equivalent state onto it -- not attempted here.
+- Once the RTOS genuinely runs, find `FUN_40139b78`'s list producer (the
+  function that inserts a node with a real `node[4]` due-time) -- not
+  located in this lane's budget. `FUN_40139b78`'s own top branch
+  (`param_1 == 0`) also decrements a watchdog counter
+  (`_DAT_44e678dc`, reset to `0x64` on an external-MIDI-clock-shaped
+  message, `*param_1 == -0x14`) that arms an internal-clock fallback
+  (`_DAT_44e67908`) when it reaches zero -- this reads as MIDI-clock
+  arbitration, not necessarily the free-running internal sequencer clock,
+  so the real internal step clock may be a still-different, unidentified
+  function.
+- Measure `--force-period` against the handler's real cost properly (a
+  binary search or a direct entry/return instrumentation, not the
+  `emu_start(count=N)` probe this lane used by hand) and decide a default
+  that leaves a documented minimum fraction of CPU time free, rather than
+  the current fixed `50_000`.
+
+Reproduced with `tools/sharc_capture_run.py snapshots/dt2-1.16/boot400M.snap
+--out out/captures/... --kind play|note --instrs N [--pre-instrs 15000000]
+--syx <a 1.16 .syx whose sha-256 matches sections/.source-sha256>`; the
+`intro_running`/`intro_done`/`ready_to_force` checks are library calls
+(`emu.pit.intro_running`, `tools/sharc_capture_run.ready_to_force`), not a
+committed script. Captures not committed (`out/` is gitignored).
