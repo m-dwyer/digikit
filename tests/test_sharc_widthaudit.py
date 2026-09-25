@@ -93,12 +93,16 @@ class WidthRulesTest(unittest.TestCase):
             "byte-sign-extended",
         )
 
-    def test_3a_stops_on_long_word(self):
+    def test_3a_selects_long_word_on_l(self):
+        # 2026-09-25: Type3a's (LW) option is now implemented (see
+        # forms_move.py's _type_3a docstring and tools/sharc_harness.py's
+        # FRAME_MILESTONE), the same register-pair access _w_pair already
+        # covers for Type14a/15a/15b -- _w_3a mirrors it exactly.
         self.assertEqual(wa._w_3a({"l": 0}), "normal-word")
-        self.assertIsNone(wa._w_3a({"l": 1}))
+        self.assertEqual(wa._w_3a({"l": 1}), "long-word")
 
     def test_pair_forms_select_long_word_on_l(self):
-        for rule in (wa._w_pair,):
+        for rule in (wa._w_pair, wa._w_3a):
             self.assertEqual(rule({"l": 0}), "normal-word")
             self.assertEqual(rule({"l": 1}), "long-word")
 

@@ -152,11 +152,15 @@ def _w_14d(f: dict) -> str | None:
     return ACCESS_WIDTHS.get((f.get("l", 0), f.get("x", 0), 0))
 
 
-def _w_3a(f: dict) -> str | None:
-    """Type3a (SHARC+ Core Programming Reference Table 13-1): a single
-    normal-word transfer; ``_type_3a`` refuses l=1 (a long-word pair)
-    outright, so only l=0 -> normal-word is ever actually executed."""
-    return None if f.get("l") else "normal-word"
+def _w_3a(f: dict) -> str:
+    """Type3a (SHARC+ Core Programming Reference p.13-15's ACCESS Encode
+    Table, every u/g/d row repeated with "(lw)" appended): l=1 selects the
+    same long-word register-pair access as Type14a/15a/15b's (lw) option
+    (``_w_pair``, PRM p.2-4 "Data Register Neighbor Pairing"); l=0 is an
+    ordinary normal-word transfer. ``_type_3a`` only executes l=1 for an
+    even-coded ureg (its own neighbor-pair convention); an odd ureg stops
+    before any load/store event, so this rule is never evaluated there."""
+    return "long-word" if f.get("l") else "normal-word"
 
 
 def _w_pair(f: dict) -> str:

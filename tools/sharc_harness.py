@@ -967,10 +967,28 @@ FRAME_DIAGNOSTIC_ASTATX_PATCH: sv.PatchTable = {0x1C0885: [("reg", "ASTATX", 0x4
 # Where one render_frames() call with FRAME_PATCH_TABLE stops today, from
 # run_init() state. Tests compare against this one pin: update it (and say
 # why in the commit) when a fix moves the stop.
+#
+# 2026-09-25: forms_move.py's Type3a handler previously refused l=1 (long-
+# word) outright ("unsupported Type3a long-word access" at 0x1c2920, 86,740
+# instructions). Implementing it (the Type14a-style neighbor-register-pair
+# access PRM p.2-4 documents for the (LW) modifier) let the frame run on
+# instead of stopping there. The run now reaches a genuine RETURN, not
+# another gap: "return without followed call" at 0x1c75d3 -- inside
+# FUN_1c74cd (block_handler itself, entry 0x1c74cd, end 0x1c75d8, per
+# tools/sharc.py's img.func) -- is how tools/sharc_run.py's
+# fresh_call_state()/Runner.fresh_call() (return_address=None, see its own
+# docstring) signals that a call started with an empty call_stack has
+# unwound all the way back through its own entry point's RTS. Since
+# call_frame() enters at block_handler with no real caller pushed, this
+# halt fires exactly when block_handler's own return executes -- the frame
+# render call chain (block_handler -> command_dispatch_fn -> cmd_handler_3
+# -> render_frame -> ...) completed. tools/sharc_widthaudit.py --root frame
+# confirms 0 access-width mismatches across all 17,468 load/store events
+# checked in this run.
 FRAME_MILESTONE = {
-    "pc_sw": 0x1C2920,
-    "instructions": 86740,
-    "reason": "unsupported Type3a long-word access",
+    "pc_sw": 0x1C75D3,
+    "instructions": 95982,
+    "reason": "return without followed call",
 }
 
 
@@ -1053,6 +1071,51 @@ def read_master_mix(memory, image: str, runner: sr.Runner) -> list[float]:
             else 0.0
         )
     return floats
+
+
+def read_ring_a(memory, image: str, runner: sr.Runner, count: int = 64) -> dict:
+    """The DAC output ring (docs/findings/06's "Rings": "0x1c74a1 converts
+    0x25f180/0x25f200 to Q31, L/R interleaved, into ring A half
+    0x261cc8 + (flag << 8)"; "B as codec input, A as DAC output: [D]") --
+    for checking whether an active voice's signal reached the DMA-facing
+    output buffer after a frame call, one step past `read_master_mix`'s
+    pre-conversion float sum.
+
+    `profile(image).ring_a`/`.ring_flag` resolve the literal DM addresses
+    `setup_frame()` already pokes `ring_flag` through (this module's own
+    "Task loop" comment); `ring_flag`'s bit 0 selects which of the two
+    256-byte (64 word) ping-pong halves the *last completed* frame wrote
+    (block_handler's own tail toggles it *after* the render, so the half
+    written by the frame that just returned is `flag_after ^ 1`, not
+    `flag_after` itself).
+
+    Returns {"flag_after": the current (post-toggle) ring_flag value,
+    "half_written": the byte offset of the half the last frame wrote,
+    "q31": COUNT raw Q31 ints (None where memory is unavailable), "float":
+    the same words as -1.0..1.0 floats (Q31's own full-scale convention)}.
+    """
+    flag_raw = st._dm_read(runner.state, profile(image).ring_flag, 4)
+    flag_after = flag_raw.value & 1 if flag_raw is not None else None
+    half_written = None if flag_after is None else ((flag_after ^ 1) * 0x100)
+    base = profile(image).ring_a + (half_written or 0)
+    q31: list[int | None] = []
+    floats: list[float | None] = []
+    for i in range(count):
+        raw = st._dm_read(runner.state, base + i * 4, 4)
+        if raw is None:
+            q31.append(None)
+            floats.append(None)
+            continue
+        value = raw.value & 0xFFFFFFFF
+        signed = value - 0x100000000 if value & 0x80000000 else value
+        q31.append(signed)
+        floats.append(signed / 2**31)
+    return {
+        "flag_after": flag_after,
+        "half_written": half_written,
+        "q31": q31,
+        "float": floats,
+    }
 
 
 def flatten(blocks: Sequence[Sequence[float]]) -> list[float]:

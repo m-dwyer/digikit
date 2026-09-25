@@ -725,7 +725,7 @@ class FrameRenderFromInitTest(unittest.TestCase):
         # handover both record for an (almost) empty synthetic frame.
         self.assertEqual(halt.pc_sw, 0xB88E4B)
 
-    def test_render_frames_with_frame_patch_table_reaches_the_long_word_stop(self):
+    def test_render_frames_with_frame_patch_table_returns(self):
         runner, results = h.render_frames(self.memory, "dt2-1.16", n_frames=1)
         self.assertEqual(len(results), 1)
         halt = results[0].halt
@@ -761,16 +761,29 @@ class FrameRenderFromInitTest(unittest.TestCase):
         # pmi=5 (I13). sequencer._check_return_target now takes pmi and
         # checks I(8+pmi)/M14 generally instead of hardcoding I12, so this
         # one instruction is recognized as a return (popping call_stack)
-        # like the other 1051. That was the only fix this lane made; see
-        # tools/sharc_core/sequencer.py's docstring for the full citation.
+        # like the other 1051.
         #
-        # With that gap closed, the frame runs 7,115 instructions further
-        # (86,740 vs 79,625) before stopping on an unrelated, pre-existing
-        # sharc_core gap this lane's brief does not own: a Type3a long-word
-        # (32-bit) DM access at 0x1c2920 that forms_move.py's Type3a
-        # handler does not support (see its own "unsupported Type3a
-        # long-word access" message) -- not a return mismatch, so this is
-        # the milestone this lane was asked to reach.
+        # With that gap closed, the frame ran 7,115 instructions further
+        # (86,740 vs 79,625) before stopping on a then-unrelated sharc_core
+        # gap: a Type3a long-word DM access at 0x1c2920 that forms_move.py's
+        # Type3a handler refused outright ("unsupported Type3a long-word
+        # access"). This lane's Y1 pass implemented it (the same
+        # Type14a-style neighbor-register-pair access the PRM documents for
+        # the (LW) modifier, PRM p.2-4), and the frame now runs on past that
+        # pc instead of stopping there. It reaches a genuine RETURN, not
+        # another gap: "return without followed call" is how
+        # tools/sharc_run.py's fresh_call()/fresh_call_state() (see their
+        # own docstrings) signal a call that started with an empty
+        # call_stack unwinding through its own entry point's RTS -- since
+        # call_frame() enters at block_handler (0x1c74cd) with no real
+        # caller pushed, and the halt pc (0x1c75d3) is inside block_handler
+        # itself (tools/sharc.py's img.func: entry 0x1c74cd, end 0x1c75d8),
+        # this is block_handler's own return firing, i.e. the whole frame
+        # render call chain (block_handler -> command_dispatch_fn ->
+        # cmd_handler_3 -> render_frame -> ...) completed.
+        # tools/sharc_widthaudit.py --root frame independently confirms 0
+        # access-width mismatches across this run's 17,468 load/store
+        # events. See tools/sharc_harness.py's FRAME_MILESTONE docstring.
         self.assertEqual(halt.reason, h.FRAME_MILESTONE["reason"])
         self.assertEqual(halt.pc_sw, h.FRAME_MILESTONE["pc_sw"])
         self.assertEqual(results[0].instructions, h.FRAME_MILESTONE["instructions"])

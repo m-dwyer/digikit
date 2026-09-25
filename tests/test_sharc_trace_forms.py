@@ -19,6 +19,7 @@ from importlib import import_module
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools"))
 T = import_module("sharc_trace")
 Instruction = import_module("sharc_disasm").Instruction
+from test_sharc_trace import loader_memory  # noqa: E402  (shared fixture)
 
 
 def insn(name, fields, length=4, kind="confident"):
@@ -504,6 +505,113 @@ class Type3dTest(unittest.TestCase):
         state = T.State(0x10, {T.UREG_CODES["I0"]: T.Const(0)})
         [result] = T._execute(state, insn("3d", dict(base, ex=0, w=1), length=6))
         self.assertEqual(result.stopped, "unsupported Type3d WACCESS")
+
+
+class Type3aLongWordTest(unittest.TestCase):
+    """Type3a's (LW) long-word register-pair option (forms_move.py's
+    ``_type_3a``, PRM p.13-15's ACCESS Encode Table + p.2-4 "Data Register
+    Neighbor Pairing") -- previously refused outright as "unsupported
+    Type3a long-word access"."""
+
+    def test_pair_load_post_modify_real_instance(self):
+        # real SW 0x1c2920 (1845536), the frame-render stop this fixed
+        # (tools/sharc_harness.py's FRAME_MILESTONE docstring):
+        # {"compute": 0, "cond": 31, "d": 0, "g": 0, "i": 1, "l": 1,
+        # "m": 4, "u": 1, "ureg": 0} -- an unconditional (cond=31), no-op
+        # compute, DM (g=0) load into the R0:R1 pair, post-modify (u=1) by
+        # I1/M4.
+        fields = {
+            "compute": 0,
+            "cond": 31,
+            "d": 0,
+            "g": 0,
+            "i": 1,
+            "l": 1,
+            "m": 4,
+            "u": 1,
+            "ureg": 0,
+        }
+        state = T.State(
+            0x10,
+            {
+                T.UREG_CODES["I1"]: T.Const(0x30001000),
+                T.UREG_CODES["M4"]: T.Const(1),
+            },
+            concrete=loader_memory(),
+        )
+        self.assertTrue(T._dm_write(state, 0x30001000, 4, T.Const(0xAAAA)))
+        self.assertTrue(T._dm_write(state, 0x30001004, 4, T.Const(0xBBBB)))
+        [result] = T._execute(state, insn("3a", fields, length=6))
+        self.assertIsNone(result.stopped)
+        load = result.trace[-1]
+        self.assertEqual(load["action"], "load")
+        self.assertEqual(load["space"], "DM")
+        self.assertEqual(load["access_width"], "long-word")
+        self.assertEqual(load["addressing_mode"], "post-modify")
+        self.assertEqual(load["ureg_pair"], ["R0", "R1"])
+        self.assertEqual(load["address"], 0x30001000)
+        # R0 (low word, the named ureg) <- address; R1 (its neighbor) <-
+        # address + 4 (PRM Figure 7-19: the named RX gets the low 32 bits,
+        # its neighbor RY the high 32 bits of one 64-bit access).
+        self.assertEqual(result.uregs[T.UREG_CODES["R0"]], T.Const(0xAAAA))
+        self.assertEqual(result.uregs[T.UREG_CODES["R1"]], T.Const(0xBBBB))
+        # Post-modify: I1 advances by M4 * 8 (long-word's own modifier
+        # scale, sharc_core.memory._access_modifier_scale), not by the
+        # normal-word scale of 4.
+        self.assertEqual(result.uregs[T.UREG_CODES["I1"]], T.Const(0x30001008))
+
+    def test_pair_store_pre_modify(self):
+        fields = {
+            "compute": 0,
+            "cond": 31,
+            "d": 1,
+            "g": 0,
+            "i": 2,
+            "l": 1,
+            "m": 3,
+            "u": 0,
+            "ureg": 4,
+        }
+        state = T.State(
+            0x10,
+            {
+                T.UREG_CODES["I2"]: T.Const(0x30002000),
+                T.UREG_CODES["M3"]: T.Const(1),
+                T.UREG_CODES["R4"]: T.Const(0x11111111),
+                T.UREG_CODES["R5"]: T.Const(0x22222222),
+            },
+            concrete=loader_memory(),
+        )
+        [result] = T._execute(state, insn("3a", fields, length=6))
+        self.assertIsNone(result.stopped)
+        store = result.trace[-1]
+        self.assertEqual(store["action"], "store")
+        self.assertEqual(store["access_width"], "long-word")
+        self.assertEqual(store["addressing_mode"], "pre-modify")
+        self.assertEqual(store["ureg_pair"], ["R4", "R5"])
+        self.assertTrue(store["concrete_write"])
+        # Pre-modify: the address for this access is I2 + M3 * 8 = 0x30002008;
+        # I2 itself is left unchanged (matching Type3a/3d/4a's own convention).
+        self.assertEqual(store["address"], 0x30002008)
+        self.assertEqual(result.uregs[T.UREG_CODES["I2"]], T.Const(0x30002000))
+        self.assertEqual(T._dm_read(result, 0x30002008, 4), T.Const(0x11111111))
+        self.assertEqual(T._dm_read(result, 0x3000200C, 4), T.Const(0x22222222))
+
+    def test_odd_ureg_pair_is_unsupported(self):
+        fields = {
+            "compute": 0,
+            "cond": 31,
+            "d": 0,
+            "g": 0,
+            "i": 1,
+            "l": 1,
+            "m": 4,
+            "u": 1,
+            "ureg": 1,  # R1: odd, no lower neighbor to pair with.
+        }
+        state = T.State(0x10, {T.UREG_CODES["I1"]: T.Const(0x1000)})
+        [result] = T._execute(state, insn("3a", fields, length=6))
+        self.assertEqual(result.stopped, "unsupported Type3a odd UREG pair")
 
 
 class UndocumentedFormsStopWithReasonTest(unittest.TestCase):

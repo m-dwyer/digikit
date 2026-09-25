@@ -74,10 +74,28 @@ def _type_3a(
     # on the processing element"), so a resolved-false predicate skips
     # both the transfer and the compute, and an unresolved predicate
     # forks into executed/skipped states exactly like every other
-    # conditional form here (2a, 5a_move, 9a_abs). Long-word pairs
-    # remain deliberately unsupported.
-    if _field(f, "l"):
-        return [_stop(state, insn, "unsupported Type3a long-word access")]
+    # conditional form here (2a, 5a_move, 9a_abs).
+    #
+    # l=1 is the (LW) long-word override (PRM p.13-15's ACCESS Encode
+    # Table: every u/g/d row repeats with "(lw)" appended, same cond/
+    # compute/i/m fields). p.13-13: "(LW) ... lets programs specify
+    # long word addressing, overriding default addressing from the
+    # memory map" -- the named ureg's 32-bit value and its *neighbor*
+    # register (PRM p.2-4 "Data Register Neighbor Pairing": "Every even
+    # data register has an associated odd register representing a
+    # register pair. For example, R1:0 are a neighbor data register
+    # pair") together fill one 64-bit long-word slot, ureg at the low
+    # word and ureg+1 at the high word (Figure 7-19 "Long Word
+    # Addressing of Single-Data": "RX = DM(LONG WORD X0 ADDRESS)"
+    # loads RX from the low 32 bits and its neighbor RY from the high
+    # 32 bits of the same 64-bit bus access). p.2-5's NOTE: "The
+    # instruction modifier (LW) overrides SIMD Mode" -- matching
+    # Type14a's PM/DM long-word branch and memory._simd_ureg_mem_
+    # companion's own long-word case, this is SISD-only, no
+    # complementary-register companion transfer. Only an even-coded
+    # ureg is supported (this tracer's existing Type14a convention:
+    # the neighbor is ureg+1); an odd ureg has no lower neighbor to
+    # pair with here and is left unsupported rather than guessed.
     cond = _field(f, "cond")
     old = dict(state.uregs)
     compute_fields = dict(f)
@@ -95,18 +113,85 @@ def _type_3a(
     except ValueError as error:
         return [_stop(state, insn, str(error))]
 
+    long_word = bool(_field(f, "l"))
+    ureg = _field(f, "ureg")
+    if long_word and (ureg & 1 or ureg + 1 >= len(UREG_NAMES)):
+        return [_stop(state, insn, "unsupported Type3a odd UREG pair")]
+
     def run_transfer(target: State) -> None:
         bank = 8 if _field(f, "g") else 0
         index, modifier = _field(f, "i") + bank, _field(f, "m") + bank
         post_modify = bool(_field(f, "u"))
         space = "PM" if bank else "DM"
+        access_width = "long-word" if long_word else "normal-word"
         iv, mv = _ureg(old, 16 + index), _ureg(old, 32 + modifier)
-        scale = _access_modifier_scale("normal-word", target.assume_nw32)
+        scale = _access_modifier_scale(access_width, target.assume_nw32)
         scaled_mv = _multiply(mv, Const(scale), "M%d * %d" % (modifier, scale))
         modified = _add(iv, scaled_mv, "I%d + M%d * %d" % (index, modifier, scale))
         address = iv if post_modify else modified
-        ureg = _field(f, "ureg")
-        if _field(f, "d"):
+        rendered = _render(address)
+        if long_word:
+            pair = (ureg, ureg + 1)
+            pair_addresses = [
+                _add(address, Const(4 * offset), "%s + %d" % (rendered, 4 * offset))
+                for offset in range(2)
+            ]
+            if _field(f, "d"):
+                values = tuple(_ureg(old, item) for item in pair)
+                writes = (
+                    tuple(
+                        _dm_write(target, item_address, 4, value)
+                        for item_address, value in zip(
+                            pair_addresses, values, strict=True
+                        )
+                    )
+                    if space == "DM"
+                    else (False, False)
+                )
+                _event(
+                    target,
+                    insn,
+                    "store",
+                    space=space,
+                    ureg_pair=[UREG_NAMES[item] for item in pair],
+                    values=[_json_value(value) for value in values],
+                    address=address,
+                    expression=rendered,
+                    concrete_write=all(writes),
+                    addressing_mode="post-modify" if post_modify else "pre-modify",
+                    access_width="long-word",
+                )
+            else:
+                loaded_values = (
+                    tuple(
+                        _dm_read(target, item_address, 4)
+                        for item_address in pair_addresses
+                    )
+                    if space == "DM"
+                    else (None, None)
+                )
+                for item, mem_value in zip(pair, loaded_values, strict=True):
+                    target.uregs[item] = mem_value or Unknown(
+                        "memory-address " + rendered
+                    )
+                _event(
+                    target,
+                    insn,
+                    "load",
+                    space=space,
+                    ureg_pair=[UREG_NAMES[item] for item in pair],
+                    address=address,
+                    expression=rendered,
+                    concrete_values=[
+                        _json_value(value)
+                        if value is not None
+                        else {"unknown": "unavailable memory"}
+                        for value in loaded_values
+                    ],
+                    addressing_mode="post-modify" if post_modify else "pre-modify",
+                    access_width="long-word",
+                )
+        elif _field(f, "d"):
             value = _ureg(old, ureg)
             _event(
                 target,
@@ -116,7 +201,7 @@ def _type_3a(
                 ureg=UREG_NAMES[ureg],
                 value=value,
                 address=address,
-                expression=_render(address),
+                expression=rendered,
                 concrete_write=_dm_write(target, address, 4, value)
                 if space == "DM"
                 else False,
@@ -132,7 +217,7 @@ def _type_3a(
                 space=space,
                 ureg=UREG_NAMES[ureg],
                 address=address,
-                expression=_render(address),
+                expression=rendered,
                 concrete_value=loaded,
                 addressing_mode="post-modify" if post_modify else "pre-modify",
                 access_width="normal-word",

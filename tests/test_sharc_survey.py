@@ -471,7 +471,11 @@ class CollectAllFrameRunTest(unittest.TestCase):
         # FRAME_PATCH_TABLE's two register hypotheses already avoid every
         # fork on this path (docs/findings/06, this lane's handover): the
         # only stop collect-all records is the same FRAME_MILESTONE stop
-        # tools/sharc_harness.py's own FrameRenderFromInitTest pins.
+        # tools/sharc_harness.py's own FrameRenderFromInitTest pins -- a
+        # genuine RETURN since the Y1 lane's Type3a (LW) fix (2026-09-25):
+        # sv._categorize maps "return without followed call" to its own
+        # "frame-returned" category (see that function), not the raw halt
+        # reason string.
         result = sv.run_collect_all(
             self._fresh_call(),
             self.h.FRAME_PATCH_TABLE,
@@ -482,7 +486,7 @@ class CollectAllFrameRunTest(unittest.TestCase):
         milestone = self.h.FRAME_MILESTONE
         self.assertEqual(result.instructions, milestone["instructions"])
         last = result.stops[0]
-        self.assertEqual(last.category, milestone["reason"])
+        self.assertEqual(last.category, "frame-returned")
         self.assertEqual(last.pc, milestone["pc_sw"])
 
     def test_without_patch_table_finds_several_distinct_forks_then_the_same_blocker(
@@ -493,10 +497,11 @@ class CollectAllFrameRunTest(unittest.TestCase):
         )
         # Every fork this lane's own FRAME_PATCH_TABLE hand-resolves, plus a
         # handful more a bare not-taken default has to guess through, ending
-        # at the same FRAME_MILESTONE stop a hand-patched run reaches.
+        # at the same FRAME_MILESTONE stop a hand-patched run reaches (a
+        # "frame-returned" category -- see the sibling test above).
         self.assertGreater(result.guesses, 5)
         milestone = self.h.FRAME_MILESTONE
-        self.assertEqual(result.stops[-1].category, milestone["reason"])
+        self.assertEqual(result.stops[-1].category, "frame-returned")
         self.assertEqual(result.stops[-1].pc, milestone["pc_sw"])
         # A recurring fork (a loop) is recorded once, not once per iteration.
         pcs = [s.pc for s in result.stops]
