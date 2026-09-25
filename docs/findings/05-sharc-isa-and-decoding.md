@@ -941,8 +941,7 @@ None is resolved to `0x252658` yet. **[D][O]**
   ("uncertain or undecodable form: source: prm") -- now runs the Type4d
   instruction and continues 1,037 more steps to the same external-call site
   the other branch already reached, landing at 1,192 steps. No `15a` bug fix
-  effect
-  appears in any of the six golden cases: `mem_access`/`dataref`/`ptr` are
+  effect appears in any of the six golden cases: `mem_access`/`dataref`/`ptr` are
   read only by `tools/sharc.py`'s `Image.refs`/`writers`/`readers`, not by
   the live tracer/runner, so that fix is silent here and only changes
   `tools/sharc.py` query results. Updated with `uv run python
