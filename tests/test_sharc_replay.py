@@ -16,6 +16,7 @@ import unittest
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools"))
+import sharc_harness as h  # noqa: E402
 import sharc_replay as replay_mod  # noqa: E402
 import sharc_run as sr  # noqa: E402
 
@@ -274,6 +275,72 @@ class ReplayIdleCaptureTest(unittest.TestCase):
             self.assertIsNone(frame["mix_gate_write"])
             self.assertIsNone(frame["master_bus_decoded_write"])
             self.assertIsNone(frame["slot_type_write"])
+
+
+@pytest.mark.slow
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+class CallFrameCollectAllWithHitsTest(unittest.TestCase):
+    """tools/sharc_replay.call_frame_collect_all_with_hits(): a real pc-hit
+    breakpoint (Runner.breakpoints, checked natively inside
+    sharc_survey.run_collect_all()'s own loop), not a memory watch on a
+    write target a function is only believed to touch -- lane E2's own task
+    1 (2026-09-25/26, docs/findings/06's "Lane E2" section)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(
+            0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools")
+        )
+
+    def _runner(self):
+        memory = h.load_image_memory("dt2-1.16")
+        init = h.run_init(memory, "dt2-1.16")
+        self.assertTrue(init.ran, init.error)
+        runner = h.new_runner(memory, "dt2-1.16", init=init)
+        h.setup_voice(runner.state, "dt2-1.16", voice=0, sample_len=4096)
+        h.setup_frame(runner.state, "dt2-1.16", command=3, ring_flag=0)
+        return runner
+
+    def test_reachable_pc_is_hit_and_frame_still_completes(self):
+        # 0x1c3083: FUN_1c2b24's own CALL to FUN_1c642a -- docs/findings/06's
+        # "Call convention" ("FUN_1c2b24 loads R4 = 0x2412c8 (0x1c3080) and
+        # calls FUN_1c642a (0x1c3083)"), runs exactly once per frame.
+        runner, result, hits = replay_mod.call_frame_collect_all_with_hits(
+            self._runner(),
+            "dt2-1.16",
+            trace_pcs={0x1C3083},
+            patch_table=h.FRAME_PATCH_TABLE,
+        )
+        self.assertEqual([hit["pc"] for hit in hits], ["0x1c3083"])
+        # The hit did not stop the frame -- run_collect_all() resumed past
+        # it and reached the same "frame-returned" milestone a plain
+        # call_frame_collect_all() call reaches from this state.
+        self.assertEqual(result.terminal.category, "frame-returned")
+        self.assertEqual(result.terminal.pc, 0x1C75D3)
+
+    def test_fun_1c60a2_is_never_reached_from_a_run_init_state(self):
+        """FUN_1c60a2 (the machine-type change detector's own call target,
+        docs/findings/06's "The SHARC machine-type consumer") does not
+        execute at all from a run_init() state with one hand-set-up voice,
+        in a bare command-3 frame call with no captured DSPI2 content --
+        consistent with the same zero-hit result this lane found replaying
+        real frames of out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap
+        (not committed -- Elektron-derived; see the lane's own report) and
+        with a synthetic frame that forces every track's machine-type field
+        to change. All three of FUN_1c60a2's own static call sites
+        (0x1c32d2/0x1c330e/0x1c33f1, inside 0x1c3289-0x1c33fe) sit behind a
+        32-iteration companding loop in FUN_1c2b24 itself (0x1c319a-
+        0x1c31da) whose own chained GT branches never fall through to that
+        block in any run tried here -- see the lane report for the
+        concrete register values."""
+        runner, result, hits = replay_mod.call_frame_collect_all_with_hits(
+            self._runner(),
+            "dt2-1.16",
+            trace_pcs={0x1C60A2},
+            patch_table=h.FRAME_PATCH_TABLE,
+        )
+        self.assertEqual(hits, [])
+        self.assertEqual(result.terminal.category, "frame-returned")
 
 
 if __name__ == "__main__":

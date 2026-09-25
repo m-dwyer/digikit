@@ -4105,3 +4105,140 @@ to at `0x1c33d2` during this exact replay) plus a code-reachability check
 (e.g. an instruction-count histogram, or a temporary breakpoint at
 `0x1c60a2`) to see whether that function executes at all, before assuming
 the write address is wrong.
+
+## Lane E2: `FUN_1c60a2` is never reached; the branch that skips it is a companding gate fed from an unpopulated pointer, not from any DSPI2 frame field **[V][C][O]**
+
+Answers Lane D2's own concrete next step above with a real pc-hit
+breakpoint (`Runner.breakpoints`, checked natively inside
+`tools/sharc_survey.py`'s `run_collect_all()` loop before an instruction
+decodes -- not a memory watch on a write target `FUN_1c60a2` is only
+*believed* to touch) instead of the watch-based probe D2 used. New,
+reusable entry point: `tools/sharc_replay.call_frame_collect_all_with_hits()`
+(installs the breakpoint set on the fresh_call runner -- `Runner.fresh_call()`
+already carries `breakpoints` forward -- records every hit's own
+instruction count, steps exactly one instruction past each hit, and
+resumes, so a function called several times per frame does not truncate
+the render). Covered by `tests/test_sharc_replay.py`'s
+`CallFrameCollectAllWithHitsTest`.
+
+**Reachability, corrected [V].** Replaying frames 0-1 of
+`out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap` (the same capture and
+frames D2's own probe used) with a breakpoint at `0x1c60a2` gives **zero**
+hits, while frame 1 still reaches the full `frame-returned` milestone at
+the same 82372 instructions D2's watch-based probe already reported. This
+rules out D2's explanation (c) ("`I5`'s absolute address is different at
+runtime than assumed, so the watch's fixed base misses the real write"):
+the write-target watch was not looking in the wrong place -- `FUN_1c60a2`'s
+own entry point is never reached at all, on this exact replay.
+
+**Which branch, and why [V].** `FUN_1c60a2`'s three static call sites
+(`0x1c32d2`, `0x1c330e`, `0x1c33f1`) all sit inside `0x1c3289`-`0x1c33fe`
+(a separate callable, reached here purely by straight-line fall-through
+from the end of `FUN_1c2b24`, not the single conditional-jump edge the
+call database records). That whole block, together with the `0x1c33d7`
+machine-type compare this finding already describes, is the *fall-through*
+side of a 32-iteration `DO` loop **inside `FUN_1c2b24` itself**
+(`0x1c319a`-`0x1c31da`, right after the loop's own preamble -- not inside
+`FUN_1c642a`/`FUN_1c24e9` as earlier notes above assumed): each iteration
+computes a floating value and takes one of two chained `JUMP IF GT`
+branches (`0x1c31b1 -> 0x1c3294`, then inside that target block
+`0x1c31c5 -> 0x1c3289`, which itself immediately re-tests `JUMP IF GT ->
+0x1c31d7`) whenever that value is small; only when it is *not* small does
+the loop fall through into `0x1c32a0`-`0x1c3329` (the machine-type compare
+plus all three `FUN_1c60a2` calls, plus four sibling case-setter calls to
+`0x1c6010`/`0x1c602c`/`0x1c6048`/`0x1c6056`).
+
+By execution, in every one of the 32 iterations, on both replayed frames,
+the compared value is exactly `0.0` (`F0`/`F7`, both fixed-point zero)
+against constants `~+0.865`/`~-0.865`/`~1.115` -- so the GT branch is taken
+every time, and the `0x1c32a0` block (and `FUN_1c60a2` inside it) is
+genuinely dead code on this run, not merely unlucky. The per-iteration
+input traces to `R0 = DM(I5, M6)` where `I5 = DM(0x254d78)` (loaded once,
+before the loop, at `0x1c3170`) -- **`0x254d78` holds a pointer, not the
+level itself** (confirmed by execution: `I5` reads back as the *value*
+`0x0` right after that load, i.e. a null pointer, so the loop dereferences
+address `0x0`, which `State.explicit_memory_model` reads as zero). The
+only resolved static writer of `0x254d78` (`tools/sharc.py`'s
+`img.writers()`) is `0x1c2c67`, inside `FUN_1c2b24` itself, a few hundred
+instructions before this loop in the *same* frame call -- confirmed by
+execution to run first (instruction 1010 of this call) and to write `0`
+there (matching the `I5=0x0` readback). No writer of a *non-null* value
+for this cell was found anywhere reached from `run_init()` or a frame call
+-- **[O]**, real writer (if any) not found.
+
+**Frame content has no effect on this gate [V].** Two independent checks,
+both against real render_frame calls with `FRAME_PATCH_TABLE` applied:
+
+- `tools/sharc_framemap.py --capture .../play-pretracks-fulltx.dt2cap
+  --frame-index 1` (its own fingerprint mode, which overwrites all 11 known
+  per-track scalar frame fields -- including machine_type at `0x94+2i` --
+  with distinct nonzero markers for all 16 tracks, deliberately forcing the
+  machine-type NOT-EQUAL branch) reports `n_offsets_with_destination: 0`:
+  none of the 1900 frame bytes this run actually read ever reappear at any
+  watched destination (a voice record, a ring, or the gain table).
+- The same fingerprinted frame, replayed with breakpoints at `0x1c60a2`,
+  `0x1c4eaf` and `0x1c6582` (below), gives **zero hits on all three** and
+  the *same* 82372-instruction terminal as the unmodified frame -- forcing
+  every track's machine-type field to change has no measurable effect on
+  this execution path at all.
+
+So no known DSPI2 frame field -- the 11 fingerprinted scalar bases
+(`0x02`, `0x34`, `0x54`, `0x74`, `0x94`, `0xb4`, `0x73c`, `0x75c`, `0x77c`,
+`0x79c`, `0x7bc`) -- was found to influence this branch, in either a real
+capture or a synthetic one. The real gate is `0x254d78`'s own pointer being
+null, upstream of and independent of the received frame.
+
+**The other candidate arm site, `FUN_1c4eaf`, is also unreached here
+[V][O].** `FUN_1c4eaf` (sets record `+0x1b8`/`+0x1ba`, "Flags and seed"
+above) has three static callers: `0x1c6582` inside `FUN_1c642a`
+(immediately after the `0x1c6553`-`0x1c6579` "Trigger" jump-table dispatch
+this finding already documents), and two inside a separate function
+`FUN_1c2ac9` (`0x1c2b0a`, `0x1c2b14`) -- **[O], not chased further**: both
+of those pass fixed addresses (`0x252730`, `0x252908`), not a voice-record
+base (`0x2412cc + k*0x1d8`), so they arm some *other* structure (near the
+master-stage bus constants `0x252538`/`0x2526e8`), not a voice, and
+`FUN_1c2ac9` is reached only via a conditional jump from `0x1c29fd`, not
+traced to whether it runs during a frame call at all. `0x1c6582` itself is
+gated by a guard at `0x1c6540`/`0x1c6549` (`JUMP IF SZ`/`JUMP IF NOT SV`,
+both branching to `0x1c657b` which falls into the `CALL 0x1c4eaf`) that
+sits, in the binary, just *before* the documented `0x1c6553` trigger entry
+-- but by execution, `FUN_1c642a`'s own 32-iteration per-voice dispatch
+loop lands on `0x1c6553` directly, 32 times, on every voice record in this
+replay, and **never once reaches `0x1c6540`** -- consistent with `0x1c6540`
+being a separate case block for a voice/slot-type value none of the 32
+records (all "empty", per-init) selects, not a shared predecessor of
+`0x1c6553`.
+
+**A diagnostic-only poke, to test the causal chain directly (not a frame
+trigger) [V].** After confirming `0x1c2c67`'s own zero-write runs first,
+forcing `DM(0x254d78 + k*4)`, `k`=0..31, to the IEEE-754 bit pattern for
+`2.0` (well above the loop's own thresholds) does *not* flip the branch
+either: because `0x254d78` is a pointer (see above), overwriting it with
+`2.0`'s bit pattern (`0x40000000`) just points `I5` at a different bogus
+address, which `explicit_memory_model` still reads as zero. Correctly
+forcing this gate would need finding, or itself allocating, whatever real
+buffer `0x254d78` is meant to point at and writing a large value *there* --
+not attempted in this lane's budget.
+
+**Net for task 2 (frame -> armed voice): no trigger encoding found.** No
+known frame offset was observed to reach either `FUN_1c60a2`'s call sites
+or `FUN_1c4eaf`'s `0x1c6582` call site, in a real capture, a
+machine-type-forcing fingerprint, or a direct internal-state poke of the
+one gate this lane could concretely identify. Per this lane's own task
+(*"If a trigger encoding is found ... craft one frame ... If [not] ...
+report"*), no synthetic frame was written to arm a voice: doing so without
+a known encoding would be presenting a guess as a firmware-driven trigger.
+The concrete next steps this lane leaves open: (1) find `0x254d78`'s real
+writer/allocator (a companding/dynamics side-chain table, by its
+neighbouring writes at `0x254d80`/`0x254d88`/`0x254d90`), since a nonzero
+pointer there is the one lever this lane found that would let a real
+frame's content reach the `0x1c33d7` compare at all; (2) trace what
+selects `0x1c6540` vs `0x1c6553` in `FUN_1c642a`'s per-voice dispatch (a
+purely static `img.print_slice()` backward slice from either address does
+not resolve cleanly here -- it walks into unrelated code inside
+`FUN_1c71ec`'s own body across a jump-table boundary the tool cannot
+separate by caller context, so it needs a concrete per-slot-type execution
+trace instead, the same pc-hit-breakpoint technique this lane used
+elsewhere); (3) trace `FUN_1c2ac9`'s own reachability and its two
+`0x252730`/`0x252908` targets, in case they are relevant to a *different*
+kind of "armed" state this lane did not check.

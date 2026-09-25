@@ -115,6 +115,7 @@ if HERE not in sys.path:
 
 import sharc_harness as h  # noqa: E402
 import sharc_run as sr  # noqa: E402
+import sharc_survey as sv  # noqa: E402
 import sharc_trace as st  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(HERE))
@@ -347,6 +348,85 @@ def _first_nonzero_write(
                 "value": "%#x" % event.new_value,
             }
     return None
+
+
+def call_frame_collect_all_with_hits(
+    runner: sr.Runner,
+    image: str,
+    *,
+    trace_pcs,
+    patch_table: sv.PatchTable | None = None,
+    watchpoints=(),
+    max_steps: int = 4_000_000,
+    max_hits: int = 200,
+    img=None,
+) -> tuple[sr.Runner, sv.CollectAllResult, list[dict]]:
+    """Like `sharc_harness.call_frame_collect_all()`, but also answers "does
+    control ever reach any of TRACE_PCS during this one frame call", with a
+    real pc-hit breakpoint (`Runner.breakpoints`, checked natively inside
+    `sharc_survey.run_collect_all()`'s own loop before an instruction
+    decodes) rather than inferring reachability from a memory watch on some
+    address a function is *believed* to write (lane E2, 2026-09-25/26 --
+    see docs/findings/06's "Lane E2" section for why this matters: a
+    write-target watch at a candidate offset can read as empty either
+    because the function never ran, or because it ran but the watched
+    address was wrong -- a pc-hit breakpoint at the function's own entry
+    (or any other pc of interest) tells the two apart).
+
+    `Runner.fresh_call()` already carries `breakpoints` forward (`new_runner
+    .breakpoints = self.breakpoints`, tools/sharc_run.py), so TRACE_PCS is
+    installed on the fresh_call runner this makes internally -- a caller
+    does not need to pre-set `runner.breakpoints` itself. A breakpoint hit
+    is not fatal to the frame call: this function clears `breakpoints`
+    (saving the set first), executes exactly the one instruction at that pc
+    (`Runner.step()`, tools/sharc_run.py's own single-instruction API,
+    unaffected by whatever `sharc_survey.run_collect_all()`'s own inlined
+    stepping loop does elsewhere), restores `breakpoints`, and resumes
+    `run_collect_all()` -- so a frame with several hits (e.g. a function
+    called once per voice/track, in a `DO 32` loop) still runs to its real
+    terminal (`frame-returned`, a genuine fork, an MMR trap, ...), with
+    every intermediate hit recorded rather than only the first.
+
+    Returns `(runner, result, hits)`: `runner` is the fresh_call Runner,
+    positioned at the true terminal stop (not at a hit -- hits are always
+    stepped past); `result` is that terminal leg's own `CollectAllResult`
+    (earlier legs' own stops, if any, are not merged in -- only the hits
+    list accumulates across legs); `hits` is
+    `[{"pc": "0x...", "instructions": N}, ...]`, oldest first, `N` being
+    `runner.instructions` (this frame's own running count, comparable
+    across hits and to `result.instructions`) at the moment of that hit,
+    before the pc's own instruction executed. Stops at `max_hits` hits
+    (a runaway loop should not build an unbounded list) or `max_steps`
+    total instructions, whichever comes first -- either way, `result`
+    still reports whatever terminal `run_collect_all()` last reached.
+    """
+    p = h.profile(image)
+    new_runner = runner.fresh_call(p.block_handler, diagnose_unknown=True)
+    if watchpoints:
+        new_runner.attach_watchpoints(list(watchpoints))
+    trace_pcs = frozenset(trace_pcs)
+    new_runner.breakpoints = frozenset(new_runner.breakpoints) | trace_pcs
+    hits: list[dict] = []
+    result = None
+    remaining = max_steps
+    while remaining > 0 and len(hits) < max_hits:
+        result = sv.run_collect_all(new_runner, patch_table or {}, remaining, img=img)
+        terminal = result.terminal
+        if terminal.category != "breakpoint" or terminal.pc not in trace_pcs:
+            break
+        hits.append(
+            {"pc": "%#x" % terminal.pc, "instructions": new_runner.instructions}
+        )
+        saved = new_runner.breakpoints
+        new_runner.breakpoints = frozenset()
+        try:
+            new_runner.step()
+        except sr.Halt as exc:
+            hits[-1]["step_halt"] = str(exc)
+            return new_runner, result, hits
+        new_runner.breakpoints = saved
+        remaining = max_steps - new_runner.instructions
+    return new_runner, result, hits
 
 
 def replay(
