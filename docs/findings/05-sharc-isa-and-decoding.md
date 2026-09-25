@@ -1055,10 +1055,12 @@ None is resolved to `0x252658` yet. **[D][O]**
   as a decode mismatch; the check first appends `raw` bytes to the query
   (`_raw_le_bytes()`, the 16-bit-little-endian-word packing `tools/sharc_isa.py`'s
   `frame_of()`/`DecodedInstruction.raw` use) and compares against
-  `read_sw()` before ever calling `decode_at()`. **[V][O]** (real and
-  reproducible; whether block 1 is dead scratch code from an earlier boot
-  stage or something worth modelling is open, and is lane A2/whoever owns
-  `sharc_core/memory.py`'s question, not a decode-path one).
+  `read_sw()` before ever calling `decode_at()`. **[V][C]** (real and
+  reproducible; resolved below, "Loader block 1 is not code: decoding from
+  LoadedMemory" and "Loader block 57 was never stale: a too-small
+  L2_BYTE_LIMIT" -- block 1 is dead scratch code, never entered in any of
+  the four final images, and DN2's "not-yet-characterized" block 57 turned
+  out to be a mapping bug, not a real overwrite, both DB_VERSION v13).
 - **Golden.** Only `trace_voice` changed (`cov_render`, `cov_all`,
   `run_voice`, `run_frame`, `trace_frame` are byte-identical). Compared
   old vs. new `output("trace_voice")` directly (not just the hash, by
@@ -1117,7 +1119,9 @@ None is resolved to `0x252658` yet. **[D][O]**
     teaching `tools/sharcdb.py`'s block scan to skip -- or teaching
     `sharc_coverage.py`'s gap report to exclude -- a `code` block a later
     block in the same stream fully overwrites, which is a database/
-    lifecycle change, not a decoder one. **[V][O]**
+    lifecycle change, not a decoder one. **[V][C]** (resolved below, "Loader
+    block 1 is not code: decoding from LoadedMemory", DB_VERSION v13 -- the
+    lifecycle change this bullet asked for).
 - **Tests.** `tests/test_sharc_coverage.py` (new): `_raw_le_bytes()`
   against a real DT2 1.16 example; `compare_decode_at()`'s four
   classifications (agreeing, stale-bytes, width, form, fields mismatch) on
@@ -1132,3 +1136,210 @@ None is resolved to `0x252658` yet. **[D][O]**
   loaded()` fails closed on a genuinely unmapped loader PC.
   `tests/test_sharcimm.py`'s own tests (unchanged) still pass, since
   `decode_all()`'s behaviour is unchanged. **[V]**
+
+## One decode INPUT, not just one decode function: DB_VERSION v13 **[V]**
+
+The previous section's own "Stale-bytes" note left two things open: block 1's
+role, and DN2's larger, uncharacterized stale-bytes count on block 57. Both
+are now resolved. The model decided on: the database describes the program
+**as loaded** -- one code block's `insn`/`functions`/edges rows are decoded
+from `tools/sharcldr.py`'s `LoadedMemory` (the whole boot stream's merged,
+last-write-wins final image), not from that block's own raw stream payload.
+This is the same input `tools/sharc_core.sequencer.decode_at()` already used
+(no database access, `LoadedMemory` only) -- the "One decode path" section
+above unified the decode *function*; this unifies the decode *input* the
+same way, for the same reason: a block whose own bytes never persist into
+the image the emulator boots from was never real code, however confidently
+it decodes. A block that genuinely ran as a boot stub before being
+overwritten would need to stay distinguishable (a separate table or a flag
+naming the overwriting block), not merged into the final-program tables --
+no such case was found in this firmware (see below), so no such table was
+added; `blocks.overwritten_bytes` (new column) is the general mechanism that
+would surface one if a future image had it.
+
+### Loader block 1 is not code: decoding from LoadedMemory **[V]**
+
+Loader block 1 (target `0x282403f0`, `byte_count` 10312, base_sw `0x1201f8`)
+is identical across all four images and is **not resident in any of the four
+final boot images**: 10304 of its own 10312 declared bytes (99.9224%) are
+overwritten by later blocks in the *same* boot stream -- mostly one large
+zero `FILL` block, the rest small `data` blocks -- before `LoadedMemory`'s
+last-write-wins resolution is reached. Only two 4-byte spans of its own
+declared range still belong to block 1 in the final image: `[0x28240458,
+0x2824045c)` (all four images) and `[0x282412bc, 0x282412c0)` (DT2
+1.16/1.15C) / `[0x2824128c, 0x28241290)` (DN2 1.11/1.10E) -- 8 bytes total,
+inconsequential. Every overlapping block has a *higher* stream index than
+block 1 (13 of them on DT2, 11 on DN2 -- DN2 packs the same address range
+into fewer, larger `FILL` blocks), so this is unambiguously "a later write
+in the same stream overwrites an earlier one", not a parsing artifact.
+**Second-agent check (this task's required independent verification):** a
+fresh agent, given no access to this finding's numbers or to
+`LoadedMemory.owner_runs()`, wrote its own parser and two independent
+ownership computations (a byte-by-byte scan and an interval sweep) directly
+against `tools/sharcldr.parse_blocks()` on the raw `section_7_BLOB.bin` of
+all four images. Its numbers matched exactly: same overlapping-block lists,
+same 99.9224% (10304/10312), same two surviving 4-byte ranges including the
+DT2-vs-DN2 difference in the second range, and confirmed every overlapping
+block's index is higher than block 1's (no contradiction of "only a later
+write can override"). **[V]**
+
+What block 1 actually is: the boot stream's docstring convention already
+established (see `tools/sharcldr.py`'s module docstring) that a
+`BFLAG_FIRST` block's `target_address` names the start of "an application"
+and that a stream can carry more than one, with only the *last* one being
+the application the core actually boots into (`0x1c1338` for DT2, matching
+this repo's `render_frame` root). Block 1's own declared range covers sw
+`0x120230`, DT2's *first* `BFLAG_FIRST` entry point -- so block 1 is (part
+of) an earlier-build application the same combined boot stream still
+carries, whose own memory range the final build's loader blocks reuse for
+parameter/coefficient data (hence their `data`/`FILL` kind) before the core
+ever starts running. No root, no IVT slot (`_detect_interrupt_vector_roots`,
+`IVT_DISPATCH_TABLES`) and no `BFLAG_FIRST` used by the *final* application
+enters block 1's range; the ~82 "functions" and dense `dataref_code_pointer`
+roots the pre-v13 database found inside it were themselves artifacts of
+decoding these dead, self-overlapping bytes as if they were live code
+(literal fields that happen to encode addresses back inside the same dead
+range). `tools/sharcinv.py`'s `CODE_BLOCKS` and this file's
+`KNOWN_CODE_BLOCKS` no longer include it on any of the four images; its
+`blocks` row now reports `kind='data'` (matching what the final image
+actually holds there) with `overwritten_bytes=10304`. **[V]**
+
+Collateral: `docs/findings/06-sharc-engine-and-startup.md` describes block 1
+as "the loader" and cites function counts, literal cross-references and hash
+matches drawn from it (e.g. "blk1 82" functions, "literal 0x60 occurs in
+blk1, blk69 and blk88", reload counts "across blk1/..."). Those specific
+blk1-derived claims no longer have a `blocks`/`insn`/`functions` row to point
+to after this fix and should be reviewed by whoever owns finding 06 -- not
+done here (docs/findings/06 and `tools/sharcinv.py`'s own module docstring
+are outside this task's file ownership; only the `CODE_BLOCKS` line and the
+`--blocks` usage example were corrected in `tools/sharcinv.py`, since the bug
+lives in the code that file defines). **[O]**
+
+### Loader block 57 was never stale: a too-small L2_BYTE_LIMIT **[V]**
+
+DN2 1.11/1.10E's other stale-bytes contributor, loader block 57 (target
+`0x2001e888`, `byte_count` 67652), is a *genuine, unoverwritten* code block:
+byte-for-byte identical between its own declared range and `LoadedMemory` at
+every address (checked directly with `mem.read()` against the raw
+byte-address, not through the sw-based accessor), independently confirmed
+with `LoadedMemory.owner_runs()` showing 0 bytes owned by anything but block
+57 itself. It was reported "stale" only because `tools/sharcldr.py`'s
+`L2_BYTE_LIMIT` (`0x20020000`, one 128 KB L2 SRAM bank) was too small:
+`read_sw()`'s L2 fallback bounds-checks against it and returned `None` for
+any sw past the bank boundary, while block 57 itself extends to
+`0x2002f1c4` -- 61,900 bytes (91.5% of the block) past that old bound. The
+ADSP-2156x hardware reference (`out/refs/adsp-2156x-hwr`) documents the real
+size: "L2CTL0 contains 1M byte of RAM grouped into eight banks, 128K bytes
+each and 96K bytes of boot ROM" -- the old bound modeled one bank of eight.
+`L2_BYTE_LIMIT` is now `0x20100000` (the full 1 MB), and `tools/sharcfn.py`'s
+`base_sw_note()` (which quoted the old bound in a diagnostic string) now
+formats it from the live constants instead of a hardcoded literal. Block 57
+stays in `KNOWN_CODE_BLOCKS`, now resolved end to end (0 stale bytes,
+below). DN2's other out-of-window block, blk59 (target `0x200779f8`), now
+has its *start* address inside the widened window too (it was previously
+excluded for being past the old `L2_BYTE_LIMIT`), but it has no prior
+characterization as code the way block 57 did (docs/findings/11's
+correspondence method never named it) and is left out of
+`KNOWN_CODE_BLOCKS` for that reason alone -- a known, unverified gap, not
+re-added by this task. **[V][O]**
+
+**Collateral, not fixed here:** `tools/sharcspec/ghidra/gen_sleigh.py`
+(SLEIGH language generation, not owned by this task) independently
+hardcodes the *old* `0x20020000` L2 boundary in generated code (its own
+`isl2` predicate, `addr_name < 0x20020000`) rather than reading
+`sharcldr.L2_BYTE_LIMIT`; it is now inconsistent with the widened Python-side
+bound. This affects only the Ghidra SLEIGH import path
+(`tools/sharc_import.py`'s own `ghidra_addr()`/`mapped_segments()` already
+read the live constants and needed no change, confirmed by
+`tests/test_sharc_import.py`), not this database/decode pipeline. Flagged
+for whoever owns `tools/sharcspec/ghidra/`. **[O]**
+
+### DB_VERSION 12 -> 13, before/after **[V]**
+
+Rebuilt all four private per-lane databases
+(`uv run python tools/sharcdb.py build out/sections/*/section_7_BLOB.bin`).
+"Before" below is a faithful v12 rebuild from a clean checkout of this
+task's changed files (not a stale number): its aligned-instruction/
+stale-bytes counts reproduce the "One decode path" section's own already-`[V]`
+table above exactly (e.g. dt2-1.16 51,032/2,269), confirming it is the same
+baseline this section's "after" is measured against.
+
+| image | aligned insns (before -> after) | functions (before -> after) | roots (before -> after) | reach (before -> after) | stale-bytes (before -> after) |
+|---|---:|---:|---:|---:|---:|
+| dt2-1.16 | 51,032 -> 48,760 | 1,228 -> 1,147 | 1,952 -> 1,872 | 67,137 -> 65,280 | 2,269 -> 0 |
+| dt2-1.15C | 50,983 -> 48,711 | 1,227 -> 1,146 | 1,952 -> 1,872 | 67,058 -> 65,201 | 2,269 -> 0 |
+| dn2-1.11 | 65,372 -> 63,100 | 1,157 -> 1,076 | 1,901 -> 1,821 | 59,454 -> 57,597 | 12,661 -> 0 |
+| dn2-1.10E | 64,586 -> 62,314 | 1,151 -> 1,070 | 1,916 -> 1,836 | 58,965 -> 57,108 | 12,075 -> 0 |
+
+`tools/sharc_coverage.py --compare-decode-at` now reports 0 stale-bytes *and*
+0 decode_at mismatches on all four images (previously 0 mismatches, nonzero
+stale-bytes -- see the "One decode path" table above). Every image's drop in
+aligned instructions is a few rows larger than its own stale-bytes count
+alone (dt2-1.16: -2,272 vs. 2,269 stale rows; dt2-1.15C: -2,272 vs. 2,269;
+dn2-1.11: -2,272 vs. 2,269 of block 1's contribution, block 57's own count
+unchanged since it was never really stale; dn2-1.10E: -2,272 vs. 2,269) -- a
+consistent -3-row edge effect from the two tiny 4-byte survivor spans no
+longer contributing their own boundary-adjacent aligned rows once block 1
+is not scanned at all, not a new discrepancy.
+
+Coverage gaps (`tools/sharc_coverage.py <image> --root 0x1c2b24` /
+`--all-roots`):
+
+| image | scope | gaps (before -> after) | not-executable instructions (before -> after) |
+|---|---|---:|---:|
+| dt2-1.16 | `--root 0x1c2b24` | 3 -> 3 (unchanged) | 3 -> 3 |
+| dt2-1.16 | `--all-roots` | 6 -> 5 | 11 -> 5 |
+| dt2-1.15C | `--all-roots` | 6 -> 5 | 11 -> 5 |
+| dn2-1.11 | `--all-roots` | 10 -> 9 | 18 -> 12 |
+| dn2-1.10E | `--all-roots` | 10 -> 9 | 18 -> 12 |
+
+In every image, the removed gap is exactly the `provisional 26a` group at
+`sw 0x1208e4/0x1208ff/0x12096d/0x12099c/0x1209b5/0x1209c4` (6 instructions)
+-- block 1's dead bytes, gone because block 1 is no longer scanned at all.
+The `--root 0x1c2b24` scope (DT2 1.16's render path) never reached block 1
+and is byte-for-byte unchanged. All remaining gaps (`1c32b0`/`1c32b1`/
+`1c32b4`, the L2-decimator `compute` gaps, DN2's extra `compute`/`form` gaps)
+are real code, unrelated to this fix, and stay open per the existing gap
+triage above. **[V]**
+
+`uv run python -m tools.sharc_symbols dt2-1.16` still resolves every symbol
+to the same value as before this change (no `FAILED`/`missing`/`mismatch`
+output) -- none of the profile's required symbols live in block 1's or
+block 57's address ranges, so this is an unsurprising but checked pass.
+**[V]**
+
+**Golden.** Only `cov_all` (`sharc_coverage dt2-1.16 --all-roots --json`)
+changed hash: `instructions` 46,010 -> 43,738, `gap_instructions` 11 -> 5,
+distinct gaps 6 -> 5 (the removed `26a` group) -- exactly the coverage-gap
+table above. `cov_render`, `run_frame`, `run_voice`, `trace_frame` and
+`trace_voice` are byte-identical (none of their roots or traced paths ever
+reached block 1). Updated with
+`uv run python tests/test_sharc_golden.py --update`. **[V]**
+
+**Files touched outside this task's listed ownership.** `tools/sharcinv.py`
+(`analyze_block()`, `build_inventory()`, `CODE_BLOCKS`) was edited because
+the stale-input bug lives in its `analyze_block()`/`build_inventory()`
+functions, which `tools/sharcfn.py`'s `load_context()` and
+`tools/sharcdb.py`'s `_fill_database()` both call into for function
+boundaries and call/jump/return sites -- fixing only this task's own files'
+decode loop would have left `functions`/`edges`/`bblocks` still built from
+block 1's stale bytes, an incoherent database. The edit is minimal (the
+payload source inside `analyze_block()`, and removing block 1 from
+`CODE_BLOCKS`); the module's own docstring and a comment referencing
+`blk1@0x1201f8` as an example were left mostly alone (see the "Collateral"
+note above). `tests/test_sharc_import.py` needed one test fixed (a
+hardcoded `0xFFFF` L2-window-size literal tied to the old, narrower
+`L2_BYTE_LIMIT`) to keep passing after the widening; `tools/sharc_import.py`
+itself needed no change (already reads the live constants). **[O]** for a
+maintainer check that these out-of-list edits don't conflict with other
+lanes' work on `tools/sharcinv.py` (last touched by unrelated commits
+`a286b20`/`8cccd2e`, well before this wave's work).
+
+**Tests.** `uv run python -m pytest tests/test_sharc_golden.py
+tests/test_lint.py tests/test_types.py tests/test_sharcdb.py
+tests/test_sharcfn.py tests/test_sharcimm.py tests/test_sharcldr.py
+tests/test_sharc_disasm.py tests/test_sharc_coverage.py
+tests/test_sharc_symbols.py tests/test_sharc_contract.py
+tests/test_sharc_index.py tests/test_sharc_discover.py
+tests/test_sharcwriters.py tests/test_sharcinv.py tests/test_sharc_import.py
+tests/test_sharcflow.py -q --slow`: 444 passed, 5 subtests passed. **[V]**

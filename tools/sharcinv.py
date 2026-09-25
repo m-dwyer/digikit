@@ -2,17 +2,19 @@
 a compute-op feature vector, with a conservative heuristic label.
 
     uv run python tools/sharcinv.py SECTION7.bin
-        [--blocks 1,56,69,76,78,80,88,91,93] [--min-depth N]
+        [--blocks 56,69,76,78,80,88,91,93] [--min-depth N]
         [--json OUT] [--top N] [--ground-truth]
 
 SECTION7.bin is the raw SHARC DSP boot stream (out/sections/dt2-1.16/
 section_7_BLOB.bin). It is parsed with tools/sharcldr.py; --blocks defaults
 to the code blocks identified in docs/findings/06-sharc-engine-and-startup.md
 ("The SHARC code is not one block"): blk69 (0x20000000, 109436 B) and blk93
-(0x283827cc, 104500 B) are the two big code regions, blk1 (0x282403f0,
-10312 B) is the loader, blk88 (0x28380548, 8484 B) and 56/76/78/80/91 are
-small code fragments. The rest of the blob (17/19/21/27/35/37/39/40/99/101)
-is data and is not scanned.
+(0x283827cc, 104500 B) are the two big code regions, blk88 (0x28380548,
+8484 B) and 56/76/78/80/91 are small code fragments. blk1 (0x282403f0,
+10312 B) was in this list through DB_VERSION v12 but is dead in the final
+loaded image (see CODE_BLOCKS above and docs/findings/05-sharc-isa-and-
+decoding.md, "One decode path") and is no longer scanned as code. The rest
+of the blob (17/19/21/27/35/37/39/40/99/101) is data and is not scanned.
 
 Boundaries: tools/sharcflow.py finds returns (a 9b_abs jump through M5/I4,
 raw 0x083F343F) and direct calls (25a_direct/25a_pcrel with a push+store in
@@ -89,7 +91,14 @@ import sharcldr  # noqa: E402
 
 # docs/findings/06-sharc-engine-and-startup.md, "The SHARC code is not one
 # block". Everything else in the boot stream is data (float tables etc).
-CODE_BLOCKS = (1, 56, 69, 76, 78, 80, 88, 91, 93)
+# Block 1 (0x282403f0, 10312 B), included here until DB_VERSION v13, is NOT
+# code in the final loaded image: ~99.92% of its own declared byte range
+# (10304 of 10312 bytes, identically across all four images) is overwritten
+# by later blocks in the same boot stream -- mostly one large zero FILL --
+# before LoadedMemory's last-write-wins resolution is reached, so it is
+# never resident in the image the emulator actually boots from. See
+# docs/findings/05-sharc-isa-and-decoding.md, "One decode path".
+CODE_BLOCKS = (56, 69, 76, 78, 80, 88, 91, 93)
 
 SW_ALIAS_BASE = sharcldr.SW_ALIAS_BASE
 L2_BYTE_BASE = sharcldr.L2_BYTE_BASE
@@ -301,13 +310,23 @@ def load_blocks(blob_path):
     return data, blocks
 
 
-def analyze_block(data: bytes, blocks: dict, idx: int, min_depth: int = 8):
+def analyze_block(mem, blocks: dict, idx: int, min_depth: int = 8):
     """-> dict with base_sw, sites (sharcflow.find_sites), insns (aligned
-    (offset, Instruction) pairs) and raw_len for code block `idx`."""
+    (offset, Instruction) pairs) and raw_len for code block `idx`.
+
+    `mem` is a tools/sharcldr.py LoadedMemory over the whole boot stream:
+    decoding reads the block's own declared address range through it (the
+    final, last-write-wins bytes the emulator actually boots from), not the
+    block's own raw stream payload -- a code block a LATER block in the
+    same stream fully overwrites (docs/findings/05-sharc-isa-and-decoding.md,
+    "One decode path", DB_VERSION v13 -- e.g. loader block 1) is never
+    resident in that image, so its own stream bytes are not the program."""
     b = blocks[idx]
-    if b['fill'] or not b['payload_len']:
+    if b['fill'] or not b['byte_count']:
         return None
-    payload = data[b['payload_offset']: b['payload_offset'] + b['payload_len']]
+    payload = mem.read(b['target_address'], b['byte_count'])
+    if payload is None:
+        return None
     base_sw = sw_base_for_target(b['target_address'])
     if base_sw is None:
         return None
@@ -627,9 +646,10 @@ def label_function(fv: dict, n_insns: int, n_callers: int, n_callees: int, is_le
 
 def build_inventory(blob_path, block_idxs, min_depth=8):
     data, blocks = load_blocks(blob_path)
+    mem = sharcldr.LoadedMemory.from_stream(data, list(blocks.values()))
     analyzed = {}
     for idx in block_idxs:
-        r = analyze_block(data, blocks, idx, min_depth)
+        r = analyze_block(mem, blocks, idx, min_depth)
         if r is None:
             continue
         r['_insn_sw'] = [r['base_sw'] + off // 2 for off, _ in r['insns']]

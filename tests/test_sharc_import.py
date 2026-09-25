@@ -17,9 +17,15 @@ class GhidraAddressTest(unittest.TestCase):
         self.assertEqual(I.ghidra_addr(L.L2_BYTE_BASE + 0xFC4A), 2 * 0x00B87E25)
 
     def test_l2_translation_is_bounded_and_l1_is_unchanged(self):
+        # (L2_BYTE_LIMIT - L2_BYTE_BASE) is the L2 window's byte size (1 MB
+        # as of docs/findings/05-sharc-isa-and-decoding.md's DB_VERSION v13
+        # widening, formerly one 128 KB bank -- see that file's "One decode
+        # path" section); derive the expected offset from the live
+        # constants rather than hardcoding one window size.
+        last_sw_offset = (L.L2_BYTE_LIMIT - 1 - L.L2_BYTE_BASE) // 2
         self.assertEqual(
             I.ghidra_addr(L.L2_BYTE_LIMIT - 1),
-            2 * (L.L2_SW_BASE + 0xFFFF) + 1,
+            2 * (L.L2_SW_BASE + last_sw_offset) + 1,
         )
         # Just past the L2 window, and below the L1 alias window (SPACE_BASE),
         # a loader byte address is neither alias: it is its own offset.

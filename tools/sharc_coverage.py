@@ -162,23 +162,30 @@ def _raw_le_bytes(raw, width):
 def compare_decode_at(img, example_cap=25):
     """For every aligned instruction in IMG, compare tools/sharcdb.py's own
     decode (the `insn` table row: width, form, fields -- built by
-    tools/sharcimm.py's successor-confidence walk over one loader block's own
-    payload bytes) against tools/sharc_core.sequencer.decode_at() at the same
-    short-word PC, run against this image's own LoadedMemory (the merged,
-    last-write-wins final boot image; no database access at decode time).
+    tools/sharcimm.py's successor-confidence walk over one code block's
+    range, read through LoadedMemory since DB_VERSION v13) against
+    tools/sharc_core.sequencer.decode_at() at the same short-word PC, run
+    against this image's own LoadedMemory (the merged, last-write-wins
+    final boot image; no database access at decode time).
     -> {image, total, stale_bytes, mismatches, by_kind, by_key, examples}:
 
     - stale_bytes: rows skipped because LoadedMemory's bytes at that PC
       already differ from the database's own recorded `raw` bytes for that
       row -- not a decode disagreement, since the two paths are not even
-      decoding the same bytes. Seen on dt2-1.16 block 1 (sw 0x120203-
-      0x12161b): a 'code' loader block whose whole byte range a later block
-      in the same boot stream overwrites (mostly with a large FILL of
-      zeros) before the image LoadedMemory models is reached, so the
-      database's per-block scan decoded bytes that never persist into the
-      image the emulator (and decode_at) actually runs from. Not fixable by
-      a decoder change; reported separately so it does not mask genuine
-      decode disagreements.
+      decoding the same bytes. Before DB_VERSION v13 this was seen on every
+      image (dt2-1.16/1.15C's loader block 1, sw 0x120203-0x12161b: a 'code'
+      loader block whose whole byte range a later block in the same boot
+      stream overwrites, mostly with a large FILL of zeros, before the
+      image LoadedMemory models is reached, so the database's per-block
+      scan decoded bytes that never persist into the image the emulator
+      -- and decode_at -- actually runs from; DN2 1.11/1.10E additionally
+      had this on block 57, from a too-small L2_BYTE_LIMIT, not a real
+      overwrite). v13 fixed both: block 1 is no longer a scanned code block
+      on any image (docs/findings/05-sharc-isa-and-decoding.md, "One decode
+      path") and every code block's `insn` rows are built from LoadedMemory
+      directly, so this should now report 0 stale_bytes on all four images
+      -- kept here as a permanent check, not a one-off measurement, since a
+      future code-block addition could reintroduce the same class of bug.
     - by_kind (bytes-agreeing rows only): counts of "width" (decode_at chose
       a different instruction length), "form" (same width, different form)
       and "fields" (same width and form, different decoded field values)

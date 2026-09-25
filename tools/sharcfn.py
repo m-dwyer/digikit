@@ -1262,7 +1262,7 @@ def load_context(blob_path: str, block_idxs, min_depth: int):
     blocks_by_idx = {b["index"]: b for b in blocks}
     analyzed = {}
     for idx in block_idxs:
-        r = sharcinv.analyze_block(data, blocks_by_idx, idx, min_depth)
+        r = sharcinv.analyze_block(mem, blocks_by_idx, idx, min_depth)
         if r is None:
             continue
         r["_insn_sw"] = [r["base_sw"] + off // 2 for off, _ in r["insns"]]
@@ -1288,9 +1288,10 @@ def base_sw_note(target_address: int) -> str:
         )
     if sharcldr.L2_BYTE_BASE <= target_address < sharcldr.L2_BYTE_LIMIT:
         return (
-            "target %#x is in the L2 byte window 0x20000000-0x20020000: "
+            "target %#x is in the L2 byte window %#x-%#x: "
             "base_sw = 0xb80000 + (target_address - 0x20000000) / 2 "
-            "(blk69 does NOT use the 0x28000000 alias)" % target_address
+            "(blk69 does NOT use the 0x28000000 alias)"
+            % (target_address, sharcldr.L2_BYTE_BASE, sharcldr.L2_BYTE_LIMIT)
         )
     return "target %#x: no known base_sw convention covers this block" % target_address
 

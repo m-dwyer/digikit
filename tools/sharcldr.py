@@ -100,7 +100,17 @@ SW_ALIAS_BASE = 0x28000000
 # short-word execution window.  Prefer the ordinary SW alias and use this
 # mapping only when that address is absent from the loaded image.
 L2_BYTE_BASE = 0x20000000
-L2_BYTE_LIMIT = 0x20020000
+# ADSP-2156x hardware reference (out/refs/adsp-2156x-hwr), "L2CTL0 contains
+# 1M byte of RAM grouped into eight banks, 128K bytes each and 96K bytes of
+# boot ROM": the addressable L2 SRAM window is 1 MB, not one 128 KB bank.
+# The old bound (0x20020000, one bank) wrongly refused a real, unoverwritten
+# read of DN2 1.11/1.10E's loader block 57 (target 0x2001e888, byte_count
+# 67652) past its first 128 KB -- read_sw()'s fallback returned None for the
+# other ~91% of the block even though LoadedMemory (byte-address read) shows
+# every one of those bytes is exactly what the block itself last wrote, no
+# later block touches them. See docs/findings/05-sharc-isa-and-decoding.md,
+# "One decode path" / DB_VERSION v13.
+L2_BYTE_LIMIT = 0x20100000
 L2_SW_BASE = 0x00B80000
 
 # block_code bits 24-31, per Table 40-27: which core the block is for.
@@ -314,6 +324,37 @@ class LoadedMemory:
                 result += self.data[start : start + stop - address]
             address = stop
         return bytes(result)
+
+    def owner_runs(self, address, size):
+        """[(start, end, owner_index_or_None), ...]: half-open, sorted,
+        contiguous runs covering exactly [address, address+size), each
+        naming the stream-order index of the block that finally owns that
+        span (last write wins, same resolution as read()) or None for a
+        gap no block ever wrote. Lets a caller ask "how much of block N's
+        own declared range does block N still own in the final image" --
+        see docs/findings/05-sharc-isa-and-decoding.md's loader block 1
+        finding (DB_VERSION v13): a code block whose byte range is later,
+        entirely overwritten by other blocks in the same boot stream is
+        never resident in the image the emulator actually boots from."""
+        self._check_address_size(address, size)
+        starts, ends, owners = self._segments
+        runs = []
+        addr = address
+        end = address + size
+        while addr < end:
+            found = self._segment(addr)
+            if found is None:
+                i = bisect.bisect_right(starts, addr)
+                nxt = starts[i] if i < len(starts) else end
+                stop = min(nxt, end)
+                runs.append((addr, stop, None))
+                addr = stop
+                continue
+            segment_end, index = found
+            stop = min(end, segment_end)
+            runs.append((addr, stop, self.blocks[index].get("index", index)))
+            addr = stop
+        return runs
 
     def read_sw(self, pc_sw, size=6):
         """Read from a VISA short-word PC using loader byte addressing."""

@@ -27,7 +27,7 @@ not-taken path as a `fallthrough` edge), returns and indirect sites
 uniformly, so "callers of X" is a `to_sw = X` query across every kind at
 once, not a CALL-only search.
 
-Code-block selection. tools/sharcinv.py's CODE_BLOCKS (1, 56, 69, 76, 78, 80,
+Code-block selection. tools/sharcinv.py's CODE_BLOCKS (56, 69, 76, 78, 80,
 88, 91, 93) is a hand-verified list for one specific image (DT2 1.16) --
 docs/findings/06-sharc-engine-and-startup.md, "The SHARC code is not one
 block". It is NOT a general "decodes densely" rule: several DATA blocks in
@@ -38,17 +38,26 @@ explicit KNOWN_CODE_BLOCKS table keyed by image sha256 rather than guessing:
 DT2 1.15C's block layout was checked by inspection to be identical to 1.16's
 (same block indices, same target addresses -- reuses sharcinv.CODE_BLOCKS
 directly), and DN2 1.11/1.10E's code blocks were identified by target-address
-correspondence to DT2's known regions (the shared 0x282403f0 loader, the
-three small 0x2838xxxx blocks, startup at 0x28380548 and the main code
-region), the same method docs/findings/11-sharc-cross-image-comparison.md
-describes ("Selection uses the same loader-target code regions as the
-existing DT2 inventory. The block indices differ where the loader stream's
-preceding records differ."). DN2 1.11 also has an extra L2-window code
-region past L2_BYTE_LIMIT (blk59, target 0x200779f8): sharcldr.LoadedMemory's
-read_sw() fallback only covers L2_BYTE_BASE..L2_BYTE_LIMIT
-(0x20000000..0x20020000), so that block's base_sw cannot be resolved with
-the reused tooling and it is left out of KNOWN_CODE_BLOCKS -- reported as a
-known gap, not silently treated as data. An image whose sha256 is not in
+correspondence to DT2's known regions (the three small 0x2838xxxx blocks,
+startup at 0x28380548 and the main code region), the same method
+docs/findings/11-sharc-cross-image-comparison.md describes ("Selection uses
+the same loader-target code regions as the existing DT2 inventory. The
+block indices differ where the loader stream's preceding records differ.").
+Every image's list originally also carried the loader-target-0x282403f0
+block (index 1 on all four images): docs/findings/05-sharc-isa-and-decoding.md's
+"One decode path" section (DB_VERSION v13) found it is not code in any of
+the four final images (a later block in the same boot stream overwrites
+99.92% of its declared byte range before boot ends), so it is no longer in
+this table or in sharcinv.CODE_BLOCKS. DN2 1.11/1.10E's block 57 (target
+0x2001e888) is a genuine, unoverwritten L2-window code block: it used to be
+mis-reported as stale by --compare-decode-at because sharcldr.L2_BYTE_LIMIT
+modeled only the first of L2 SRAM's eight 128 KB banks (v13 widened it to
+the full 1 MB). DN2 1.11 also has an extra L2-window region (blk59, target
+0x200779f8): it fell outside the OLD L2_BYTE_LIMIT and was left out of
+KNOWN_CODE_BLOCKS for that reason; the wider v13 bound now covers its start
+address too, but it has not been verified as code (unlike block 57, no
+prior characterization exists for it), so it remains a known, unverified
+gap here, not silently treated as data. An image whose sha256 is not in
 KNOWN_CODE_BLOCKS refuses to build without an explicit --blocks override,
 rather than guessing.
 """
@@ -81,11 +90,73 @@ import sharcinv  # noqa: E402
 import sharcldr  # noqa: E402
 from sharc_trace import ACCESS_WIDTHS  # noqa: E402
 
-DB_VERSION = 12
+DB_VERSION = 13
 
 # Bump DB_VERSION whenever the schema or the semantics of an existing column
 # change, so build_database()'s skip-rebuild check (sha256 + DB_VERSION) does
 # the right thing on the next run.
+#
+# --- v13: decode from LoadedMemory, not a code block's own stream bytes ----
+#
+# docs/findings/05-sharc-isa-and-decoding.md's "One decode path" section had
+# already found (with tools/sharc_coverage.py's --compare-decode-at) that a
+# `code` loader block's own stream payload is not always what the image the
+# emulator actually boots from holds at that address: a LATER block in the
+# same boot stream can overwrite some or all of an earlier block's declared
+# range before the whole stream finishes loading (LoadedMemory's documented
+# last-write-wins resolution). Both places that built the `insn`/`functions`
+# table's underlying decode -- this file's own per-code-block loop below and
+# tools/sharcinv.py's analyze_block()/build_inventory() (which this file's
+# _fill_database() also calls, via tools/sharcfn.py's load_context(), for
+# function boundaries and call/jump/return sites) -- read a code block's OWN
+# stream bytes (data[payload_offset:payload_offset+payload_len]). Both now
+# instead read the block's declared [target_address, target_address+
+# byte_count) range through a tools/sharcldr.py LoadedMemory built over the
+# whole stream, matching tools/sharc_core.sequencer.decode_at()'s own input
+# (no database access, LoadedMemory only) -- one decode INPUT as well as one
+# decode function, for the same reason the "One decode path" section unified
+# the decode FUNCTION.
+#
+# Two concrete, cross-checked consequences (see the finding for the byte-
+# level evidence and the second-agent check):
+#
+#  1. Loader block 1 (all four images, target 0x282403f0, byte_count 10312)
+#     is dead in the final image: 10304 of its own 10312 declared bytes
+#     (99.92%, identical fraction and identical two 4-byte survivor gaps on
+#     all four images) are overwritten by later blocks in the same stream --
+#     mostly one large zero FILL, the rest small `data` blocks -- before
+#     LoadedMemory's resolution is reached. No root or IVT slot enters it;
+#     the many `dataref_code_pointer` roots and ~82 "functions" the old
+#     per-block scan found inside it were themselves artifacts of decoding
+#     these dead bytes as if they were live code (self-referential immediate
+#     values that happen to land back in the block's own dead address
+#     range). tools/sharcinv.py's CODE_BLOCKS (and this file's
+#     KNOWN_CODE_BLOCKS entries for all four images) no longer include it;
+#     its blocks-table row now reports `kind='data'` (or 'fill'), matching
+#     what the final image actually uses that address range for -- not a
+#     "code" block LoadedMemory happens to give a different read for, but
+#     not a program-code block at all. This removes the six `26a`-vs-`21a`
+#     stale-bytes "SYNC" coverage gaps sharc_coverage.py --all-roots
+#     reported at sw 0x1208e4/0x1208ff/0x12096d/0x12099c/0x1209b5/0x1209c4.
+#
+#  2. DN2 1.11/1.10E's loader block 57 (target 0x2001e888, byte_count 67652)
+#     is NOT overwritten at all -- byte-for-byte identical to LoadedMemory
+#     across its whole declared range -- but tools/sharcldr.py's L2_BYTE_LIMIT
+#     (previously 0x20020000, one 128 KB L2 SRAM bank) was too small: the
+#     ADSP-2156x hardware reference documents 1 MB of L2 SRAM across eight
+#     128 KB banks, and block 57 itself extends to 0x2002f1c4, 61,900 bytes
+#     (91.5%) past the old bound. read_sw()'s L2 fallback bounds-checked
+#     against that too-small limit and returned None there, which is what
+#     tools/sharc_coverage.py's --compare-decode-at reported as "stale
+#     bytes" even though nothing in the boot stream ever touches those
+#     bytes again -- a mapping bug, not a real overwrite. L2_BYTE_LIMIT is
+#     now 0x20100000 (the full 1 MB window); block 57 stays in
+#     KNOWN_CODE_BLOCKS, now correctly resolved end to end.
+#
+# `blocks` gained an `overwritten_bytes` column (tools/sharcldr.py's new
+# LoadedMemory.owner_runs()): for every non-FILL block, the count of its own
+# declared bytes NOT owned by itself in the final image (0 = fully intact).
+# General diagnostic, not just for the two cases above.
 #
 # --- v12: Type3d/4d/14d confident decode; Type15a mem_access/dataref fix ----
 #
@@ -293,15 +364,17 @@ KNOWN_CODE_BLOCKS = {
     "0f514a12a2255f5c081e292c47f1f29462003177658da4bbae0a22fd737fffa2": sharcinv.CODE_BLOCKS,
     # dt2-1.15C (identical block layout to 1.16 -- verified by inspection)
     "6d4316cddd41edef7a136c10d270313882028a59b96cc8fe97a716b949a7d551": sharcinv.CODE_BLOCKS,
-    # dn2-1.11: blk1 loader(0x282403f0), blk56 L2 main(0x20000000),
-    # blk57 L2 extension(0x2001e888, within L2_BYTE_LIMIT), blk66/68/70 the
-    # three small 0x2838004c/0x283801a4/0x28380328 blocks, blk78 startup
-    # (0x28380548), blk81 the small 0x2838261c block, blk83 the main code
-    # region (0x28382720). blk59 (0x200779f8, past L2_BYTE_LIMIT) is left out
-    # -- see the module docstring.
-    "336e340aa0cdcd34e314cfa44849f709a3134f6bd4cd57dfc7e15702c83115e2": (1, 56, 57, 66, 68, 70, 78, 81, 83),
+    # dn2-1.11: blk56 L2 main(0x20000000), blk57 L2 extension(0x2001e888,
+    # within L2_BYTE_LIMIT), blk66/68/70 the three small
+    # 0x2838004c/0x283801a4/0x28380328 blocks, blk78 startup (0x28380548),
+    # blk81 the small 0x2838261c block, blk83 the main code region
+    # (0x28382720). blk1 (target 0x282403f0, same as DT2's dead block 1) is
+    # left out -- see the module docstring. blk59 (0x200779f8) is also left
+    # out: the v13 L2_BYTE_LIMIT widening now covers its start address, but
+    # it has no prior characterization as code (unlike blk57).
+    "336e340aa0cdcd34e314cfa44849f709a3134f6bd4cd57dfc7e15702c83115e2": (56, 57, 66, 68, 70, 78, 81, 83),
     # dn2-1.10E: same target-address correspondence, shifted indices.
-    "174b391822bbe33a99e5f42bd02ef3ea75c0e79351caae6ba90e4cd2c4de5350": (1, 56, 57, 67, 69, 71, 79, 82, 84),
+    "174b391822bbe33a99e5f42bd02ef3ea75c0e79351caae6ba90e4cd2c4de5350": (56, 57, 67, 69, 71, 79, 82, 84),
 }
 
 SCHEMA = """
@@ -311,6 +384,11 @@ CREATE TABLE blocks (
     image TEXT, idx INTEGER, target_address INTEGER, byte_count INTEGER,
     kind TEXT,              -- 'code' | 'data' | 'fill'
     base_sw INTEGER,        -- NULL when no known addressing convention covers it
+    -- DB_VERSION v13: bytes of this block's own declared range NOT owned by
+    -- itself in the final image (LoadedMemory.owner_runs(), last write
+    -- wins) -- 0 means every byte this block wrote is still there; NULL for
+    -- FILL blocks (a FILL block contributes no bytes of its own to compare).
+    overwritten_bytes INTEGER,
     PRIMARY KEY (image, idx));
 
 -- Every offset tools/sharcimm.py's linear sweep decodes in a scanned code
@@ -1296,8 +1374,18 @@ def read_meta(path):
         return {}
 
 
+def _overwritten_bytes(mem, b):
+    """Count of block `b`'s own declared byte range NOT owned by itself in
+    the final image (mem.owner_runs(), last write wins), or None for a FILL
+    block (see the `blocks` table's schema comment, DB_VERSION v13)."""
+    if b["fill"] or not b["byte_count"]:
+        return None
+    runs = mem.owner_runs(b["target_address"], b["byte_count"])
+    own = sum(end - start for start, end, owner in runs if owner == b["index"])
+    return b["byte_count"] - own
+
+
 def _fill_database(db, name, sha, blob_path, code_blocks, min_depth, ctx):
-    data = ctx["data"]
     mem = ctx["mem"]
     functions = ctx["functions"]
     analyzed = ctx["analyzed"]
@@ -1326,8 +1414,11 @@ def _fill_database(db, name, sha, blob_path, code_blocks, min_depth, ctx):
         else:
             kind = "data"
         base_sw = analyzed[idx]["base_sw"] if idx in analyzed else sharcinv.sw_base_for_target(b["target_address"])
-        block_rows.append((name, idx, b["target_address"], b["byte_count"], kind, base_sw))
-    db.executemany("INSERT INTO blocks VALUES (?,?,?,?,?,?)", block_rows)
+        block_rows.append((
+            name, idx, b["target_address"], b["byte_count"], kind, base_sw,
+            _overwritten_bytes(mem, b),
+        ))
+    db.executemany("INSERT INTO blocks VALUES (?,?,?,?,?,?,?)", block_rows)
 
     entry_to_fn = {}
     func_rows = []
@@ -1393,7 +1484,12 @@ def _fill_database(db, name, sha, blob_path, code_blocks, min_depth, ctx):
             continue
         b = blocks_by_idx[idx]
         base_sw = block["base_sw"]
-        payload = data[b["payload_offset"]: b["payload_offset"] + b["payload_len"]]
+        # DB_VERSION v13: the block's declared range through LoadedMemory's
+        # final, last-write-wins bytes, not its own stream payload -- see
+        # the DB_VERSION comment above ("One decode path" / loader block 1).
+        payload = mem.read(b["target_address"], b["byte_count"])
+        if payload is None:
+            continue
 
         table = sharcimm.decode_all(payload)
         depth = sharcimm.depths(table, len(payload))
