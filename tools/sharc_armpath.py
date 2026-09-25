@@ -302,6 +302,7 @@ def trace_arm_path(
     capture_path: str,
     *,
     n_frames: int | None = None,
+    start_frame: int = 0,
     max_hits_per_frame: int = 8000,
 ) -> dict:
     """Replay CAPTURE_PATH's real DSPI2 frames through the real hardware
@@ -314,13 +315,32 @@ def trace_arm_path(
     (`_sample()`), grouped into per-voice-iteration records
     (`analyze_iterations()`).
 
+    `start_frame` (Lane J1, 2026-09-26) skips the first `start_frame`
+    captured frames without replaying them through the SHARC at all --
+    just `write_dma_transfer`/`drive_dma_completion` are not even called
+    for them. This only saves time when the frames being skipped are known
+    not to matter for the question at hand (e.g. bracketing a panel event
+    deep into a long idle capture, as `tools/sharc_capture_run.py --kind
+    note`'s default `trig_at` does): every companding-record/arm-guard
+    finding this project has made (docs/findings/06, Lane E2/H1-H3) shows
+    those cells depend only on `command_word_shift_src` (toggled by a
+    transfer-complete DMA callback, unrelated to any frame's own content)
+    and on a per-track bitfield-unpack function (`FUN_1c24e9`) that reads
+    each frame fresh with no cross-frame accumulation of the fields this
+    lane's own diff touched -- so replaying from an arbitrary frame index
+    is equivalent to replaying from 0 for this specific question, at a
+    fraction of the cost. `per_frame[i]["index"]` is still the frame's real
+    index in CAPTURE_PATH (`start_frame + i`), not a re-based 0.
+
     Returns a dict with `per_frame`, each entry's own `iterations` list
     naming, per voice, whether `GUARD_A`/`GUARD_B` fired and what pc the
     dispatch reached instead, plus whether `FUN_1c4eaf` (the arm function)
     or `FUN_1c2ac9` (the OTHER caller, fixed non-voice targets -- see the
     module docstring) ran at all this frame."""
     cap = sharc_capture.load(capture_path)
-    frames = cap.dspi2_frames if n_frames is None else cap.dspi2_frames[:n_frames]
+    frames = cap.dspi2_frames[start_frame:]
+    if n_frames is not None:
+        frames = frames[:n_frames]
 
     memory = h.load_image_memory(image)
     init = h.run_init(memory, image)
@@ -339,7 +359,8 @@ def trace_arm_path(
     h.setup_frame_dma(state, image)
 
     per_frame = []
-    for idx, frame in enumerate(frames):
+    for offset, frame in enumerate(frames):
+        idx = start_frame + offset
         cmd = replay.frame_command(frame.tx)
         h.write_dma_transfer(state, image, frame.tx)
         runner = h.drive_dma_completion(runner, image)
@@ -389,6 +410,7 @@ def trace_arm_path(
         "capture": capture_path,
         "kind": cap.kind,
         "frames_in_capture": len(cap.dspi2_frames),
+        "start_frame": start_frame,
         "frames_replayed": len(frames),
         "voice_records": "%#x" % p.voice_records,
         "voice_record_stride": "%#x" % VOICE_RECORD_STRIDE,
@@ -404,13 +426,16 @@ def parse_args(argv=None):
     parser.add_argument("image")
     parser.add_argument("capture")
     parser.add_argument("--frames", type=int, default=None)
+    parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--report", help="write the full trace as JSON")
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    result = trace_arm_path(args.image, args.capture, n_frames=args.frames)
+    result = trace_arm_path(
+        args.image, args.capture, n_frames=args.frames, start_frame=args.start_frame
+    )
     if args.report:
         with open(args.report, "w") as fh:
             json.dump(result, fh, indent=1)

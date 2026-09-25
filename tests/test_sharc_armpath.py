@@ -166,6 +166,29 @@ class TraceArmPathTest(unittest.TestCase):
             self.assertFalse(it["guard_b_taken"])
             self.assertFalse(it["reached_arm_fn"])
 
+    def test_start_frame_skips_without_shifting_reported_index(self):
+        """Lane J1: `start_frame` lets a caller bracket a real event deep
+        into a long capture (e.g. a panel press near the end of a
+        multi-hundred-frame idle-baseline run) without paying to replay
+        every preceding frame -- `per_frame[i]["index"]` must still be the
+        real capture index (`start_frame + i`), and starting at frame 1
+        directly must agree with frame 1's own result from a `start_frame=0`
+        run over the same two frames (this project's null-companding-record
+        finding does not depend on prior frames -- see the function's own
+        docstring)."""
+        baseline = armpath.trace_arm_path("dt2-1.16", str(FULLTX_CAPTURE), n_frames=2)
+        skipped = armpath.trace_arm_path(
+            "dt2-1.16", str(FULLTX_CAPTURE), n_frames=1, start_frame=1
+        )
+        self.assertEqual(skipped["frames_replayed"], 1)
+        self.assertEqual(skipped["start_frame"], 1)
+        only = skipped["per_frame"][0]
+        self.assertEqual(only["index"], 1)
+        reference = baseline["per_frame"][1]
+        self.assertEqual(only["command"], reference["command"])
+        self.assertEqual(only["n_iterations"], reference["n_iterations"])
+        self.assertEqual(only["companding_fields"], reference["companding_fields"])
+
     def test_forcing_the_second_guard_byte_arms_and_renders_a_voice(self):
         """A direct, diagnostic poke of one voice-iteration's own GUARD_B
         byte (not a DMA-transfer write: this lane confirmed by execution

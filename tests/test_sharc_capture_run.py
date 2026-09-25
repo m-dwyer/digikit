@@ -147,5 +147,27 @@ class ReadyToForceTest(unittest.TestCase):
         self.assertTrue(scr.ready_to_force(m, 5))
 
 
+class TrigChannelBitTest(unittest.TestCase):
+    """Lane J1: trig_channel_bit() generalizes TRIG_1_CHANNEL/TRIG_1_BIT to
+    any 0-indexed track, via emu/panelin.py's code_for() inverse."""
+
+    def test_track_0_matches_trig_1_constants(self):
+        self.assertEqual(scr.trig_channel_bit(0), (scr.TRIG_1_CHANNEL, scr.TRIG_1_BIT))
+
+    def test_track_2(self):
+        # TRIG 3 (track 2): code 27 -> channel 3, bit 2.
+        self.assertEqual(scr.trig_channel_bit(2), (3, 2))
+
+    def test_track_15_last_valid(self):
+        # TRIG 16 (track 15): code 40 -> channel 4, bit 7.
+        self.assertEqual(scr.trig_channel_bit(15), (4, 7))
+
+    def test_track_out_of_range_rejected(self):
+        with self.assertRaises(ValueError):
+            scr.trig_channel_bit(16)
+        with self.assertRaises(ValueError):
+            scr.trig_channel_bit(-1)
+
+
 if __name__ == "__main__":
     unittest.main()

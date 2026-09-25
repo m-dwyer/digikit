@@ -255,6 +255,27 @@ FLEXBUS_WATCH = (0x8C000000, 0x8C000010)
 TRIG_1_CHANNEL = 3
 TRIG_1_BIT = 0
 
+# Lane J1 (2026-09-26): generalizes TRIG_1_CHANNEL/TRIG_1_BIT to any track.
+# `emu/panelin.py`'s own `code_for(channel, bit) = channel*8+bit+1` for
+# channels 0-5, and the button-name table this module's own PLAY_CHANNEL/
+# PLAY_BIT comment already reads (codes 25-40 = "TRIG 1".."TRIG 16") gives
+# TRIG (track+1)'s code as 25+track -- so channel/bit is the inverse of
+# `code_for` at that code. track=0 must reproduce TRIG_1_CHANNEL/TRIG_1_BIT
+# exactly (checked by this function's own test).
+TRIG_CODE_BASE = 25  # code_for(TRIG_1_CHANNEL, TRIG_1_BIT) == 25
+
+
+def trig_channel_bit(track: int) -> tuple[int, int]:
+    """-> (channel, bit) for pressing "TRIG track+1" (0-indexed `track`,
+    0..15) -- see `TRIG_CODE_BASE`'s own comment. `track=0` is exactly
+    `(TRIG_1_CHANNEL, TRIG_1_BIT)`."""
+    if not 0 <= track <= 15:
+        raise ValueError("track must be 0..15, got %r" % (track,))
+    code = TRIG_CODE_BASE + track
+    channel, bit = divmod(code - 1, 8)
+    return channel, bit
+
+
 # PLAY's (channel, bit), read back from the running 1.16 image's own button
 # name table (`emu/panelin.py`'s `control_names(m, profile, 'button')`:
 # code 20 = "PLAY", code 19 = "RECORD", code 21 = "STOP", codes 25-40 =
@@ -482,6 +503,7 @@ def run(
     syx: str | None = None,
     ssi0_hz: int = 1000,
     trig_at: int | None = None,
+    trig_track: int = 0,
     force_period: int = 50_000,
     chunk: int = 200_000,
     unblock: bool = False,
@@ -572,6 +594,7 @@ def run(
             "ssi0_hz": ssi0_hz if ssi0 is not None else None,
             "poke_track_types": ["%d:%d" % (t, y) for t, y in poke_track_types],
             "pre_instrs": pre_instrs,
+            "trig_track": trig_track if kind == "note" else None,
         },
     )
     peer = CapturingPeer(writer, counter=lambda: pits.now)
@@ -633,7 +656,7 @@ def run(
     def on_chunk(pc_, done):
         if kind in ("note", "play") and not triggered["done"] and done >= trig_at:
             channel, bit = (
-                (TRIG_1_CHANNEL, TRIG_1_BIT)
+                trig_channel_bit(trig_track)
                 if kind == "note"
                 else (PLAY_CHANNEL, PLAY_BIT)
             )
@@ -704,6 +727,16 @@ def parse_args(argv=None):
     p.add_argument("--syx")
     p.add_argument("--ssi0-hz", type=int, default=1000)
     p.add_argument("--trig-at", type=lambda s: int(s, 0), default=None)
+    p.add_argument(
+        "--trig-track",
+        dest="trig_track",
+        type=lambda s: int(s, 0),
+        default=0,
+        metavar="N",
+        help="0-indexed track TRIG (N+1) presses under --kind note "
+        "(see trig_channel_bit()'s own docstring); default 0 (TRIG 1), "
+        "the prior hardcoded behaviour",
+    )
     p.add_argument("--force-period", type=lambda s: int(s, 0), default=50_000)
     p.add_argument("--chunk", type=lambda s: int(s, 0), default=200_000)
     p.add_argument("--unblock", action="store_true")
@@ -760,6 +793,7 @@ def main(argv=None) -> int:
         syx=args.syx,
         ssi0_hz=args.ssi0_hz,
         trig_at=args.trig_at,
+        trig_track=args.trig_track,
         force_period=args.force_period,
         chunk=args.chunk,
         unblock=args.unblock,

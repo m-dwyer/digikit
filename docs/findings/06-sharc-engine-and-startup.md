@@ -4921,3 +4921,189 @@ tests/test_lint.py tests/test_types.py tests/test_sharc_golden.py -q --slow`:
   part of this same region) is not named.
 - The root fix both this lane and Lane E2 now point at is the same:
   `0x254d78`/the companding record at `0x266220`.
+
+## Lane J1: a real TRIG on a track with a real machine type reaches `FUN_1c60a2` and arms a voice for one silent frame -- the first non-diagnostic arm this project has recorded **[O, needs a second-agent byte-check]**
+
+Branch `work/sharc-emulator` @ `cb77543`, worktree
+`.claude/worktrees/agent-a27e3e3d359f0cd36`. `sections/.source-sha256`
+(`278541e4...dddf3a9ec`) matches `shasum -a 256` of the real 1.16 `.syx`.
+Built on Lane I1's `snapshots/dt2-1.16/running.snap` (a genuinely running
+RTOS, kit loaded, track 2 = machine type 2) and Lane H3's guard decode.
+
+**Setup.** `tools/sharc_capture_run.py` gained `trig_channel_bit(track)`
+and `--trig-track N` (generalizing the previously hardcoded `TRIG_1_CHANNEL`/
+`TRIG_1_BIT`, always track 0). Two 30,000,000-instruction captures from
+`running.snap`, `--unblock`, otherwise identical: `dt2-1.16-running-idle.dt2cap`
+(Lane I1's own, no panel input) and a new `dt2-1.16-running-trig.dt2cap`
+(`--kind note --trig-track 2`, TRIG on track 2 -- the one track
+`running.snap` shows with a nonzero machine type, confirmed again here by a
+direct read of `_DAT_80004704 + 2*0x450 + 0x34 + 0xa2 = 2`). Both captured
+574 frames.
+
+**1. The TRIG changes 8 TX-frame byte offsets, none of them the documented
+per-track tables.** A byte-for-byte diff of the two captures'
+574-frame-aligned TX bytes: offsets `6, 35, 37, 39, 41, 56, 2374, 2375`
+differ and nowhere else. Two of these are lasting (change at frame 303,
+stay changed through frame 573): offset `6` (`0x06 = 0x02 + 2*2`) and `56`
+(`0x38 = 0x34 + 2*2`) -- both are track-2's own slot in two different
+16-track, 2-byte-stride parameter arrays whose base offsets (`0x02`, `0x34`)
+match two of Lane F2's own `FINGERPRINT_FIELDS` bases exactly.
+`tools/sharc_framemap.py --no-fingerprint --natural-markers` on frame 303
+confirms both are read only inside `FUN_1c24e9` ("parameter converter
+(bitfield unpack)", `0x1c24e9`-`0x28b5`) at `0x1c2554`/`0x1c2546`, with no
+fingerprint-matched destination found. Four more offsets (`35, 37, 39, 41` =
+`0x23, 0x25, 0x27, 0x29`, a 4-byte block at consecutive odd addresses, not
+matching any documented per-track table) change for exactly one or two
+frames each (303 and/or 304) and then revert -- a one-shot event, not a
+persistent state field; `FUN_1c24e9` also reads these, at `0x1c2517`/
+`0x1c2563`. The last two (`2374, 2375` = `0x946`) sit past `FRAME_LEN`
+(`0x802`, the 2,048/2,050 bytes `FUN_1c2b24` actually copies into
+`0x2558dc`) -- in the same "past the real payload" tail Lane I1's own PLAY
+diff already put in doubt -- and change only for frames 303-374 (72
+frames, consistent with some ColdFire-side envelope/decay counter, not
+examined further here).
+
+**2. `tools/sharc_armpath.trace_arm_path()` gained `start_frame`** (skip N
+captured frames without replaying them at all, keeping `per_frame[i]
+["index"]` as the real capture index) so a caller can bracket a rare event
+deep into a long capture instead of paying to replay every frame from 0 --
+justified in the function's own docstring by the project's own prior
+findings (the companding-record/arm-guard cells depend only on
+`command_word_shift_src`, not on frame history) and pinned by a new test,
+`test_start_frame_skips_without_shifting_reported_index` (frame 1's result
+starting at `start_frame=1` is identical to frame 1's own result from a
+`start_frame=0` run over the same two frames). This let this lane replay
+just frames 300-311 of each 574-frame capture (~13s/frame) instead of all
+of them.
+
+**3. On the TRIG capture only, `FUN_1c60a2` runs (2 hits at frame 303) and
+`FUN_1c642a`'s `GUARD_B` arms a real voice at frame 304.** A direct pc-hit
+trace for `FUN_1c60a2` (`0x1c60a2`) over frames 300-309: 0 hits on the idle
+capture, 2 hits at frame 303 on the TRIG capture -- **the first time this
+project has ever recorded `FUN_1c60a2` running** (Lane E2: "never reached";
+Lane I1's own replay of a real running-RTOS PLAY capture: "`fun_1c60a2_
+total_hits` is `0` across all 4 replayed frames"). `tools/sharc_armpath.py
+--start-frame 300 --frames 12` on the same window: `any_guard_b_taken=True,
+any_arm_fn_hit=True` on the TRIG capture, both `False` on the idle capture
+over the identical window. The hit is voice-loop iteration 4 at frame 304:
+`field2_sample.R2 = 0x1` (field2 is normally `0x0` on every iteration, every
+frame, per Lane H3), `guard_b_taken=True`, `reached_arm_fn=True`,
+`arm_call_sample.R4 = 0x241a2c` -- exactly `profile.voice_records + 4 *
+VOICE_RECORD_STRIDE`, i.e. **voice 4**, not one of Lane E2's two fixed
+non-voice `FUN_1c2ac9` targets. A follow-up read of voice 4's own record
+(`0x241a2c`) confirms its `FIELD_ACTIVE` byte (`+0x1b8`) is `0` at frame
+303, `1` at frame 304, and back to `0` at frame 305 -- a real, one-frame
+firmware write to a voice record's own ACTIVE field, driven by a real DSPI2
+transfer, not a diagnostic poke. `companding_record_fields()` reads all
+zero throughout (`['0x0','0x0','0x0','0x0']`): **this arm does not go
+through the companding-record chain Lane E2/F2/H3 traced** -- it is a
+different, more direct effect of the tail dispatch in `FUN_1c2b24` reacting
+to real per-track data, not yet fully re-traced to the instruction that
+picks it (item below).
+
+**A wide write-watchpoint over `[0x24f0d8, 0x24f138)` across frames
+300-305 shows the tail loop firing a *different write site* at frame 303
+on the TRIG capture than on idle**: idle writes come from `pc=0x1c33ba`
+(Lane H3's own named "field1 array" writer) at addresses `0x24f0f0`/`f1`;
+the TRIG capture's frame 303 writes the *same* two addresses with the *same*
+value (`0`) but from `pc=0x1c33d8` instead -- a different instruction inside
+the same tail-dispatch block taking a different path. Neither idle nor TRIG
+shows any write of value `1` anywhere in `[0x24f0d8, 0x24f138)` across
+frames 300-305 in this watch, even though `AFTER_LOAD2`'s own live read at
+frame 304 sees `field2[4] = 1`: the write that sets it must happen between
+frame 304's own entry and `FUN_1c642a`'s guard read, at an address or via
+an addressing mode this watch's range/aliasing did not catch (`sw 0x1c71a3`
+resets the same array back to `0` later in every single frame, both idle
+and TRIG, which is consistent with a read-then-clear pattern across the
+frame boundary, but the actual `=1` write site is still not identified).
+**Not resolved**: which instruction, fed by which of the two changed
+per-track fields (offset `6`/`0x02+2*2` or `56`/`0x34+2*2`) or the one-shot
+quad (`35-41`), picks `0x1c33d8` over `0x1c33ba`, and where it (or
+something else) writes the `1` `AFTER_LOAD2` observes.
+
+**4. The armed voice is silent and self-deactivates: this is not yet
+"hearing a note".** Voice 4's own record, read across frames 300-339: its
+`FIELD_SAMPLE_PTR` (word 0) is `0x8045a6c8` (a real SDRAM address --
+confirmed independently to be *modelled*, not unmapped: reading it straight
+after `run_init()`, before any frame call, returns real, distinct nonzero
+32-bit words, presumably the ROM default sample this project's `check_
+correctness()` already cites) immediately before this lane's first fed
+frame, but reads `0x00000000` (null -- `FIELD_SAMPLE_PTR`'s own "null =
+zero-fill gate" convention) from frame 300 onward, **identically on the
+idle capture at the same `start_frame=300`, so this null-out is not itself
+a TRIG effect** -- it happens on the very first synthetic frame call this
+lane's own `start_frame` shortcut feeds, on both captures alike. Because of
+it, voice 4's work buffer (`FIELD_WORK_BUFFER`), the master mix (`0x25f180`)
+and ring A all read all-zero for the whole 300-339 window on both captures:
+the arm at frame 304 sets `ACTIVE` but the voice renders silence and
+`FUN_1c642a`'s own per-slot-type/next-frame logic deactivates it again by
+frame 305 (consistent with this project's own prior finding that a null
+sample pointer gates render to zero-fill). **Open, not resolved by this
+lane**: whether voice 4's sample pointer would still hold its real
+`0x8045a6c8` default at frame 304 in a *continuous* replay from frame 0
+(this lane's `start_frame` shortcut was justified for the guard/`FUN_1c60a2`
+question by their independence from frame history, per `trace_arm_path()`'s
+own updated docstring, but that argument was not separately made for
+`FIELD_SAMPLE_PTR`, and the null-out happening identically on both captures
+at the *first fed frame* rather than at a fixed real frame index is itself
+evidence this specific field's null-out may be an artifact of starting the
+replay cold rather than something that happens at real frame 300 during a
+genuine from-boot run). A continuous from-frame-0 replay of the TRIG
+capture (expensive: ~300+ frames at the same ~13s/frame) would settle this
+directly -- not attempted here.
+
+### Task item 3 (follow the changed offsets into the SHARC) -- folded into item 1 above
+
+The two lasting per-track offsets (`6`, `56`) and the one-shot quad
+(`35-41`) are consumed only by `FUN_1c24e9`; none of the eight changed
+offsets is read anywhere in `FUN_1c2b24`'s own companding/tail-dispatch
+code directly (that code reads `0x254d78`/the fixed companding-record
+table, unaffected by any TX byte -- Lane F2). So the path from "changed
+wire byte" to "different tail-loop branch at `0x1c33d8`" runs through
+`FUN_1c24e9`'s own per-track decode, not a direct read of the transfer by
+the tail loop -- consistent with `FUN_1c24e9` being `render_frame`'s own
+per-track front end (docs/findings/04's "the machine type reaches the
+SHARC" chain) rather than the arm loop reading raw wire bytes itself. The
+exact intermediate variable `FUN_1c24e9` writes that the tail dispatch (or
+something between them) later reads is not identified -- flagged open
+above, not guessed at.
+
+### Owned-file changes (lane J1)
+
+- `tools/sharc_capture_run.py`: `trig_channel_bit(track)` and
+  `--trig-track N` (default 0, backward compatible), threaded through
+  `run()`/`parse_args()`/`main()`.
+- `tools/sharc_armpath.py`: `trace_arm_path()` gained `start_frame` (see
+  item 2 above); `--start-frame` CLI flag; `per_frame[i]["index"]` now
+  `start_frame + i`.
+- `tests/test_sharc_capture_run.py`: `TrigChannelBitTest` (4 tests, pure).
+- `tests/test_sharc_armpath.py`: `test_start_frame_skips_without_shifting_
+  reported_index` (1 test, `@pytest.mark.slow`, firmware-gated).
+- `docs/findings/06-sharc-engine-and-startup.md`: this section.
+- `docs/FINDINGS.md`: index line update.
+
+Not committed (firmware-derived): `out/captures/dt2-1.16-running-trig.dt2cap`.
+
+### Tests
+
+`uv run python -m pytest tests/test_sharc_capture_run.py tests/test_sharc_armpath.py
+tests/test_sharc_replay.py tests/test_lint.py tests/test_types.py
+tests/test_sharc_golden.py -q --slow`. No `sharc_core` change; no golden
+hash touched.
+
+### Open
+
+- The exact instruction that picks `0x1c33d8` over `0x1c33ba` in
+  `FUN_1c2b24`'s own tail dispatch, and where the observed `field2[4] = 1`
+  is actually written (not caught by a `[0x24f0d8, 0x24f138)` watch across
+  the frame this lane checked) -- the single biggest gap in this lane's own
+  causal chain.
+- Whether voice 4's null sample pointer at arm time is a `start_frame`
+  cold-start artifact or a genuine per-frame reset -- see item 4.
+- Whether other (track, frame) combinations arm *and* keep a live sample
+  pointer -- this lane tested exactly one track (2) and one 12-frame
+  window; not swept further.
+- This finding needs a second agent to check the watch/trace evidence
+  against the image bytes independently before it is marked **[V]**, per
+  this project's own rule (CLAUDE.md: "Have a second agent check a finding
+  against the image bytes before marking it [V]").
