@@ -48,7 +48,26 @@ second).
   transfer. The ColdFire emulator's PIT/DTIM timer service delays the kit
   load (lane A3), so the sequencer may not be running in real time.
 
-## Next steps (recommended order)
+## Update (lanes H1-H3, @ e8056cf)
+
+- Root cause of "no notes": no capture ever came from a ColdFire with its
+  RTOS running. `boot400M.snap` is mid-intro; `tools/sharc_capture_run.py`
+  skipped the intro hold/release other tools do, and its forced vector 191
+  re-entered the handler (fixed). The sequencer never ran.
+- Arm path confirmed: FUN_1c642a arms a voice (0x1c6549 -> 0x1c6582 ->
+  FUN_1c4eaf) when a per-voice guard byte (DM(I1-0x54), array
+  0x24f0d8..0x24f0f7) is nonzero. FUN_1c2b24's tail loop (0x1c3289-0x1c33fe,
+  gated by the null pointer 0x254d78) writes those bytes. Poking one guard
+  byte arms a voice through firmware code and it renders.
+- BITEXT BITLEN12 > 32 is moot (the bit FIFO is never filled in dt2-1.16).
+  Frame-path pitch suspect: voice-record words 0x62/0x63 as read by
+  FUN_1c4afe.
+
+Next: get a 1.16 ColdFire to a running RTOS with kit and pattern loaded
+(emu/longrun.py handles the intro and couples to the SHARC process), save a
+snapshot there, and capture PLAY from it. Everything SHARC-side waits on it.
+
+## Next steps (before H1-H3; kept for reference)
 
 1. Decide whether the ColdFire emits notes at all: during PLAY, check that
    its sequencer step counter advances and that note events are created on
