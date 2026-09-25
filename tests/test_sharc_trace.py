@@ -1265,6 +1265,69 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(loaded.trace[0]["address"], 0x2000 + 20)
         self.assertEqual(loaded.uregs[4], T.Const(0x11223344))
 
+    def test_type15b_forced_long_word_register_pair(self):
+        """Type15b's (lw) is the same register-pair access as Type15a's own
+        (lw) (out/refs/sharc-plus-prm p.391: "if the instruction type uses
+        optional forced long word modifier (LW)... register pair access is
+        done"), not a single wider (8-byte) transfer into one register --
+        sharc_core.memory._dm_read intentionally refuses width > 4 ("a
+        register pair, which this tracer does not model"), so before this
+        every (lw) Type15b load/store read/wrote Unknown at every site,
+        including docs/findings/06's voice render polyphase interpolator's
+        own coefficient-table reads (FUN_1c4f81, sw 0x1c50b9 etc., all (lw)
+        Type15b). The displacement is scaled the same as an unqualified
+        access (p.6-10's Table 6-2, cited in Type15a's own docstring), not
+        by 8, independent of l -- I0 + 5*4 = 0x2000 + 20, then the pair's
+        own second word is a fixed +4 (0x2000 + 24)."""
+        i6 = T.UREG_CODES["I0"]
+        state = T.State(
+            1,
+            {i6: T.Const(0x2000)},
+            concrete=loader_memory(
+                loader_block(1, 0x2014, 8, payload=b"\x44\x33\x22\x11\x88\x77\x66\x55")
+            ),
+            assume_nw32=True,
+        )
+        load_fields = {
+            "i[2:0]": 0,
+            "g": 0,
+            "d": 0,
+            "l": 1,
+            "ureg[6:0]": 4,
+            "data[6:0]": 5,  # +5 words, same scaling as the non-lw case above
+        }
+        loaded = self.run_one(state, insn("15b", load_fields, 4))
+        self.assertEqual(loaded.uregs[4], T.Const(0x11223344))
+        self.assertEqual(loaded.uregs[5], T.Const(0x55667788))
+        self.assertEqual(loaded.trace[0]["access_width"], "long-word")
+
+        odd_pair = self.run_one(
+            T.State(1, {i6: T.Const(0x2000)}, concrete=loader_memory()),
+            insn(
+                "15b",
+                {"i[2:0]": 0, "g": 0, "d": 0, "l": 1, "ureg[6:0]": 7, "data[6:0]": 5},
+                4,
+            ),
+        )
+        self.assertEqual(odd_pair.stopped, "unsupported Type15b odd UREG pair")
+
+        store_state = T.State(
+            1,
+            {i6: T.Const(0x2000), 4: T.Const(0x11223344), 5: T.Const(0x55667788)},
+            concrete=loader_memory(),
+            assume_nw32=True,
+        )
+        stored = self.run_one(
+            store_state,
+            insn(
+                "15b",
+                {"i[2:0]": 0, "g": 0, "d": 1, "l": 1, "ureg[6:0]": 4, "data[6:0]": 5},
+                4,
+            ),
+        )
+        self.assertEqual(T._dm_read(stored, 0x2014, 4), T.Const(0x11223344))
+        self.assertEqual(T._dm_read(stored, 0x2018, 4), T.Const(0x55667788))
+
     def test_pm_normal_word_load_into_px_splits_loader_backed_48_bits(self):
         address = T.L1_BLOCK3_NW_BASE + 0x20
         byte_address = L.sw_to_byte(T.L1_BLOCK3_SW_BASE) + 6 * 0x20

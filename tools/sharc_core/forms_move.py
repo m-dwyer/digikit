@@ -874,18 +874,87 @@ def _type_16a(
 def _type_15b(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
 ) -> list[State]:
-    """15b."""
+    """15b.
+
+    SHARC+ Core Programming Reference (out/refs/sharc-plus-prm) pp.389-392,
+    Figure 15-4 p.392: DM(<data7>,Ia) = Ureg / Ureg = DM(<data7>,Ia).
+    p.391 Description: "The optional (LW) in this syntax lets programs
+    specify long word addressing, overriding default addressing from the
+    memory map... if the instruction type uses optional forced long word
+    modifier (LW)... register pair access is done" -- the same
+    register-pair (ureg, ureg+1) at (address, address+4) Type15a's own
+    (lw) already implements (this form's docstring, citing p.389), not a
+    single wider (8-byte) transfer into one register. That was the
+    previous model here; sharc_core.memory._dm_read intentionally refuses
+    any width > 4 ("a register pair, which this tracer does not model"),
+    so every (LW) Type15b site read Unknown rather than a wrong value --
+    found tracing docs/findings/06's voice render polyphase interpolator
+    (FUN_1c4f81's coefficient-table reads at sw 0x1c50b9 etc., all (LW)
+    Type15b), which needs six int16 taps per phase from three (LW) pair
+    reads, not six separate ones.
+    p.6-10's (lw) row "scales the same as an unqualified/(nw) access, not
+    by 8" (Type15a's docstring cites the same table): the <data7>
+    displacement is the normal-word (x4 under assume_nw32) scale
+    unconditionally, independent of l -- only the pair's own second word
+    is a fixed +4, exactly as Type15a's l=1 branch already does.
+    """
     index = _field(f, "i") + (8 if _field(f, "g") else 0)
     offset = _signed(_field(f, "data[6:0]"), 7)
-    # Type 15b's immediate modifier follows the selected memory width.
-    # The opt-in 32-bit normal-word interpretation therefore makes an
-    # unqualified (non-LW) displacement four bytes wide.
-    if state.assume_nw32 and not _field(f, "l"):
+    if state.assume_nw32:
         offset *= 4
     iv = _ureg(state.uregs, 16 + index)
     address = _add(iv, Const(offset), "I%d + %d" % (index, offset))
+    rendered = _render(address)
     code = _field(f, "ureg")
-    width = 8 if _field(f, "l") else 4
+    if _field(f, "l"):
+        if code & 1 or code + 1 >= len(UREG_NAMES):
+            return [_stop(state, insn, "unsupported Type15b odd UREG pair")]
+        pair = (code, code + 1)
+        offsets = tuple(
+            _add(address, Const(4 * off), "%s + %d" % (rendered, 4 * off))
+            for off in range(2)
+        )
+        if _field(f, "d"):
+            values = tuple(_ureg(state.uregs, item) for item in pair)
+            writes = tuple(
+                _dm_write(state, offset_address, 4, value)
+                for offset_address, value in zip(offsets, values, strict=True)
+            )
+            _event(
+                state,
+                insn,
+                "store",
+                ureg_pair=[UREG_NAMES[item] for item in pair],
+                values=[_json_value(value) for value in values],
+                address=address,
+                expression=rendered,
+                access_width="long-word",
+                long_word=True,
+                concrete_write=all(writes),
+            )
+        else:
+            loaded_values = tuple(
+                _dm_read(state, offset_address, 4) for offset_address in offsets
+            )
+            for item, mem_value in zip(pair, loaded_values, strict=True):
+                state.uregs[item] = mem_value or Unknown("memory-address " + rendered)
+            _event(
+                state,
+                insn,
+                "load",
+                ureg_pair=[UREG_NAMES[item] for item in pair],
+                address=address,
+                expression=rendered,
+                access_width="long-word",
+                long_word=True,
+                concrete_values=[
+                    _json_value(value)
+                    if value is not None
+                    else {"unknown": "unavailable memory"}
+                    for value in loaded_values
+                ],
+            )
+        return _advance(state, insn)
     if _field(f, "d"):
         value = state.uregs.get(code, Unknown("uninitialized " + UREG_NAMES[code]))
         _event(
@@ -894,21 +963,21 @@ def _type_15b(
             "store",
             ureg=UREG_NAMES[code],
             address=address,
-            expression=_render(address),
-            long_word=bool(_field(f, "l")),
-            concrete_write=_dm_write(state, address, width, value),
+            expression=rendered,
+            long_word=False,
+            concrete_write=_dm_write(state, address, 4, value),
         )
     else:
-        loaded = _dm_read(state, address, width)
-        state.uregs[code] = loaded or Unknown("memory-address " + _render(address))
+        loaded = _dm_read(state, address, 4)
+        state.uregs[code] = loaded or Unknown("memory-address " + rendered)
         _event(
             state,
             insn,
             "load",
             ureg=UREG_NAMES[code],
             address=address,
-            expression=_render(address),
-            long_word=bool(_field(f, "l")),
+            expression=rendered,
+            long_word=False,
             concrete_value=loaded,
         )
     return _advance(state, insn)

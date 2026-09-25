@@ -89,21 +89,6 @@ class ReferenceRenderTest(unittest.TestCase):
         self.assertEqual(out[1:], [0.0, 0.0, 0.0])
 
 
-class VoiceRecordAddressTest(unittest.TestCase):
-    def test_voice_zero_matches_contract(self):
-        self.assertEqual(h.voice_record_address(0), 0x2412CC)
-
-    def test_stride_matches_contract(self):
-        self.assertEqual(h.voice_record_address(1), 0x2412CC + 0x1D8)
-        self.assertEqual(h.voice_record_address(31), 0x2412CC + 31 * 0x1D8)
-
-    def test_rejects_out_of_range(self):
-        with self.assertRaises(ValueError):
-            h.voice_record_address(32)
-        with self.assertRaises(ValueError):
-            h.voice_record_address(-1)
-
-
 @unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
 class FirmwareBackedTest(unittest.TestCase):
     @classmethod
@@ -121,20 +106,85 @@ class FirmwareBackedTest(unittest.TestCase):
             self.assertEqual(insn.type_name, "2c", hex(pc))
             self.assertEqual(insn.kind, "confident", hex(pc))
 
+    def test_voice_zero_matches_contract(self):
+        self.assertEqual(h.voice_record_address("dt2-1.16", 0), 0x2412CC)
+
+    def test_stride_matches_contract(self):
+        self.assertEqual(h.voice_record_address("dt2-1.16", 1), 0x2412CC + 0x1D8)
+        self.assertEqual(h.voice_record_address("dt2-1.16", 31), 0x2412CC + 31 * 0x1D8)
+
+    def test_rejects_out_of_range(self):
+        with self.assertRaises(ValueError):
+            h.voice_record_address("dt2-1.16", 32)
+        with self.assertRaises(ValueError):
+            h.voice_record_address("dt2-1.16", -1)
+
     def test_setup_voice_writes_documented_fields(self):
         runner = h.new_runner(self.memory, "dt2-1.16")
-        record = h.setup_voice(runner.state, 0, sample_len=256, pitch_step=1.0)
+        record = h.setup_voice(
+            runner.state,
+            "dt2-1.16",
+            0,
+            sample_len=256,
+            pitch_step=1.0,
+            sample_base=0x310000,
+        )
         self.assertEqual(record, 0x2412CC)
 
         def read32(offset):
             value = sr.st._dm_read(runner.state, record + offset, 4)
             return value.value
 
+        # FIELD_SAMPLE_PTR (record+0): this lane's own finding, not
+        # previously in docs/findings/06's contract table -- see
+        # sharc_harness.py's module docstring's "The record+0 open
+        # problem, resolved" section.
+        self.assertEqual(read32(h.FIELD_SAMPLE_PTR), 0x310000)
         self.assertEqual(read32(h.FIELD_STEP), 1 << 31)  # step 1.0 in Q31
         self.assertEqual(read32(h.FIELD_PHASE), 0)
         self.assertEqual(read32(h.FIELD_END), 256 << 31 & 0xFFFFFFFF)
         active = sr.st._dm_read(runner.state, record + h.FIELD_ACTIVE, 1)
         self.assertEqual(active.value, 1)
+
+    def test_call_render_passes_the_record_base_so_i0_latches_the_sample_ptr(self):
+        # The corrected call convention (this module's docstring): R4 must
+        # be the record address itself, not record+4 -- confirmed against
+        # out/sharcdb's decode of FUN_1c642a's own call site (sw
+        # 0x1c6ad3-0x1c6b00): R4 = DM(I6-4) + 4 = frame_workspace + 4 =
+        # voice_records, the record base. The observable consequence: with
+        # R4 = record, FUN_1c4f81's "I0 = DM(I4, M5) u=0" (sw 0x1c504a)
+        # reads record+0 (FIELD_SAMPLE_PTR) exactly -- with the old
+        # record+4 bug this instruction would have read record+4 (the
+        # work buffer) instead, latching garbage.
+        from sharc_core.encoding import UREG_CODES
+
+        sample_ptr = 0x310000
+        runner = h.new_runner(self.memory, "dt2-1.16")
+        record = h.setup_voice(
+            runner.state,
+            "dt2-1.16",
+            0,
+            sample_len=256,
+            pitch_step=1.0,
+            sample_base=sample_ptr,
+        )
+        state = runner.state
+        state.pc_sw = h.profile("dt2-1.16").voice_render
+        state.stopped = None
+        state.pending = None
+        state.call_stack = []
+        state.loops = []
+        state.status_stack = []
+        state.at_loaded_entry = False
+        state.uregs[UREG_CODES["R4"]] = sr.st.Const(record)
+        # sw 0x1c504c is the instruction right after "I0 = DM(I4, M5)" (sw
+        # 0x1c504a) and right before I4 gets rebased to +0x1b8 -- stop
+        # there so I0 is observed exactly once latched, before anything
+        # later in the function could touch it again.
+        runner.breakpoints = frozenset({0x1C504C})
+        runner.run(max_steps=2000)
+        i0 = state.uregs[UREG_CODES["I0"]]
+        self.assertEqual(i0, sr.st.Const(sample_ptr))
 
     def test_render_blocks_runs_the_real_render_path_without_error_halts(self):
         blocks, results = h.render_blocks(self.memory, "dt2-1.16", 0, 2)
@@ -157,32 +207,39 @@ class FirmwareBackedTest(unittest.TestCase):
         # docs/findings/06's voice record contract: FUN_1c4ecf/0x1c4f81 is
         # not a handful-of-instructions stub; the first block's genuine
         # pass through the interpolation loop is at least a few hundred
-        # instructions (this repo's own exploration during development saw
-        # ~1000-4000 depending on the exact path taken). A later block can
-        # legitimately be much shorter (this module's docstring's "Open
-        # problem": block-to-block continuity is not yet established, and
-        # this harness has already seen the render clear its own active
-        # flag on some later call), so only the first block is asserted on.
+        # instructions.
         self.assertGreater(results[0].instructions, 200)
 
-    def test_check_correctness_runs_and_reports_a_number(self):
-        # See sharc_harness.py's module docstring and check_correctness()'s
-        # own docstring: this does not assert a small error, because the
-        # raw sample-data source this render path reads is not yet
-        # correctly wired up (an open problem, not a bug in this test) --
-        # it only asserts the machinery runs end to end and returns
-        # well-formed numbers.
-        report = h.check_correctness(self.memory, "dt2-1.16")
-        self.assertEqual(len(report["rendered_decimated"]), 32)
-        self.assertEqual(len(report["reference"]), 32)
-        self.assertIsInstance(report["max_abs_error"], float)
-        self.assertGreaterEqual(report["max_abs_error"], 0.0)
+    def test_check_correctness_runs_and_reports_numbers_per_case(self):
+        # See sharc_harness.py's module docstring's "MRF" note: this does
+        # not assert a small error. The render's dataflow is now correct
+        # up to the multiply-accumulate chain (this lane's Type15b (lw)
+        # register-pair fix in tools/sharc_core/forms_move.py got the
+        # coefficient-table reads to a concrete value), but
+        # sharc_core.compute_mult's "RN = sat mrf MOD2, SF" op
+        # (mult_saturate_mrf_sf) is unconditionally Unknown -- the
+        # documented, unmodeled-80-bit-MRF limitation that function's own
+        # comment names -- so the final interpolated sample this render
+        # path writes back is never a concrete value, and every case's
+        # error here is not small. This asserts the machinery runs
+        # end to end for every documented case and returns well-formed,
+        # honest numbers, not a false "correct" verdict.
+        report = h.check_correctness(self.memory, "dt2-1.16", n_blocks=8)
+        self.assertEqual(
+            set(report), {"sine_step1", "sine_step0.5", "sine_step2", "ramp_step1"}
+        )
+        for name, case in report.items():
+            self.assertEqual(case["n_blocks"], 8, name)
+            self.assertIsInstance(case["max_abs_error"], float, name)
+            self.assertGreaterEqual(case["max_abs_error"], 0.0, name)
+            self.assertEqual(len(case["phase"]), 8, name)
+            self.assertEqual(len(case["active"]), 8, name)
 
     def test_coeff_table_reads_plausible_taps(self):
-        table = h.read_coeff_table(self.memory, phases=4)
+        table = h.read_coeff_table(self.memory, "dt2-1.16", phases=4)
         self.assertEqual(len(table), 4)
         for taps in table:
-            self.assertEqual(len(taps), h.ADDRESSES["coeff_table_taps"])
+            self.assertEqual(len(taps), h.COEFF_TABLE_TAPS)
             for tap in taps:
                 # (swse) int16 / 2**15: always in [-1, 1).
                 self.assertGreaterEqual(tap, -1.0)

@@ -236,6 +236,7 @@ class EnclosingFunction:
 #   master_mix=0x1c207b voice_render=0x1c4ecf voice_render_tail=0x1c4f81
 #   init=0x1c15e3 voice_alloc_scan=0x1c149b voice_record_init_a=0x1c7442
 #   voice_record_init_b=0x1c4e70 decimator=0xb80000 voice_records=0x2412cc
+#   coeff_table=0x25d940
 #   frame_workspace=0x2412c8 mix_table_base=0x252d78 source_words=0x24ef2c
 #   float_table_a=0x8045a6c8 track_buffers=0x252df8 selector_table=0x2567c0
 #   machine_type_cache=0x255970
@@ -301,6 +302,11 @@ SYMBOLS = [
     ('decimator', FuncMatch(0xb80000), REQUIRED_DT2),
 
     ('voice_records', LiteralAt('voice_alloc_scan', 0x10, form='19a'), REQUIRED_DT2),
+    # The 128-phase, 6-tap polyphase coefficient table (docs/findings/06's
+    # voice record contract, "Render and declick"): voice_render_tail loads
+    # its base once, sw 0x1c50aa ("I5 = 0x25d940"), just before the DO 64
+    # interpolation loop.
+    ('coeff_table', LiteralAt('voice_render_tail', 0x129, form='17a'), REQUIRED_DT2),
     ('frame_workspace', LiteralAt('init', 0x5d, form='17a'), REQUIRED_DT2),
     ('mix_table_base', LiteralAt('init', 0x85, form='17a'), REQUIRED_DT2),
     ('source_words', LiteralAt('init', 0x8d, form='17a'), REQUIRED_DT2),

@@ -13,12 +13,45 @@ Library use:
     h.write_wav("/tmp/voice0.wav", h.flatten(blocks), sample_rate=48000)
 
 Per docs/findings/06-sharc-engine-and-startup.md's "The voice record
-contract" section (two agents checked it against the 1.16 bytes) and the
-"Known" facts this harness was briefed with: one voice occupies a 0x1d8-byte
-record at ADDRESSES["voice_records"] + voice*0x1d8; FUN_1c4ecf (called the
-way FUN_1c642a calls it: R4 = record address + 4) is one voice's render,
-producing 64 interpolated floats at record+4..+0x103 and, through its own
-call to the decimator at 0xb80000, a 2:1-decimated 32-sample block.
+contract" and "Voices" sections (two agents checked the contract table
+against the 1.16 bytes): one voice occupies a 0x1d8-byte record at
+``profile.voice_records + voice*0x1d8``. FUN_1c4ecf (``profile.voice_render``,
+called the way FUN_1c642a's dispatch loop calls it: **R4 = the record
+address itself**, not record+4 -- see "Corrected voice call convention"
+below) is one voice's render, producing 64 interpolated floats at
+record+4..+0x103 and, through its own call to the decimator at 0xb80000, a
+2:1-decimated 32-sample block.
+
+**Corrected voice call convention.** An earlier version of this harness
+passed R4 = record+4, compensating with two empirical pokes (record+0x1bc
+set to 1, record+4's first float set to 1.0) to reach the render body at
+all. Both were papering over the same off-by-4: FUN_1c642a's real call
+site (sw 0x1c6ad3-0x1c6b00) loads ``I4 = DM(I6-4)`` (frame_workspace,
+``profile.frame_workspace``), computes ``R13 = DM(I6-4) + 4`` once before
+the 32-voice loop and passes ``R4 = R13`` unmodified to FUN_1c4ecf/
+FUN_1c5576 -- i.e. R4 = frame_workspace + 4 = ``profile.voice_records``,
+the record base, confirmed directly against ``out/sharcdb``'s decode at
+those sw addresses. Inside FUN_1c4ecf/FUN_1c4f81, I4 is set to R4 once
+(sw 0x1c4f0f) and never rebased before the fields the contract table
+documents at record+4.., record+0x1b8 etc are read through it -- so those
+offsets are relative to the *record base*, matching the contract table
+exactly once R4 is corrected. Both empirical pokes are gone.
+
+**The record+0 open problem, resolved: it is the raw sample-data
+pointer.** FUN_1c4ecf's own entry gate (sw 0x1c4f15: ``R4 = DM(I4, M5)``,
+i.e. word 0 of the record) was previously undocumented ("[O]" in the
+contract table's context) and empirically zero-filled unless non-zero,
+alongside the ACTIVE byte at +0x1b8. Tracing FUN_1c4f81 (out/sharcdb
+decode, sw 0x1c504a): **before I4 is rebased to +0x1b8** (sw 0x1c504c),
+``I0 = DM(I4, M5)`` reads that same word-0 field, and the DO 64
+interpolation loop (sw 0x1c5096-0x1c5101) reloads ``I4 = I0`` every
+iteration (sw 0x1c50a4) before indexing the raw samples it multiplies
+against the polyphase taps. So record+0 is a pointer: null means "no
+sample assigned" (the gate FUN_1c4ecf checks), non-null is the address the
+DO 64 loop actually reads PCM through. ``setup_voice()`` now writes
+``sample_base`` there instead of setting a dead I0 register (I0 was always
+overwritten before the loop used it -- this is why seeding the register
+directly, as the previous version did, had no effect).
 
 Two known-bad decodes (see ``_KNOWN_BAD_DECODE_PCS``'s docstring -- a live,
 standalone ``sharc_trace.decode_at()`` call picks a 32-bit "2b" full-compute
@@ -32,34 +65,22 @@ that changes them is picked up automatically. This is a workaround, not a
 fix: sharc_disasm.py and the decode tables are not this module's files (see
 this repo's CLAUDE.md "Agents" section on lane ownership) -- report new
 instances of the same pattern rather than adding overrides for them here
-blindly.
+blindly. (One consequence: a live, uncorrected ``sharc_trace`` trace of this
+same span reports the record+0 load at sw 0x1c505a, 0x10 sw higher than
+out/sharcdb's 0x1c504a -- a downstream symptom of the same width bug, not a
+second load site.)
 
-**Open problem (not solved by this module): the raw sample-data source.**
-FUN_1c4ecf/FUN_1c4f81's own six-tap interpolation loop (the ``DO 64`` at
-sw 0x1c5096-0x1c5101) reads through I4, freshly reloaded from I0 on every
-iteration (sw 0x1c50a4's ``I4 = I0``); I0 is callee-saved (saved at
-sw 0x1c4ee3, restored at sw 0x1c4f60), so its value on entry to FUN_1c4ecf
-should be the caller-supplied raw sample pointer. But by the time the DO 64
-loop runs, I0 has already been overwritten *inside FUN_1c4f81 itself* (the
-only other write found in this span, sw 0x1c505a: ``I0 = DM(I4, M5)``) --
-seeding I0 at entry (tried: a synthetic 320-sample sine buffer) has no
-effect on what the loop actually reads. What the loop does read, both with
-a zero and a synthetic sample buffer, is five fixed addresses around
-0x17800008-0x17800018 -- fixed across all 64 iterations of one call, which
-does not look like a sliding FIR window over raw PCM at all, and is
-extremely likely a downstream artefact of some *other* unseeded register in
-the dependency chain (FUN_1c642a normally sets ~15 DAG registers, several
-of them from per-track state this harness does not reconstruct, before
-calling FUN_1c4ecf) rather than a real address. This harness therefore
-renders successfully (FUN_1c4ecf returns cleanly) but its output is **not**
-validated as numerically correct -- see ``check_correctness()``'s docstring
-and this module's own test for how that is measured and reported honestly
-rather than papered over.
+Symbols (function/data addresses) come from ``tools/sharc_symbols.py``'s
+``resolve()`` against ``out/sharcdb``, not a hardcoded dict -- see
+``profile()`` below. Only record layout (byte offsets within one voice
+record, and the coefficient table's phase stride) are constants here, since
+those are not independently-addressed symbols.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -74,45 +95,47 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import sharc as sharcmod  # noqa: E402
 import sharc_run as sr  # noqa: E402
+import sharc_symbols  # noqa: E402
 import sharc_trace as st  # noqa: E402
 from sharc_disasm import Instruction  # noqa: E402
 from sharcldr import LoadedMemory  # noqa: E402
 
-# Every firmware address this harness relies on, in one place (per this
-# lane's brief) so a future per-image resolver (lane B's sharc_symbols.py)
-# only has to replace this dict.
-ADDRESSES = {
-    # FUN_1c15e3 (docs/findings/06): no arguments; initialises the 32 voice
-    # records at "voice_records" below (calls 0x1c7442 32 times), copies 32
-    # words 0x24ef2c->0x252d78 and fills 0x253df8.
-    "init": 0x1C15E3,
-    # FUN_1c4ecf: one voice's render (callable entry; calls FUN_1c4f81 at
-    # 0x1c4f81 for the actual interpolation/decimation body). Called from
-    # FUN_1c642a's dispatch loop (sw 0x1c6b00) with R4 = record address + 4.
-    "render": 0x1C4ECF,
-    "render_body": 0x1C4F81,
-    # 32 voice records, 0x1d8 bytes apart (docs/findings/06's voice record
-    # contract, two-agent-checked on the 1.16 bytes).
-    "voice_records": 0x2412CC,
-    "voice_record_stride": 0x1D8,
-    "voice_record_count": 32,
-    # 128-phase, 6-tap polyphase coefficient table: 6 (swse) int16 taps per
-    # phase, one per 4-byte (normal-word) slot, 24 bytes/phase (docs/
-    # findings/06's voice record contract, "Render and declick").
-    "coeff_table": 0x25D940,
-    "coeff_table_taps": 6,
-    "coeff_table_stride_bytes": 24,
-    # The decimator (docs/findings/06 sec. "The L2 code block's short-word
-    # base is 0xb80000" / functions/README.md): an L2 (blk69) short-word
-    # code address, not a DM data address -- called from within FUN_1c4f81
-    # (sw 0x1c525d), reads the 64-float work buffer at record+4 and writes
-    # 32 decimated (x0.5) floats.
-    "decimator": 0xB80000,
-}
+# Firmware addresses (functions, tables) come from tools/sharc_symbols.py's
+# resolve(), not a hardcoded dict: cached per image so repeated calls in one
+# process (render_blocks() in a loop, the test suite) reuse one resolution.
+_PROFILE_CACHE: dict[str, sharc_symbols.Profile] = {}
+
+
+def profile(image: str) -> sharc_symbols.Profile:
+    """This image's resolved symbol table (tools/sharc_symbols.py), cached.
+    Raises sharc_symbols.SymbolResolutionError if a symbol this harness
+    needs (voice_render, voice_records, coeff_table, ...) does not resolve
+    -- loudly, at call time, rather than silently rendering from a stale
+    hardcoded address."""
+    if image not in _PROFILE_CACHE:
+        _PROFILE_CACHE[image] = sharc_symbols.resolve(
+            sharcmod.load(image), device="dt2"
+        )
+    return _PROFILE_CACHE[image]
+
+
+# Voice record layout: not independently-addressed symbols, so these stay
+# as constants here rather than moving into sharc_symbols.py.
+#
+# 32 voice records, 0x1d8 bytes apart, at profile(image).voice_records
+# (docs/findings/06's voice record contract, two-agent-checked on the 1.16
+# bytes).
+VOICE_RECORD_STRIDE = 0x1D8
+VOICE_RECORD_COUNT = 32
 
 # Voice record field offsets, bytes, from docs/findings/06's voice record
-# contract table (two-agent-checked on the 1.16 bytes).
+# contract table (two-agent-checked on the 1.16 bytes) plus this lane's own
+# byte-level trace of FUN_1c4ecf/FUN_1c4f81 (see this module's docstring)
+# for FIELD_SAMPLE_PTR, previously undocumented ("[O]" in the contract
+# table) and empirically mis-set.
+FIELD_SAMPLE_PTR = 0x0  # word 0: pointer to raw PCM; null = zero-fill gate
 FIELD_WORK_BUFFER = 0x4  # 64 floats, written by render_body
 FIELD_PREVIOUS_SAMPLE = 0x180  # word 0x60
 FIELD_RATE = 0x184  # word 0x61, u32
@@ -128,6 +151,13 @@ FIELD_ACTIVE = 0x1B8
 FIELD_SEED_PENDING = 0x1BA
 FIELD_REVERSE = 0x1BB
 FIELD_LOOP = 0x1BC
+
+# 128-phase, 6-tap polyphase coefficient table layout at
+# profile(image).coeff_table: 6 (swse) int16 taps per phase, one per 4-byte
+# (normal-word) slot, 24 bytes/phase (docs/findings/06's voice record
+# contract, "Render and declick").
+COEFF_TABLE_TAPS = 6
+COEFF_TABLE_STRIDE_BYTES = 24
 
 Q31 = 1 << 31
 
@@ -152,8 +182,6 @@ def _decode_override(image: str, pc_sw: int) -> Instruction:
     """out/sharcdb's own decode at PC_SW, as a sharc_disasm.Instruction --
     see this module's docstring for why this differs from a live
     ``sharc_trace.decode_at()`` call at these specific addresses."""
-    import sharc as sharcmod
-
     img = sharcmod.load(image)
     rows = img.sql(
         "SELECT width, form, fields FROM insn WHERE image=? AND sw=?",
@@ -207,10 +235,10 @@ def _make_runner(
     )
 
 
-def voice_record_address(voice: int) -> int:
-    if not 0 <= voice < ADDRESSES["voice_record_count"]:
-        raise ValueError("voice must be 0..%d" % (ADDRESSES["voice_record_count"] - 1))
-    return ADDRESSES["voice_records"] + voice * ADDRESSES["voice_record_stride"]
+def voice_record_address(image: str, voice: int) -> int:
+    if not 0 <= voice < VOICE_RECORD_COUNT:
+        raise ValueError("voice must be 0..%d" % (VOICE_RECORD_COUNT - 1))
+    return profile(image).voice_records + voice * VOICE_RECORD_STRIDE
 
 
 @dataclass
@@ -234,7 +262,7 @@ def run_init(memory, image: str, *, max_steps: int = 200_000) -> InitResult:
     ``setup_voice()`` writes is set directly from docs/findings/06's own
     contract, not read back from what FUN_1c15e3 would have written.
     """
-    runner = _make_runner(memory, image, ADDRESSES["init"], {"I6": 0x300000})
+    runner = _make_runner(memory, image, profile(image).init, {"I6": 0x300000})
     try:
         result = runner.run(max_steps=max_steps)
     except Exception as exc:  # pragma: no cover - defensive, see docstring
@@ -267,8 +295,27 @@ def _poke(state, address: int, value: int, width: int = 4) -> None:
         )
 
 
+def _read_q31_pair(state, address: int) -> int:
+    """The inverse of ``_write_q31_pair``: a signed Q31 int64, low word
+    first. Unwritten (explicit_memory_model) reads as 0."""
+    lo = st._dm_read(state, address, 4)
+    hi = st._dm_read(state, address + 4, 4)
+    low = lo.value & 0xFFFFFFFF if lo is not None else 0
+    high = hi.value & 0xFFFFFFFF if hi is not None else 0
+    raw = (high << 32) | low
+    if raw & (1 << 63):
+        raw -= 1 << 64
+    return raw
+
+
+def _read_byte(state, address: int) -> int:
+    raw = st._dm_read(state, address, 1)
+    return raw.value & 0xFF if raw is not None else 0
+
+
 def setup_voice(
     state,
+    image: str,
     voice: int,
     *,
     sample_len: int,
@@ -276,35 +323,26 @@ def setup_voice(
     start: int = 0,
     end: int | None = None,
     loop_start: int = 0,
+    sample_base: int = 0x310000,
 ) -> int:
     """Write one voice record's fields per docs/findings/06's voice record
-    contract, and return its address. ``pitch_step`` is in input samples
-    per output (pre-interpolation) step; 1.0 is unity speed.
+    contract (plus FIELD_SAMPLE_PTR, this lane's own finding -- see this
+    module's docstring), and return its address. ``pitch_step`` is in input
+    samples per output (pre-interpolation) step; 1.0 is unity speed.
+    ``sample_base`` is the raw-PCM address stored at record+0 -- the caller
+    is responsible for having written samples there (``call_render`` no
+    longer pokes a register for this; see the docstring's "Corrected voice
+    call convention").
 
     Fields this harness does not have a documented source for (fade-in,
     zero-cross mute, reseed, reverse/loop, seed-pending) are left at their
     reset-zero value via ``State.explicit_memory_model`` rather than
     guessed at.
     """
-    record = voice_record_address(voice)
+    record = voice_record_address(image, voice)
     end = sample_len if end is None else end
+    _poke(state, record + FIELD_SAMPLE_PTR, sample_base)
     _poke(state, record + FIELD_ACTIVE, 1, width=1)
-    # See this module's docstring: byte record+0x1bc (not the contract
-    # table's documented +0x1b8) is what FUN_1c4ecf's own early-exit gate
-    # (sw 0x1c4f1f/0x1c4f21) actually reads with a synthetic, from-scratch
-    # register/stack setup -- empirically confirmed non-zero here is
-    # required to reach the render body at all; see the module docstring's
-    # "Open problem" note before trusting this beyond that gate.
-    _poke(state, record + FIELD_LOOP, 1, width=1)
-    # Avoid the function's zero-fill short-circuit at sw 0x1c4f15-0x1c4f18
-    # (leftz(DM(record+4)) -> SV): a fresh record's work buffer is 0
-    # (State.explicit_memory_model), which that check treats as "nothing
-    # to render yet".
-    _poke(
-        state,
-        record + FIELD_WORK_BUFFER,
-        struct.unpack("<I", struct.pack("<f", 1.0))[0],
-    )
     _write_q31_pair(state, record + FIELD_LOOP_START, loop_start << 31)
     _write_q31_pair(state, record + FIELD_START, start << 31)
     _write_q31_pair(state, record + FIELD_END, end << 31)
@@ -317,22 +355,24 @@ def setup_voice(
 def new_runner(
     memory: LoadedMemory, image: str, *, stack_base: int = 0x300000
 ) -> sr.Runner:
-    """A Runner parked at ADDRESSES["render"], ready for repeated calls
-    through ``call_render`` -- one State/overlay is shared across those
-    calls (a Runner's own State is otherwise created once and never reset;
-    see this module's docstring's "Open problem" note and ``call_render``'s
-    docstring for why a *fresh* Runner per call, tried first, does not
-    work: each Runner's State starts from an empty overlay, so a second
-    Runner never sees the first's ``setup_voice()`` pokes)."""
-    return _make_runner(memory, image, ADDRESSES["render"], {"I6": stack_base})
+    """A Runner parked at profile(image).voice_render, ready for repeated
+    calls through ``call_render`` -- one State/overlay is shared across
+    those calls (a Runner's own State is otherwise created once and never
+    reset; see ``call_render``'s docstring for why a *fresh* Runner per
+    call, tried first, does not work: each Runner's State starts from an
+    empty overlay, so a second Runner never sees the first's
+    ``setup_voice()`` pokes)."""
+    return _make_runner(memory, image, profile(image).voice_render, {"I6": stack_base})
 
 
 def call_render(
-    runner: sr.Runner, record: int, *, sample_base: int = 0x310000
+    runner: sr.Runner, image: str, record: int
 ) -> tuple[sr.RunResult, list[float]]:
-    """Call FUN_1c4ecf the way FUN_1c642a calls it (R4 = record + 4) on
-    RUNNER's already-set-up State (see ``new_runner``/``setup_voice``),
-    and return (RunResult, the 64 work-buffer floats).
+    """Call FUN_1c4ecf the way FUN_1c642a's dispatch loop calls it -- R4 =
+    the record address itself, not record+4 (see this module's docstring's
+    "Corrected voice call convention") -- on RUNNER's already-set-up State
+    (see ``new_runner``/``setup_voice``), and return (RunResult, the 64
+    work-buffer floats).
 
     Resets RUNNER's control-flow state (pc_sw, call stack, loops, pending
     delay slot) as a fresh call needs, but deliberately keeps its DM
@@ -343,21 +383,21 @@ def call_render(
     FUN_1c642a's own dispatch loop does than starting over from
     ``new_runner`` would be.
 
-    See this module's docstring for why the returned floats are not (yet)
-    a validated render of whatever sample data ``sample_base`` holds.
+    The raw sample pointer is not a register here (see ``setup_voice``'s
+    ``sample_base``): it is read by the callee from record+0
+    (FIELD_SAMPLE_PTR), a persistent record field, not reset per call.
     """
     from sharc_core.encoding import UREG_CODES
 
     state = runner.state
-    state.pc_sw = ADDRESSES["render"]
+    state.pc_sw = profile(image).voice_render
     state.stopped = None
     state.pending = None
     state.call_stack = []
     state.loops = []
     state.status_stack = []
     state.at_loaded_entry = False
-    state.uregs[UREG_CODES["R4"]] = st.Const(record + FIELD_WORK_BUFFER)
-    state.uregs[UREG_CODES["I0"]] = st.Const(sample_base)
+    state.uregs[UREG_CODES["R4"]] = st.Const(record)
     runner.instructions = 0
     runner.form_counts.clear()
     runner.max_call_depth_reached = 0
@@ -383,24 +423,40 @@ def render_blocks(
     pitch_step: float = 1.0,
     sample_len: int = 4096,
     sample_base: int = 0x310000,
+    samples: Sequence[float] | None = None,
 ) -> tuple[list[list[float]], list[sr.RunResult]]:
     """N call_render() calls against one freshly set-up voice record,
     sharing a single Runner/State (see ``new_runner``/``call_render``) so
     the record's own persistent fields (phase, previous sample, ...) carry
     over between calls the way they would across real render-loop
-    invocations. See this module's docstring's "Open problem" note: this
-    harness does not yet know how to make the render loop's actual sample
-    read advance across blocks either way, so this measures
-    instructions/block and exercises the correctness-checking machinery,
-    not (yet) verified block-to-block audio continuity.
+    invocations -- see ``check_correctness()`` for this measured against an
+    independent reference, including phase continuity across blocks.
+
+    ``samples``, if given, is written to ``sample_base`` before the first
+    call (FIELD_SAMPLE_PTR then points at it), e.g. a synthetic sine for an
+    audible WAV. If omitted, the record still points at ``sample_base`` but
+    nothing is written there, so unwritten DM reads as 0
+    (State.explicit_memory_model): a silent (but not zero-fill-gated, since
+    FIELD_SAMPLE_PTR is still non-null) render, useful for an
+    instructions/block measurement alone.
     """
     runner = new_runner(memory, image)
+    state = runner.state
+    if samples is not None:
+        for i, value in enumerate(samples):
+            bits = struct.unpack("<I", struct.pack("<f", value))[0]
+            _poke(state, sample_base + i * 4, bits)
     record = setup_voice(
-        runner.state, voice, sample_len=sample_len, pitch_step=pitch_step
+        state,
+        image,
+        voice,
+        sample_len=sample_len,
+        pitch_step=pitch_step,
+        sample_base=sample_base,
     )
     blocks, results = [], []
     for _ in range(n_blocks):
-        result, floats = call_render(runner, record, sample_base=sample_base)
+        result, floats = call_render(runner, image, record)
         blocks.append(floats)
         results.append(result)
     return blocks, results
@@ -434,7 +490,7 @@ def write_wav(path: str, samples: Sequence[float], sample_rate: int = 48000) -> 
 # --- reference 6-tap polyphase interpolator + 2:1 decimator ----------------
 
 
-def read_coeff_table(memory, phases: int = 128) -> list[list[float]]:
+def read_coeff_table(memory, image: str, phases: int = 128) -> list[list[float]]:
     """The firmware's own polyphase coefficients (docs/findings/06's
     "Render and declick": 6 (swse) int16 taps per phase, one per 4-byte
     slot, 24 bytes/phase), as float taps (sign-extended int16 / 2**15).
@@ -444,16 +500,12 @@ def read_coeff_table(memory, phases: int = 128) -> list[list[float]]:
     """
     from sharcldr import SW_ALIAS_BASE
 
+    base = profile(image).coeff_table
     table = []
     for phase in range(phases):
         taps = []
-        for tap in range(ADDRESSES["coeff_table_taps"]):
-            addr = (
-                SW_ALIAS_BASE
-                + ADDRESSES["coeff_table"]
-                + phase * ADDRESSES["coeff_table_stride_bytes"]
-                + tap * 4
-            )
+        for tap in range(COEFF_TABLE_TAPS):
+            addr = SW_ALIAS_BASE + base + phase * COEFF_TABLE_STRIDE_BYTES + tap * 4
             raw = memory.read(addr, 2)
             value = 0 if raw is None else int.from_bytes(raw, "little", signed=True)
             taps.append(value / 32768.0)
@@ -501,56 +553,127 @@ def reference_render(
     ]
 
 
+def _make_test_input(
+    kind: str, length: int, *, freq_cycles_per_sample: float = 1.0 / 32
+) -> list[float]:
+    """A synthetic, bounded-amplitude input for ``check_correctness``.
+    ``kind`` is "sine" (the same generator the previous version of this
+    module used) or "ramp" (a periodic sawtooth at the same period, in
+    [-1, 1)) -- a discontinuous waveform the 6-tap interpolator's frequency
+    response treats very differently from a sine, so agreement on both is
+    a much stronger cross-check than either alone."""
+    if kind == "sine":
+        return [
+            math.sin(2 * math.pi * freq_cycles_per_sample * i) for i in range(length)
+        ]
+    if kind == "ramp":
+        period = max(2, round(1.0 / freq_cycles_per_sample))
+        return [2.0 * ((i % period) / period) - 1.0 for i in range(length)]
+    raise ValueError("unknown check_correctness input kind: %r" % (kind,))
+
+
+# (input kind, pitch_step) cases check_correctness() runs by default: unity
+# speed, one downward and one upward pitch step, on both waveforms.
+_DEFAULT_CASES: tuple[tuple[str, float], ...] = (
+    ("sine", 1.0),
+    ("sine", 0.5),
+    ("sine", 2.0),
+    ("ramp", 1.0),
+)
+
+
 def check_correctness(
     memory,
     image: str,
     *,
-    n_samples: int = 64,
+    n_blocks: int = 8,
+    cases: Sequence[tuple[str, float]] = _DEFAULT_CASES,
     freq_cycles_per_sample: float = 1.0 / 32,
-) -> dict:
-    """Compare one render_block() call's work-buffer output against
-    reference_render() on the same synthetic sine input.
+) -> dict[str, dict]:
+    """For each (input kind, pitch_step) in ``cases``, render ``n_blocks``
+    consecutive 32-sample blocks from one voice and compare each against
+    ``reference_render()`` run over the same input with its own phase
+    accumulator carried forward the same way the firmware's FIELD_PHASE
+    record field persists across ``call_render()`` calls -- so this checks
+    both per-block numerical accuracy and block-to-block continuity (phase
+    advancing by pitch_step*64 per block, matching the DO 64 loop's 64
+    raw interpolation points; ACTIVE staying 1 with real sample data and a
+    non-null FIELD_SAMPLE_PTR).
 
-    This is a real, working comparison, not a placeholder -- but see this
-    module's docstring's "Open problem" before trusting its verdict: the
-    harness's render call does not yet demonstrably read the synthetic
-    sample buffer this function writes (I0, the only register found that
-    plausibly carries a sample pointer, is overwritten inside FUN_1c4f81
-    before the interpolation loop uses it), so a large error here today is
-    expected and does not by itself mean the interpolator's semantics
-    are wrong -- only that this harness has not yet wired real sample data
-    into whatever the loop actually reads. A small error would be strong
-    (if surprising, given the open problem) positive evidence; report
-    both the error and this caveat together, never the error alone.
+    Returns one dict per case, keyed "<kind>_step<pitch_step>".
     """
-    sample_len = 320
-    samples = [
-        math.sin(2 * math.pi * freq_cycles_per_sample * i) for i in range(sample_len)
-    ]
     sample_base = 0x310000
-    runner = new_runner(memory, image)
-    state = runner.state
-    for i, value in enumerate(samples):
-        bits = struct.unpack("<I", struct.pack("<f", value))[0]
-        _poke(state, sample_base + i * 4, bits)
-    record = setup_voice(state, 0, sample_len=sample_len, pitch_step=1.0)
-    result, rendered = call_render(runner, record, sample_base=sample_base)
-    decimated = decimate(rendered)
+    coeff_table = None  # loaded once cases start, after profile() resolves
+    results: dict[str, dict] = {}
+    for kind, pitch_step in cases:
+        # Enough input for n_blocks*64 raw interpolation points at this
+        # pitch_step, plus the interpolator's 6-tap window margin either
+        # side (reference_render's sample_at() zero-pads out of range, but
+        # keeping real signal there makes the comparison meaningful for
+        # taps that reach past a block's own span).
+        sample_len = int(math.ceil(n_blocks * 64 * pitch_step)) + 32
+        samples = _make_test_input(
+            kind, sample_len, freq_cycles_per_sample=freq_cycles_per_sample
+        )
+        if coeff_table is None:
+            coeff_table = read_coeff_table(memory, image)
 
-    coeff_table = read_coeff_table(memory)
-    reference = reference_render(
-        samples, coeff_table, step=1.0, n_output=len(decimated)
-    )
+        runner = new_runner(memory, image)
+        state = runner.state
+        for i, value in enumerate(samples):
+            bits = struct.unpack("<I", struct.pack("<f", value))[0]
+            _poke(state, sample_base + i * 4, bits)
+        record = setup_voice(
+            state,
+            image,
+            0,
+            sample_len=sample_len,
+            pitch_step=pitch_step,
+            sample_base=sample_base,
+        )
 
-    errors = [abs(a - b) for a, b in zip(decimated, reference, strict=True)]
-    return {
-        "halt": result.halt.reason,
-        "instructions": result.instructions,
-        "rendered_decimated": decimated,
-        "reference": reference,
-        "max_abs_error": max(errors) if errors else None,
-        "mean_abs_error": sum(errors) / len(errors) if errors else None,
-    }
+        pos = 0.0
+        halts, per_block_max, per_block_mean = [], [], []
+        phases, actives = [], []
+        flat_errors: list[float] = []
+        for _ in range(n_blocks):
+            result, rendered = call_render(runner, image, record)
+            decimated = decimate(rendered)
+            reference = reference_render(
+                samples,
+                coeff_table,
+                step=pitch_step,
+                n_output=len(decimated),
+                start_phase=pos,
+            )
+            pos += pitch_step * 2 * len(decimated)  # = pitch_step * 64
+
+            errors = [abs(a - b) for a, b in zip(decimated, reference, strict=True)]
+            flat_errors.extend(errors)
+            per_block_max.append(max(errors) if errors else None)
+            per_block_mean.append(sum(errors) / len(errors) if errors else None)
+            halts.append(result.halt.reason)
+            phases.append(_read_q31_pair(state, record + FIELD_PHASE) / Q31)
+            actives.append(_read_byte(state, record + FIELD_ACTIVE))
+
+        phase_deltas = [b - a for a, b in itertools.pairwise(phases)]
+        results["%s_step%g" % (kind, pitch_step)] = {
+            "kind": kind,
+            "pitch_step": pitch_step,
+            "n_blocks": n_blocks,
+            "halts": halts,
+            "max_abs_error": max(flat_errors) if flat_errors else None,
+            "mean_abs_error": sum(flat_errors) / len(flat_errors)
+            if flat_errors
+            else None,
+            "per_block_max_error": per_block_max,
+            "per_block_mean_error": per_block_mean,
+            "phase": phases,
+            "phase_deltas": phase_deltas,
+            "phase_delta_expected": pitch_step * 64,
+            "active": actives,
+        }
+    return results
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -560,6 +683,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--blocks", type=int, default=8)
     p.add_argument("--pitch-step", type=float, default=1.0)
     p.add_argument("--sample-len", type=int, default=4096)
+    p.add_argument("--freq", type=float, default=1000.0, help="WAV sine frequency, Hz")
     p.add_argument("--out", default=None, help="WAV output path")
     p.add_argument("--sample-rate", type=int, default=48000)
     p.add_argument("--run-init", action="store_true", default=False)
@@ -573,6 +697,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if a.run_init:
         init = run_init(memory, a.image)
 
+    # The output WAV's audible frequency is freq/sample_rate cycles per
+    # *decimated* output sample; the raw PCM this harness writes to
+    # sample_base is consumed at pitch_step raw samples per output, so its
+    # own cycles-per-sample must be scaled up by pitch_step to land on the
+    # same audible frequency after resampling.
+    cycles_per_sample = (a.freq / a.sample_rate) * a.pitch_step
+    samples = [
+        math.sin(2 * math.pi * cycles_per_sample * i) for i in range(a.sample_len)
+    ]
+
     start = time.perf_counter()
     blocks, results = render_blocks(
         memory,
@@ -581,6 +715,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         a.blocks,
         pitch_step=a.pitch_step,
         sample_len=a.sample_len,
+        samples=samples,
     )
     elapsed = time.perf_counter() - start
     total_instructions = sum(r.instructions for r in results)
@@ -624,12 +759,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if a.out:
             print("wrote", a.out)
         if correctness is not None:
-            print(
-                "correctness: max_abs_error=%.4g mean_abs_error=%.4g (see "
-                "sharc_harness.py's docstring/check_correctness() before "
-                "trusting this number)"
-                % (correctness["max_abs_error"], correctness["mean_abs_error"])
-            )
+            for name, case in correctness.items():
+                print(
+                    "correctness[%s]: max_abs_error=%.4g mean_abs_error=%.4g "
+                    "phase_deltas=%s (expected %.1f) active=%s"
+                    % (
+                        name,
+                        case["max_abs_error"],
+                        case["mean_abs_error"],
+                        ["%.2f" % d for d in case["phase_deltas"]],
+                        case["phase_delta_expected"],
+                        case["active"],
+                    )
+                )
     return 0
 
 
