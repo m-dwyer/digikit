@@ -5,9 +5,9 @@ tools/sharc_replay.py.
     uv run python tools/sharc_capture_run.py SNAPSHOT --out CAPTURE.dt2cap \
         --kind idle|note|play --instrs N [--syx SYX] [--ssi0-hz N]
         [--trig-at N] [--force-period N] [--unblock]
-        [--poke-track-type TRACK:TYPE ...]
+        [--poke-track-type TRACK:TYPE ...] [--pre-instrs N]
 
-Two things a run needs, both handled here:
+Three things a run needs, all handled here:
 
 **Getting a DSPI2 driver call to happen at all.** The vector-191 ISR
 (docs/findings/04-coldfire-dsp-link.md, "The ColdFire tells the SHARC
@@ -120,6 +120,26 @@ to re-run here) UI front-end that would normally produce that same byte
 change. Combine with `--kind note` (`--trig-at`) for the full causal chain
 that report.json's own `machine_trig1` run used: a poked machine change,
 then a real panel TRIG 1.
+
+**Getting the *real* per-track machine type and active flag, with no poke
+at all.** Every capture this tool produced before `--pre-instrs` existed --
+`--kind idle`, `--kind note`, and `--kind play` alike, on unmodified
+`snapshots/dt2-1.16/boot400M.snap` -- shows every track's machine-type and
+`0x73c` active fields at zero for the whole run, even though a real,
+non-empty kit is already loaded at that snapshot (`_DAT_80004704` is
+non-null and one track already has a real machine type; see
+`run_natural_track_refresh()`'s own docstring). That data just never gets
+copied into the SRAM row the TX frame is built from, because the function
+that does that copy (`KIT_LOAD_FN`, `FUN_4002d9c4`) has not run yet at that
+exact snapshot instant -- it fires naturally 10-12M instructions later, but
+only when nothing is servicing real PIT/DTIM timer interrupts in the
+meantime, which every timed capture (this tool's own `--force-period`
+phase included) does. `--pre-instrs N` runs an untimed pre-phase (bounded by
+N, stopped early by a code hook the moment `KIT_LOAD_FN` fires) before the
+timed capture phase starts, so the row already carries the snapshot's real
+per-track data -- no `--poke-track-type` needed, though the two combine
+freely (poke is applied after the pre-phase, so it can still override
+specific tracks on top of whatever the natural refresh produced).
 """
 
 from __future__ import annotations
@@ -131,7 +151,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from unicorn import UC_HOOK_MEM_WRITE  # noqa: E402
+from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_WRITE  # noqa: E402
 from unicorn.m68k_const import (  # noqa: E402
     UC_M68K_REG_A7,
     UC_M68K_REG_D0,
@@ -194,6 +214,17 @@ PLAY_BIT = 3
 TRACK_9A_BASE = 0x80003CD0
 TRACK_9A_STRIDE = 0x9A
 TRACK_TYPE_OFFSET = 0
+
+# The real per-track kit-load-and-refresh (docs/findings/04-coldfire-dsp-link.md,
+# "Lane A3: the natural per-track kit-load-and-refresh event"): FUN_4002da7a
+# sets the live kit pointer `_DAT_80004704` and zeroes the sync-cache/mute
+# arrays; FUN_4002d9c4 (same live pointer) then calls FUN_4002d438 for every
+# unmasked track, copying that track's real machine-type/parameter bytes
+# from its live source object into the SRAM mirror row the vector-191
+# handler reads into the TX frame. See run_natural_track_refresh()'s own
+# docstring for when this fires and why it needs an untimed pre-phase.
+KIT_LOAD_FN = 0x4002D9C4
+ROW_REFRESH_FN = 0x4002D438
 
 
 def _resolve_panel_profile(main_img: bytes):
@@ -273,6 +304,69 @@ def poke_track_type(m, track: int, type_: int) -> None:
     )
 
 
+def run_natural_track_refresh(m, pc: int, budget: int, *, chunk: int = 200_000) -> int:
+    """Run up to BUDGET instructions, untimed, so the real per-track
+    kit-load-and-refresh (KIT_LOAD_FN's own docstring) has a chance to fire
+    before the timed capture phase starts. -> the PC to resume from.
+
+    Every capture this project has produced before this function existed
+    used ``snapshots/dt2-1.16/boot400M.snap`` unmodified: at that exact
+    point the live kit pointer (``_DAT_80004704``) is already set to a real,
+    non-null project (one track already carries a real machine type, and
+    every other per-track object already holds plausible non-default
+    parameter bytes -- this is not an empty/unloaded project), but the SRAM
+    mirror row the TX frame is built from is still at its zero-initialized
+    reset value: KIT_LOAD_FN has not run since boot, so nothing has ever
+    copied that real data into the row. Confirmed by execution: resuming
+    ``boot400M.snap`` for 10-12M further ColdFire instructions, with no
+    panel input and no forced vector 191, reaches KIT_LOAD_FN exactly once,
+    which calls ROW_REFRESH_FN for all 16 tracks and makes the mismatch
+    disappear (the row byte for the one track with a real machine type
+    changes from 0 to that type).
+
+    This needs its own untimed, pits-less phase because the interaction is
+    with time-of-check, not just elapsed instructions: the same resume
+    driven through ``emu.longrun.spin()`` with a real
+    ``emu.dtim.Timers``/``emu.pit.Pits`` object servicing PIT/DTIM
+    interrupts -- what every capture/replay tool in this project, including
+    this module's own timed capture phase below, normally does -- did not
+    reach KIT_LOAD_FN within at least 60M further instructions in the same
+    control. Only removing the PIT/DTIM timer service (not chunking, not
+    the SSI0 model, not the idle-yield reschedule ``emu.longrun.build()``
+    always installs -- each checked in isolation) restores the ~12M timing.
+    Why real PIT/DTIM service changes which task the guest OS schedules
+    enough to block or badly delay this one function was not chased further
+    here: this pre-phase is a bounded, opt-in workaround for capturing real
+    per-track data, not a fix to the timer/scheduling model. Flagged open in
+    docs/findings/04-coldfire-dsp-link.md.
+
+    BUDGET is a cap, not a fixed cost: a code hook on KIT_LOAD_FN stops the
+    run as soon as it fires, so a generous budget does not slow down a
+    capture where the event already happened early. If it never fires
+    within BUDGET, this returns the PC reached anyway -- the caller's own
+    capture proceeds exactly as it would have with pre_instrs=0, just having
+    spent BUDGET instructions first.
+    """
+
+    def on_kit_load(uc, addr, size, data):
+        uc.emu_stop()
+
+    handle = m.uc.hook_add(
+        UC_HOOK_CODE, on_kit_load, begin=KIT_LOAD_FN, end=KIT_LOAD_FN
+    )
+    try:
+        # Deliberately no `pits=`/`async_events=` here -- see this
+        # function's own docstring for why a timed phase does not reach
+        # KIT_LOAD_FN.
+        pc, _done, _stop = spin(m, pc, budget, chunk)
+    finally:
+        # One-shot: a hook left installed would also fire on any later,
+        # legitimate re-entry of KIT_LOAD_FN during the timed capture phase
+        # that follows, silently truncating it via the same emu_stop().
+        m.uc.hook_del(handle)
+    return pc
+
+
 def run(
     snapshot: str,
     out_path: str,
@@ -287,6 +381,7 @@ def run(
     unblock: bool = False,
     poke_track_types: tuple[tuple[int, int], ...] = (),
     watch_mem: tuple[tuple[int, int], ...] = (),
+    pre_instrs: int = 0,
 ) -> dict:
     if kind not in ("idle", "note", "play"):
         raise ValueError("kind must be 'idle', 'note' or 'play', got %r" % (kind,))
@@ -322,6 +417,16 @@ def run(
 
     panel_profile = _resolve_panel_profile(main_img)
     m.uc.mem_write(prof["gate"], bytes(4))  # open the frame-build gate
+
+    if pre_instrs:
+        # Let the real per-track kit-load-and-refresh run before the timed
+        # capture phase starts, so the SRAM row (and hence the TX frame)
+        # carries genuine machine-type/active data instead of the
+        # zero-initialized reset values -- see run_natural_track_refresh()'s
+        # own docstring for what this waits for and why it needs its own
+        # untimed phase.
+        pc = run_natural_track_refresh(m, pc, pre_instrs, chunk=chunk)
+
     for track, type_ in poke_track_types:
         poke_track_type(m, track, type_)
 
@@ -341,6 +446,7 @@ def run(
             "ssi0": ssi0_status,
             "ssi0_hz": ssi0_hz if ssi0 is not None else None,
             "poke_track_types": ["%d:%d" % (t, y) for t, y in poke_track_types],
+            "pre_instrs": pre_instrs,
         },
     )
     peer = CapturingPeer(writer, counter=lambda: pits.now)
@@ -462,6 +568,21 @@ def parse_args(argv=None):
         "profile, FLEXBUS_WATCH (0x8c000000-0x8c000010) is always added, "
         "in addition to whatever this gives",
     )
+    p.add_argument(
+        "--pre-instrs",
+        dest="pre_instrs",
+        type=lambda s: int(s, 0),
+        default=0,
+        metavar="N",
+        help="run up to N instructions, untimed, before the timed capture "
+        "phase, to let the real per-track kit-load-and-refresh fire (see "
+        "run_natural_track_refresh()'s own docstring); 0 (default) skips "
+        "this and keeps every existing capture's exact behaviour. On "
+        "snapshots/dt2-1.16/boot400M.snap this fires within 10-12M "
+        "instructions, so 15_000_000 is a reasonable value; a code hook "
+        "stops the phase as soon as it fires, so a larger budget costs "
+        "nothing when it fires early",
+    )
     return p.parse_args(argv)
 
 
@@ -485,6 +606,7 @@ def main(argv=None) -> int:
         unblock=args.unblock,
         poke_track_types=poke_track_types,
         watch_mem=watch_mem,
+        pre_instrs=args.pre_instrs,
     )
     print(
         "%s: %d frame(s), %d ssi0-rx, %d dspi1-calls, %d mem-writes, "

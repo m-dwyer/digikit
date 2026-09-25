@@ -1934,3 +1934,108 @@ snapshots/dt2-1.16/boot400M.snap --out out/captures/dt2-1.16-<kind>-ext.dt2cap
 --kind <idle|note|play> --instrs N --syx <a 1.16 .syx whose sha-256 matches
 sections/.source-sha256>`. Captures are firmware-derived and were not
 committed (`out/` is gitignored).
+
+## Lane A3: the natural per-track kit-load-and-refresh event **[V][O]**
+
+Every capture up to this lane, on every `--kind`, showed every track's
+machine-type and `0x73c` active field at zero for the whole run, even under
+`--kind play` with the snapshot's own pattern running. This corrects the
+implicit assumption behind that reading -- that `boot400M.snap` has no real
+project/kit loaded. It does. **[C][V]**
+
+- Reading `boot400M.snap`'s memory directly (`emu.longrun.build()`, zero
+  instructions executed -- a static read, not a run) shows the live kit
+  pointer `_DAT_80004704` already non-null: `0x426532b8`. Its 16 per-track
+  sub-objects (`_DAT_80004704 + 0x34 + i*0x450`) already hold plausible,
+  non-default data: track 2's machine-type byte (`+0xa2`) is `2`, and every
+  track's word at `+0x60` is a small positive value clustered around
+  `0x4000` (a neutral/centre default, not zero). The kit-wide per-track mask
+  at `+0x552e` is `0x0000` (no track excluded). This is an already-loaded,
+  mostly-empty-but-not-blank kit (one track configured), not an unloaded or
+  zeroed project. **[V]**
+- The SRAM mirror row (`0x80003cd0 + i*0x9a`, "The machine type reaches the
+  SHARC" above) and the sync-cache (`0x8000470c`, sixteen longs) are still
+  at their post-reset zero value at this same instant: `FUN_4002d438`
+  ("`FUN_4002d438` was reached zero times" above) has genuinely not run
+  since boot, so nothing has ever copied that real per-track data into the
+  row the TX frame is built from. Both readings are correct; they describe
+  different memory. **[V]**
+- **`FUN_4002d9c4(param_1)` is the real kit-load function.** Not previously
+  named: it is `_DAT_80004704`'s other writer (the first, `FUN_4002da7a`,
+  was already in the writer table above; this lane decompiled it too). It
+  sets the live kit pointer, then loops the 16 tracks and, for every track
+  whose bit is clear in the mask at `param_1+0x552e`, calls
+  `FUN_4002d438(track_object, track)` -- the same wholesale-refresh function
+  the rest of this file already established end to end
+  (`source + 0xa2 -> FUN_4002d438 -> row byte 0 -> TX 0x94`). With the mask
+  `0`, every track is unmasked, so a real call refreshes all 16 rows in one
+  pass:
+
+  ```
+  4002d9cc  246f 001c                 movea.l (Stack[0x4],SP),A2   ; param_1 (kit ptr)
+  4002d9e0  23ca 8000 4704            move.l A2,(DAT_80004704).l
+  LAB_4002d9f0:
+  4002d9f0  716a 552e                 mvs.w: (0x552e,A2),D0        ; per-track mask
+  4002d9f4  0500                      btst.l D2,D0
+  4002d9f6  6612                      bne.b LAB_4002da0a            ; masked: skip
+  4002d9f8  2f02                      move.l D2,-(SP)               ; track
+  4002d9fa  2f03                      move.l D3,-(SP)               ; track_object
+  4002d9fe  4e94                      jsr (A4)                      ; FUN_4002d438
+  ```
+
+  Confirmed by execution: hooking `0x4002d9c4` and `0x4002d438` (entry-PC
+  code hooks, arguments read off the stack per this disassembly) on a run
+  resumed from `boot400M.snap` observes `FUN_4002d9c4` fire exactly once,
+  immediately followed by 16 `FUN_4002d438` calls (tracks 0-15, in order,
+  each with that track's real source-object address), after which the row
+  byte for track 2 reads `2` (was `0`) and the cache is populated. **[V]**
+- **Why every existing capture still sees zero: `FUN_4002d9c4` has not run
+  yet at exactly `boot400M.snap`'s instant, and it is time-of-check
+  sensitive to how the run is driven, not just how many instructions
+  elapse.** Resuming `boot400M.snap` for 10-12M further instructions with
+  plain, untimed execution (`emu.longrun.spin()` with no `pits`/PIT-DTIM
+  timer service, no forced vector 191, no panel input) reaches
+  `FUN_4002d9c4` reliably (bracketed: not yet at +10M, fired by +12M). The
+  same resume, driven through `emu.longrun.spin()` with a real
+  `emu.dtim.Timers`/`emu.pit.Pits` object servicing PIT3/DTIM interrupts --
+  what `tools/sharc_capture_run.py`'s own timed capture phase does, and what
+  every capture/replay tool in this project does -- does **not** reach
+  `FUN_4002d9c4` within at least 60M further instructions in the same
+  control. Isolated one variable at a time (chunk size, the SSI0 model, the
+  idle-yield reschedule `emu.longrun.build()` always installs): only
+  removing the PIT/DTIM timer service restores the ~12M timing. Why
+  servicing real PIT/DTIM interrupts changes which task the guest RTOS
+  schedules enough to block or badly delay this one function -- a
+  scheduling/timer-model question, not a ColdFire-DSP-link one -- was not
+  chased further here. **[V][O]**
+- **Fix (opt-in, emulator-side): `tools/sharc_capture_run.py --pre-instrs N`.**
+  Runs up to `N` instructions, untimed (no `pits`), before the timed capture
+  phase starts, stopped early by a one-shot code hook the moment
+  `FUN_4002d9c4` fires (`run_natural_track_refresh()`). Default `0` keeps
+  every existing capture's exact behaviour unchanged. Verified: `--kind play
+  --instrs 15000000 --pre-instrs 15000000` on `boot400M.snap` (real 1.16
+  `.syx`, sha-256 matching `sections/.source-sha256`) now captures a
+  `--kind play` run where track 2's machine-type frame word (`0x94 + 2*2`)
+  reads `2` from frame 1 onward, and the `0x73c` active word is non-zero for
+  tracks 2, 3, 6 and 9 -- real per-track data, no `--poke-track-type` used.
+  Combine the two: poke is applied after the pre-phase, so it can still
+  override specific tracks on top of whatever the natural refresh produced.
+  **[V]**
+- **Open.** Which tracks end up "active" (2, 3, 6, 9) does not match either
+  "only the one track with a real machine type" (just track 2) or "the
+  pattern's active trigs" (3, 12, 13, 15, from the Z1 lane above) -- the
+  `0x73c` formula ("`0` if the type is 0 and the word at `src + 0x60` is 0,
+  else `1`") may be incomplete, or reads a different mirror than this lane
+  assumed, given every track's `+0x60` word was already non-zero in the raw
+  source object. Not resolved here. Also open: whether `FUN_4002d9c4`'s
+  real trigger under faithful PIT/DTIM timing is reachable at all within a
+  practical instruction budget, or needs a different scheduling/timer
+  interaction understood first -- `--pre-instrs` is a bounded workaround for
+  capturing real per-track data, not a fix to that scheduling question.
+  **[O]**
+
+Reproduced with: `uv run python tools/sharc_capture_run.py
+snapshots/dt2-1.16/boot400M.snap --out out/captures/dt2-1.16-play-pretracks.dt2cap
+--kind play --instrs 15000000 --pre-instrs 15000000 --syx <a 1.16 .syx whose
+sha-256 matches sections/.source-sha256>`. Capture not committed (`out/` is
+gitignored).
