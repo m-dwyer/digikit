@@ -29,11 +29,18 @@ class ElzTest(unittest.TestCase):
         data = bytes(random.Random(1).randrange(256) for _ in range(5000))
         self.assertEqual(elz.depack_section(aplib.pack_section(data)), data)
 
-    def test_declared_length_must_match_the_end_marker(self):
+    def test_padding_after_the_end_marker_is_accepted(self):
+        # a same-size repack pads the stream past the end marker; the device
+        # stops at the marker, so the padding must not be an error
         packed = bytearray(aplib.pack_section(b'hello world'))
         packed[3] += 4  # declare four more stream bytes than the end marker uses
-        with self.assertRaises(ValueError):
-            elz.depack_section(bytes(packed) + bytes(4))
+        self.assertEqual(elz.depack_section(bytes(packed) + bytes(4)), b'hello world')
+
+    def test_end_marker_past_the_declared_length_is_an_error(self):
+        packed = bytearray(aplib.pack_section(b'hello world'))
+        packed[3] -= 4  # declare four fewer stream bytes than the end marker needs
+        with self.assertRaises(EOFError):  # depack runs out of declared stream first
+            elz.depack_section(bytes(packed))
 
     @unittest.skipUnless(sections_from_syx(), 'needs the 1.15C .syx and sections/ extracted from it')
     def test_matches_the_device_depacker_on_1_15c(self):

@@ -85,11 +85,11 @@ def depack(data, pos, end):
 def depack_section(stream):
     """Depack a section that starts with its [u32 length][u32 sum] header.
 
-    -> bytes. Raises ValueError when the end marker does not land exactly on
-    the declared stream length.
+    -> bytes. Raises ValueError when the end marker lands past the declared
+    stream length; padding after the marker (a same-size repack) is accepted.
     """
     length = struct.unpack_from(">I", stream, 0)[0]
     out, end = depack(stream, 8, 8 + length)
-    if end != 8 + length:
+    if end > 8 + length:   # trailing padding after the end marker is not an error (same-size repack)
         raise ValueError("end marker at %d of %d stream bytes" % (end - 8, length))
     return bytes(out)
