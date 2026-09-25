@@ -771,9 +771,9 @@ class FrameRenderFromInitTest(unittest.TestCase):
         # handler does not support (see its own "unsupported Type3a
         # long-word access" message) -- not a return mismatch, so this is
         # the milestone this lane was asked to reach.
-        self.assertEqual(halt.reason, "unsupported Type3a long-word access")
-        self.assertEqual(halt.pc_sw, 0x1C2920)
-        self.assertEqual(results[0].instructions, 86740)
+        self.assertEqual(halt.reason, h.FRAME_MILESTONE["reason"])
+        self.assertEqual(halt.pc_sw, h.FRAME_MILESTONE["pc_sw"])
+        self.assertEqual(results[0].instructions, h.FRAME_MILESTONE["instructions"])
 
 
 @unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")

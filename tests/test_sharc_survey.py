@@ -470,7 +470,7 @@ class CollectAllFrameRunTest(unittest.TestCase):
     def test_with_frame_patch_table_is_a_single_stop(self):
         # FRAME_PATCH_TABLE's two register hypotheses already avoid every
         # fork on this path (docs/findings/06, this lane's handover): the
-        # only stop collect-all records is the same known return-mismatch
+        # only stop collect-all records is the same FRAME_MILESTONE stop
         # tools/sharc_harness.py's own FrameRenderFromInitTest pins.
         result = sv.run_collect_all(
             self._fresh_call(),
@@ -479,10 +479,11 @@ class CollectAllFrameRunTest(unittest.TestCase):
             img=self.img,
         )
         self.assertEqual(len(result.stops), 1)
-        self.assertEqual(result.instructions, 191363)
+        milestone = self.h.FRAME_MILESTONE
+        self.assertEqual(result.instructions, milestone["instructions"])
         last = result.stops[0]
-        self.assertEqual(last.category, "return-mismatch")
-        self.assertEqual(last.pc, 0xB82A30)
+        self.assertEqual(last.category, milestone["reason"])
+        self.assertEqual(last.pc, milestone["pc_sw"])
 
     def test_without_patch_table_finds_several_distinct_forks_then_the_same_blocker(
         self,
@@ -492,10 +493,11 @@ class CollectAllFrameRunTest(unittest.TestCase):
         )
         # Every fork this lane's own FRAME_PATCH_TABLE hand-resolves, plus a
         # handful more a bare not-taken default has to guess through, ending
-        # at the same return-mismatch a hand-patched run reaches.
+        # at the same FRAME_MILESTONE stop a hand-patched run reaches.
         self.assertGreater(result.guesses, 5)
-        self.assertEqual(result.stops[-1].category, "return-mismatch")
-        self.assertEqual(result.stops[-1].pc, 0xB82A30)
+        milestone = self.h.FRAME_MILESTONE
+        self.assertEqual(result.stops[-1].category, milestone["reason"])
+        self.assertEqual(result.stops[-1].pc, milestone["pc_sw"])
         # A recurring fork (a loop) is recorded once, not once per iteration.
         pcs = [s.pc for s in result.stops]
         self.assertEqual(len(pcs), len(set(pcs)))

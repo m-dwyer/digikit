@@ -301,8 +301,7 @@ class DynamicViewTest(unittest.TestCase):
     """dynamic_view() against the real frame call (setup_voice() +
     setup_frame() + fresh_call(block_handler), tools/sharc_harness.py's own
     call chain), with FRAME_PATCH_TABLE so it reaches the same known
-    return-mismatch tools/sharc_harness.py's own FrameRenderFromInitTest
-    pins (191,363 instructions, 0xb82a30) -- run_init() alone is several
+    stop tools/sharc_harness.py pins as FRAME_MILESTONE -- run_init() alone is several
     seconds; a Watchpoint-logged run is slower still, so this is its own
     slow test rather than folded into BuildWithInitTest."""
 
@@ -310,8 +309,8 @@ class DynamicViewTest(unittest.TestCase):
         import sharc_harness as h
 
         view = si.dynamic_view("dt2-1.16", patch_table=h.FRAME_PATCH_TABLE)
-        self.assertEqual(view.instructions, 191363)
-        self.assertIn("differs from recorded return", view.halt["reason"])
+        self.assertEqual(view.instructions, h.FRAME_MILESTONE["instructions"])
+        self.assertEqual(view.halt["reason"], h.FRAME_MILESTONE["reason"])
         self.assertGreater(view.n_read_addrs, 0)
         self.assertGreater(view.n_written_addrs, 0)
         # Addresses are un-aliased back to the plain application DM pointer

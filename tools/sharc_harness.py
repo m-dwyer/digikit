@@ -964,6 +964,15 @@ FRAME_PATCH_TABLE: sv.PatchTable = {
 # of FRAME_PATCH_TABLE for that reason.
 FRAME_DIAGNOSTIC_ASTATX_PATCH: sv.PatchTable = {0x1C0885: [("reg", "ASTATX", 0x400)]}
 
+# Where one render_frames() call with FRAME_PATCH_TABLE stops today, from
+# run_init() state. Tests compare against this one pin: update it (and say
+# why in the commit) when a fix moves the stop.
+FRAME_MILESTONE = {
+    "pc_sw": 0x1C2920,
+    "instructions": 86740,
+    "reason": "unsupported Type3a long-word access",
+}
+
 
 def render_frames(
     memory,
