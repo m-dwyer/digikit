@@ -3774,6 +3774,50 @@ unambiguous (a single 48-bit match) -- either an encoding row error in our
 compute table for `BITEXT (NU)`, or real use of that range. `0xb88fe6` is
 unreachable (after an unconditional delayed jump). Both remain **[O]**.
 
+**The `0x1c4969` fork's own harness patch is the frame-path pitch bug's
+root cause (lane E1, 2026-09-26) `[O]`.** `tools/sharc_harness.py`'s
+`FRAME_PATCH_TABLE` gets past this fork by forcing the fcomp's own operands
+(`F6`, `F4` -- register aliases `R6`/`R4`) to a fixed `1.0f`/`1.0f` at
+`0x1c4965`, one instruction before the fork. This resolves the branch
+deterministically (equal, not less-than) but also throws away the real,
+data-dependent values `F6`/`F4` are computed from (an `fsub`/`fmax` chain
+over `FIELD_SAMPLE_LENGTH`-derived fixed-to-float conversions,
+`0x1c4931`-`0x1c4963`) -- and a register-level measurement shows the
+consequence directly: one `call_frame()` through `FUN_1c642a`'s per-voice
+dispatch advances `FIELD_PHASE` by **exactly the same** 40.430023193359375
+raw samples every single time, for `pitch_step` 0.5, 1.0 AND 2.0 alike
+(checked across 6 consecutive frames too, same constant every frame) --
+i.e. this patch makes the frame path's per-frame position update
+completely independent of the real per-voice step, not merely scaled by a
+constant factor. At `pitch_step=1.0` this reads as "output is
+40.430023193359375/64 = 0.6317x the requested frequency" (this repo's own
+prior phrasing), but that ratio is specific to `pitch_step=1.0`; the real
+relationship is "the frame path's audible frequency is fixed at
+`freq * 0.6317...`, regardless of `pitch_step`" -- confirmed on a 384-frame
+render (`freq=1000`, `pitch_step=1.0`): the measured tone lands at
+`631.7191123962402` Hz (`power_ratio` 1.0002, i.e. a pure tone) matching
+`1000 * 40.430023193359375/64` to full float precision. **Not a sample-rate
+or block-size issue** (task brief's own leading hypotheses) -- both are
+unchanged from the exact, block-render path (`check_correctness()`).
+
+Attempting a less lossy patch -- forcing only the ASTATX bits `_lt_ge_le_gt`
+(`tools/sharc_core/sequencer.py`) reads (`AF`/`AN`/`AZ`/`AV`, all zero, so
+the branch is still deterministically not-taken) at `0x1c4969` itself
+instead of clobbering `F6`/`F4`/`R6` at `0x1c4965` -- lets the real,
+data-dependent `R4` value survive, but immediately hits a NEW fork three
+instructions later (`0xb88f0f`, inside a `CALL 0xb88f06` -- another
+`fcomp`-against-zero divide-by-zero guard, the same shape as `FUN_b88e04`'s
+own recips helper `FRAME_PATCH_TABLE`'s other entry, `0x1C2FEC`, already
+patches): the real `F4` value chases the Unknown deeper into a second,
+sibling reciprocal/divide helper instead of resolving it. `_lt_ge_le_gt`
+itself already does correct per-bit `ASTATX` reasoning (`_astatx_known_bit`,
+not a single all-or-nothing check like the already-fixed `_type_18a` bit
+test) -- so the Unknown here is a genuine gap in whatever computes `F6`/`F4`
+themselves (most likely inside the `fcomp`/recips chain feeding them from
+`FIELD_SAMPLE_LENGTH`), not in the predicate evaluator. Resolving it
+properly needs tracing `FUN_1c4914`'s full semantics and the two recips
+helpers it calls -- out of this lane's own budget; reported, not fixed.
+
 **Frame call path [D].** The audio task loop `0x1c7749`-`0x1c775d` waits
 (`CALL 0xb86b1e`) then calls the block handler `0x1c74cd`, which dispatches
 through the table at `0x25f7b0` = `{0x1c7524, 0x1c75d8, 0x1c763c,
@@ -3927,6 +3971,35 @@ for the neighbouring master-bus parameter table (`0x255fb6`-`0x2560d0`).
 audio-rate content into the master mix `[O]`** -- both the control
 table's real bit layout and whether a genuine "no mixer configured" state
 ever produces signal on real hardware remain open.
+
+**Re-checked with a real device's own per-track gate-source bytes (lane E1,
+2026-09-26) `[C]`.** The "reads all-zero in every capture" premise above no
+longer holds: `out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap` frame 20
+has real, nonzero bytes across the whole per-track gate-source range
+(`0x255908`-`0x25600a`) and a real per-track machine type (RX frame offset
+`0x94 + 2i`, docs/findings/04 -- track index 2 = machine type 2, the only
+one of this capture's own kit tracks with one assigned). Loading this range
+verbatim (masking only the *master-bus parameter table*,
+`0x255fb6`-`0x2560d0`, out -- see `tools/sharc_harness.py`'s
+`MASTER_BUS_TABLE_RANGE` docstring for why) and running 20 continuous
+`block_handler` frames with NO injection hack of any kind still leaves the
+per-track master-stage input (`TRACK_MIX_BASE`), the master mix
+(`0x25f180`/`0x25f200`) and ring A all exactly zero throughout. So the open
+question this section leaves -- whether real gate-source data, as opposed
+to a permanently-zero synthetic one, would make the accumulate loop carry a
+track's samples through -- is answered **no**, at least for this specific
+per-track gate configuration: the gap is not simply "no real data was ever
+loaded here."
+
+This re-check did NOT cover the master-bus parameter table's own real
+content: real, nonzero bytes there deterministically trip a brand-new
+`sharc_core` gap ("unsupported full compute cu=0x3 opcode=0xe0", no public
+semantics) on the SECOND real-frame-driven `block_handler` call -- plausibly
+a real machine type reaching `FUN_1c642a`'s dispatch for the first time
+entering genuine per-machine synthesis code this project has never executed
+before (see `tools/sharc_harness.py`'s `MASTER_BUS_TABLE_RANGE` docstring
+for the full evidence). Whether a real master-bus configuration (as opposed
+to the zeroed one this re-check used) changes the outcome remains open.
 
 **The fix taken: inject past this entire stage, onto the master mix
 itself.** `tools/sharc_harness.py`'s `inject_master_mix()`, applied at

@@ -151,6 +151,13 @@ import sharc_symbols  # noqa: E402
 import sharc_trace as st  # noqa: E402
 from sharcldr import LoadedMemory  # noqa: E402
 
+# emu/ is a sibling of tools/, not on sys.path by default -- same pattern
+# tools/sharc_replay.py's own import block already uses (lane E2's file;
+# not duplicated here, just the same two-line sys.path fix).
+if os.path.dirname(HERE) not in sys.path:
+    sys.path.insert(0, os.path.dirname(HERE))
+from emu import sharc_capture  # noqa: E402
+
 # Firmware addresses (functions, tables) come from tools/sharc_symbols.py's
 # resolve(), not a hardcoded dict: cached per image so repeated calls in one
 # process (render_blocks() in a loop, the test suite) reuse one resolution.
@@ -322,11 +329,30 @@ def load_image_memory(image: str):
 
 
 def _make_runner(
-    memory: LoadedMemory, image: str, start: int, regs: Mapping[str | int, int | str]
+    memory: LoadedMemory,
+    image: str,
+    start: int,
+    regs: Mapping[str | int, int | str],
+    *,
+    provisional_forms: Sequence[str] = (),
+    provisional_interpretations: Mapping[str, str] | None = None,
 ) -> sr.Runner:
     """One place for the Runner options this harness always turns on: state
     that a real boot leaves at reset (0) rather than Unknown, and the numeric
-    recips model (this render path's pitch/rate math divides)."""
+    recips model (this render path's pitch/rate math divides).
+
+    ``provisional_forms``/``provisional_interpretations`` default to empty
+    (unchanged behaviour: an uncertain-decode or no-semantics form still
+    halts) -- passed straight through to ``sr.Runner`` (see its own
+    docstring, and ``sharc_core/state.py``'s ``State.provisional_forms``/
+    ``State.provisional_interpretations``) for a caller that wants to opt
+    into treating a specific, already-confirmed-decode-but-no-semantics
+    form (e.g. ``21p_undoc16`` at 0x1c32b0, this repo's scratchpad
+    STATE.md's "opt-in provisional interpretation") as a no-op instead of
+    stopping the run -- lane E1's own real-frame-bytes renders hit exactly
+    that form from frame 1 onward (a genuinely new fork, not present with
+    an empty synthetic frame); see ``render_frames_to_ring_a()``'s own
+    docstring for how this harness surfaces the same opt-in."""
     return sr.Runner(
         memory,
         start,
@@ -335,6 +361,8 @@ def _make_runner(
         approx_recips=True,
         follow_loaded_calls=True,
         max_call_depth=64,
+        provisional_forms=provisional_forms,
+        provisional_interpretations=provisional_interpretations,
     )
 
 
@@ -358,7 +386,14 @@ class InitResult:
     runner: sr.Runner | None = None
 
 
-def run_init(memory, image: str, *, max_steps: int = 2_000_000) -> InitResult:
+def run_init(
+    memory,
+    image: str,
+    *,
+    max_steps: int = 2_000_000,
+    provisional_forms: Sequence[str] = (),
+    provisional_interpretations: Mapping[str, str] | None = None,
+) -> InitResult:
     """Attempt FUN_1c15e3 (docs/findings/06: no arguments) to its return.
 
     On the 1.16 image it returns after about 1.24 million instructions.
@@ -368,9 +403,20 @@ def run_init(memory, image: str, *, max_steps: int = 2_000_000) -> InitResult:
     is what a real boot leaves before any voice is triggered (see finding
     06's "Init writes": every voice's word +0 is the R8 argument, +0x1b8 is
     0). Pass this to ``new_runner(..., init=...)`` to render from it instead
-    of a bare state.
+    of a bare state. ``render_frames()``/``render_frames_to_ring_a()`` use
+    ``init.runner`` directly (not ``new_runner()``), so
+    ``provisional_forms``/``provisional_interpretations`` given here (see
+    ``_make_runner``'s own docstring) apply to every frame call those
+    functions make afterward, not just to init's own run.
     """
-    runner = _make_runner(memory, image, profile(image).init, {"I6": 0x300000})
+    runner = _make_runner(
+        memory,
+        image,
+        profile(image).init,
+        {"I6": 0x300000},
+        provisional_forms=provisional_forms,
+        provisional_interpretations=provisional_interpretations,
+    )
     try:
         result = runner.run(max_steps=max_steps)
     except Exception as exc:  # pragma: no cover - defensive, see docstring
@@ -1225,6 +1271,189 @@ def write_ring_a_wav(
         write_wav(path, mono, sample_rate=sample_rate)
 
 
+# --- Real capture frame bytes (lane E1, 2026-09-25) -----------------------
+#
+# Every render_frames()/render_frames_to_ring_a() run above (and
+# FRAME_PATCH_TABLE/CONTINUOUS_MIX_SCALAR_PATCH) was built against a
+# completely EMPTY RX frame: setup_frame() only ever poked the three
+# command-dispatch cells, never anything in [0x2558dc, 0x2560de) itself. Per
+# this repo's scratchpad STATE.md ("KEY" item, 2026-09-25): the master-bus
+# parameter table FUN_1c207b decodes every frame (0x255fb6-0x2560d0) and the
+# per-track mix-gate source FUN_1c207b's own dispatch masks come from
+# (0x255908-0x25600a) are BOTH inside that 2,050-byte RX frame at 0x2558dc
+# (offsets 0x6da-0x7f4 and 0x2c-0x72e respectively) -- so every prior
+# "reads all zero" finding about those tables was reading an RX frame this
+# project never populated, not a property of the firmware. The functions
+# below load real RX frame bytes from a tools/sharc_capture_run.py capture
+# (a real device's own DSPI2 traffic) and write them at the same address a
+# real transfer would, so a frame render sees whatever a real device
+# actually put in its own mixer/gate tables.
+#
+# CAPTURE_FRAME_BASE/CAPTURE_FRAME_LEN repeat tools/sharc_replay.py's own
+# RX_BASE/TX_PAYLOAD_BYTES and tools/sharc_framemap.py's FRAME_BASE/
+# FRAME_LEN (docs/findings/06's "The ColdFire frame is mapped into SHARC DM
+# at 0x2558dc", confirmed by execution in tools/sharc_framemap.py) rather
+# than importing either -- tools/sharc_replay.py is lane E2's file for this
+# task, and tools/sharc_framemap.py is a shared analysis tool neither lane
+# owns; the literal itself is already established in three places, so a
+# fourth citing the same evidence is not a new claim.
+CAPTURE_FRAME_BASE = 0x2558DC
+CAPTURE_FRAME_LEN = 0x802  # 2,050 bytes
+
+
+def capture_frame_bytes(cap: sharc_capture.Capture, index: int) -> bytes:
+    """The raw bytes a real device's DSPI2 TX frame ``cap.dspi2_frames[index]``
+    puts at CAPTURE_FRAME_BASE: the first CAPTURE_FRAME_LEN bytes of that
+    frame's own ``.tx`` payload (the ColdFire's TX = the SHARC's RX; see
+    tools/sharc_replay.py's own module docstring point 1 for the same
+    convention, and tools/sharc_framemap.py's ``_frame_tx`` for the same
+    slice). Raises IndexError/ValueError for an out-of-range index or a
+    payload shorter than CAPTURE_FRAME_LEN (should not happen for a
+    ``--full-tx`` capture -- this lane's own capture,
+    out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap, has 2,748-byte
+    payloads throughout)."""
+    if not 0 <= index < len(cap.dspi2_frames):
+        raise IndexError(
+            "capture_frame_bytes: frame %d out of range (0..%d)"
+            % (index, len(cap.dspi2_frames) - 1)
+        )
+    tx = cap.dspi2_frames[index].tx
+    if len(tx) < CAPTURE_FRAME_LEN:
+        raise ValueError(
+            "capture_frame_bytes: frame %d payload is only %d bytes, need %d"
+            % (index, len(tx), CAPTURE_FRAME_LEN)
+        )
+    return bytes(tx[:CAPTURE_FRAME_LEN])
+
+
+def write_capture_frame(state, frame_bytes: bytes) -> None:
+    """Poke FRAME_BYTES (CAPTURE_FRAME_LEN bytes) into DM at
+    CAPTURE_FRAME_BASE, byte for byte -- the same convention
+    tools/sharc_framemap.py's own run uses (``h._poke(state, FRAME_BASE + i,
+    byte, width=1)``), so a real capture's per-track mixer/gate tables read
+    exactly as a real device would have loaded them."""
+    if len(frame_bytes) != CAPTURE_FRAME_LEN:
+        raise ValueError(
+            "write_capture_frame: expected %d bytes, got %d"
+            % (CAPTURE_FRAME_LEN, len(frame_bytes))
+        )
+    for i, byte in enumerate(frame_bytes):
+        _poke(state, CAPTURE_FRAME_BASE + i, byte, width=1)
+
+
+# Frame offsets (relative to CAPTURE_FRAME_BASE) STATE.md's own "KEY" item
+# names as the two ranges to check for the kit-load settle transient: the
+# master-bus parameter table (0x255fb6-0x2560d0 = offset 0x6da-0x7f4) and
+# the per-track mix-gate source (0x255908-0x25600a = offset 0x2c-0x72e).
+SETTLED_FRAME_RANGES: tuple[tuple[int, int], ...] = ((0x6DA, 0x7F4), (0x2C, 0x72E))
+
+
+def find_settled_capture_frame(
+    cap: sharc_capture.Capture,
+    *,
+    ranges: Sequence[tuple[int, int]] = SETTLED_FRAME_RANGES,
+    min_frame: int = 0,
+) -> int | None:
+    """The first frame index >= MIN_FRAME whose own frame bytes
+    (``capture_frame_bytes``) have at least one nonzero byte in every one of
+    RANGES -- past the kit-load settle transient (frame 0 of this lane's own
+    capture reads all-zero in both ranges: the ColdFire has not yet
+    populated the mixer/gate tables). Returns None if no such frame exists.
+
+    This is a coarse gate (some byte nonzero in range), not a stability
+    check. This lane's own scan of
+    out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap (291 frames) found
+    both ranges already nonzero from frame 1 onward (62/561 nonzero bytes),
+    but still drifting (68/659 at frame 2) before settling to a near-constant
+    63/~593-596 from frame 20 on -- this module's own default pick
+    (``DEFAULT_CAPTURE_FRAME_INDEX``) uses ``min_frame=20`` for that reason,
+    not the first frame this function would accept unconstrained."""
+    for index in range(min_frame, len(cap.dspi2_frames)):
+        frame = capture_frame_bytes(cap, index)
+        if all(any(frame[lo:hi]) for lo, hi in ranges):
+            return index
+    return None
+
+
+# This lane's own capture and chosen start frame (see
+# find_settled_capture_frame()'s docstring for why 20, not the first frame
+# that satisfies SETTLED_FRAME_RANGES at all): a real 4-track kit, PLAY
+# running, DSPI2 traffic captured with the full 2,748-byte TX/RX payload
+# (out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap's own header: kind
+# "play", 291 frames). At this frame, the big-endian machine-type word at
+# CAPTURE_FRAME_BASE offset 0x94+2i (docs/findings/04's "The machine type
+# reaches the SHARC, at TX frame offset 0x94 + 2i") is nonzero (value 2)
+# only for track index 2 of the 16 -- the one kit track among the four this
+# capture's own kit populates that has a real machine assigned, per this
+# lane's own report -- every other track offset reads 0.
+DEFAULT_CAPTURE_PATH = "out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap"
+DEFAULT_CAPTURE_FRAME_INDEX = 20
+DEFAULT_CAPTURE_TRACK = 2
+
+
+def load_capture(path: str = DEFAULT_CAPTURE_PATH) -> sharc_capture.Capture:
+    """``emu.sharc_capture.load(path)`` -- re-exported so a caller (this
+    module's own CLI, a test, a caller script) does not need its own
+    ``sys.path``/import dance for ``emu.sharc_capture`` just to load one
+    capture file."""
+    return sharc_capture.load(path)
+
+
+# The master-bus parameter table range (STATE.md's own "KEY" item; see
+# SETTLED_FRAME_RANGES), masked out by default when writing a capture's real
+# frame bytes for more than one consecutive block_handler call.
+#
+# **Root cause of a brand-new gap, found by this lane's own bisection (see
+# the report's full matrix): real, nonzero content in JUST this range --
+# not the per-track gate source (0x2c-0x72e) and not the machine-type table
+# (0x94+2i) -- deterministically trips a sharc_core gap this lane has never
+# seen before ("unsupported full compute cu=0x3 opcode=0xe0") on the SECOND
+# real-frame-driven block_handler call, at the same instruction count every
+# time, even when every subsequent frame's own bytes are held IDENTICAL to
+# the first (so this is not about frame-to-frame content changing; it is
+# about running the per-track dispatch a second time after whatever it did
+# on the first). ``tools/sharc_core/compute.py``'s own CU3_OPS comment
+# already documents this exact caution for cu=3 in general ("PRM: cu=11 not
+# used by SINGLEFN ... there is no evidence it is real or what it would
+# mean") -- this lane extends that caution to opcode 0xe0 specifically, not
+# a new finding about cu=3 as a whole. The likeliest explanation (not
+# confirmed further, out of this lane's own scope) is that a real machine
+# type reaching FUN_1c642a's per-track dispatch for the first time (this
+# repo's scratchpad STATE.md: "FUN_1c60a2 (machine-type change detector)
+# ... a replay with a real 0->2 change saw zero writes there" -- this lane's
+# own real-frame render is, as far as this project's history shows, the
+# first time that detector has actually fired) reaches genuine per-machine
+# synthesis code this project has never executed before, using a compute
+# form with no public semantics -- exciting as a "first contact" with real
+# machine code, but not something this lane may guess an implementation
+# for (this repo's CLAUDE.md: sharc_core fixes need a PRM page, a test, or
+# a widthaudit 0-mismatch proof; none exists here). Masking this one range
+# lets a capture's real machine-type and per-track gate-source data (this
+# lane's own actual target, per STATE.md's KEY item) run for any number of
+# continuous frames instead of stopping after one.
+MASTER_BUS_TABLE_RANGE: tuple[int, int] = SETTLED_FRAME_RANGES[0]
+
+
+def capture_frame_bytes_for_render(
+    cap: sharc_capture.Capture,
+    index: int,
+    *,
+    mask_master_bus_table: bool = True,
+) -> bytes:
+    """``capture_frame_bytes()``, with MASTER_BUS_TABLE_RANGE zeroed by
+    default (see that constant's own docstring for why) -- what
+    ``render_frames_to_ring_a()`` actually writes per frame when given a
+    ``capture``. Pass ``mask_master_bus_table=False`` to get the completely
+    unmodified real bytes (reproduces the new gap from the second real
+    frame on -- useful for confirming the finding, not for a working
+    multi-frame render)."""
+    frame = bytearray(capture_frame_bytes(cap, index))
+    if mask_master_bus_table:
+        lo, hi = MASTER_BUS_TABLE_RANGE
+        frame[lo:hi] = bytes(hi - lo)
+    return bytes(frame)
+
+
 # --- Voice -> track -> master mix -> ring A (lane A2, 2026-09-25) ---------
 #
 # render_frames()/call_frame() above reach a genuine RETURN (FRAME_MILESTONE)
@@ -1400,18 +1629,15 @@ def _float_to_word(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
-def inject_track_buffer(state, record: int, *, track: int = 0) -> list[float]:
-    """Read RECORD's own work buffer (FIELD_WORK_BUFFER, 64 floats -- this
+def read_voice_work_buffer_decimated(state, record: int) -> list[float]:
+    """RECORD's own work buffer (FIELD_WORK_BUFFER, 64 floats -- this
     frame's real interpolated render, already produced by the firmware's
-    own per-voice dispatch call, whether or not FUN_1c642a's own
-    accumulate stage ever sums it into a track buffer -- see this
-    section's own module note), decimate it exactly the way `decimate()`
-    does, and write the 32-sample result as float32 words into both the L
-    and R halves of TRACK's master-stage input buffer
-    (`track_mix_address()`). Mono only (both channels get the same
-    samples) -- there is no evidence yet for a real per-channel pan value
-    to set instead. Returns the 32 decimated floats written, for a caller
-    to inspect or assemble into a WAV alongside ring A."""
+    own per-voice dispatch call, whether or not FUN_1c642a's own accumulate
+    stage ever sums it into a track buffer), decimated 2:1 the same way
+    `decimate()`/the firmware's own `0xb80000` does. Read-only: this is
+    "the voice's own output this frame" for measurement (lane E1's own
+    per-stage comparison), factored out of `inject_track_buffer()` so a
+    caller can read it without also writing it anywhere."""
     work = []
     for i in range(64):
         raw = st._dm_read(state, record + FIELD_WORK_BUFFER + i * 4, 4)
@@ -1420,7 +1646,18 @@ def inject_track_buffer(state, record: int, *, track: int = 0) -> list[float]:
             if raw is not None
             else 0.0
         )
-    decimated = decimate(work)
+    return decimate(work)
+
+
+def inject_track_buffer(state, record: int, *, track: int = 0) -> list[float]:
+    """Read RECORD's own work buffer (see `read_voice_work_buffer_decimated`)
+    and write the 32 decimated samples as float32 words into both the L
+    and R halves of TRACK's master-stage input buffer
+    (`track_mix_address()`). Mono only (both channels get the same
+    samples) -- there is no evidence yet for a real per-channel pan value
+    to set instead. Returns the 32 decimated floats written, for a caller
+    to inspect or assemble into a WAV alongside ring A."""
+    decimated = read_voice_work_buffer_decimated(state, record)
     for i, value in enumerate(decimated):
         word = _float_to_word(value)
         _poke(state, track_mix_address(track, channel="L") + i * 4, word)
@@ -1606,34 +1843,60 @@ def call_frame_with_track_injection(
     patch_table: sv.PatchTable | None = FRAME_PATCH_TABLE,
     max_steps: int = 4_000_000,
     write_master_mix: bool = True,
+    inject_track: bool = True,
+    frame_bytes: bytes | None = None,
 ) -> tuple[sr.Runner, sr.RunResult, list[float]]:
-    """Like `call_frame()`, but calls `inject_track_buffer()` the instant
-    `MASTER_STAGE_CALL_PC` is about to execute -- see this section's own
-    module note for why (the accumulate stage's real enable value is not
-    established). Steps one instruction at a time (not
-    `sharc_survey.run_with_patches()`/`run_collect_all()`) applying
-    `patch_table` the same way `call_frame()` does; a fork this halts on is
-    a genuinely new, unresolved gap (report it, do not add a guess here),
-    not something to drive through with a default branch pick, since this
-    function's whole point is to observe the master stage's own,
-    unperturbed behaviour once it has real per-track input.
+    """Like `call_frame()`, but (when INJECT_TRACK, the default) calls
+    `inject_track_buffer()` the instant `MASTER_STAGE_CALL_PC` is about to
+    execute -- see this section's own module note for why (the accumulate
+    stage's real enable value was not established from a synthetic, empty
+    frame; see FRAME_BYTES below for using a real one instead). Steps one
+    instruction at a time (not `sharc_survey.run_with_patches()`/
+    `run_collect_all()`) applying `patch_table` the same way `call_frame()`
+    does; a fork this halts on is a genuinely new, unresolved gap (report
+    it, do not add a guess here), not something to drive through with a
+    default branch pick, since this function's whole point is to observe
+    the master stage's own, unperturbed behaviour once it has real
+    per-track input.
 
-    When WRITE_MASTER_MIX is true (the default), the SAME 32 samples
-    `inject_track_buffer()` just computed are also written straight into
-    the master mix (`inject_master_mix()`) the instant
-    `MASTER_MIX_INJECT_PC` is about to execute, later in this same
+    `FRAME_BYTES`, if given (`capture_frame_bytes()`'s own return, lane E1),
+    is written at CAPTURE_FRAME_BASE (`write_capture_frame()`) before
+    `fresh_call` -- so this one frame's own render sees a real device's
+    mixer/gate tables, not a blank synthetic frame, for everything except
+    the one voice this harness itself drives via `record`.
+
+    `INJECT_TRACK` (default True) controls whether `inject_track_buffer()`
+    actually pokes TRACK's master-stage input; when False, the voice's own
+    decimated output is still read every call (via
+    `read_voice_work_buffer_decimated()`, the same 32 floats
+    `inject_track_buffer()` would have written) for the returned
+    `injected`/measurement value, but nothing is written to
+    `track_mix_address()` -- for measuring whether real frame data alone
+    (FRAME_BYTES) makes FUN_1c642a's own accumulate loop carry the voice
+    there without this hack.
+
+    When WRITE_MASTER_MIX is true (the default) and INJECT_TRACK is also
+    true, the SAME 32 samples `inject_track_buffer()` just computed are
+    also written straight into the master mix (`inject_master_mix()`) the
+    instant `MASTER_MIX_INJECT_PC` is about to execute, later in this same
     step loop -- see the "why the track buffer never reaches the master
-    mix as audio" module note above `MASTER_MIX_INJECT_PC` for why this is
-    necessary to get a clean tone out at all, not just the accumulate
-    stage's own unperturbed per-track input. Pass `False` to get the old
-    (pre-lane-D1) track-buffer-only behaviour, e.g. to keep studying
-    `FUN_1c207b`'s own per-track dispatch in isolation.
+    mix as audio" module note above `MASTER_MIX_INJECT_PC` for why this was
+    necessary to get a clean tone out of a blank synthetic frame. When
+    INJECT_TRACK is False but WRITE_MASTER_MIX is still True, the voice's
+    own read-only decimated output is written to the master mix directly
+    (bypassing the track buffer and its gate entirely) instead of the
+    track-buffer injection's own result, so the two hacks can be toggled
+    independently. Pass WRITE_MASTER_MIX=False to get the old (pre-lane-D1)
+    track-buffer-only behaviour, or both False to run with no injection
+    hack at all (real frame data, real gate, real dispatch only).
 
-    Returns `(new_runner, RunResult, injected)` where `injected` is
-    `inject_track_buffer()`'s own 32-float return, or `[]` if
-    `MASTER_STAGE_CALL_PC` was never reached (an earlier stop)."""
+    Returns `(new_runner, RunResult, injected)` where `injected` is the 32
+    decimated floats (written or not, depending on the flags above), or
+    `[]` if `MASTER_STAGE_CALL_PC` was never reached (an earlier stop)."""
     p = profile(image)
     new_runner = runner.fresh_call(p.block_handler, diagnose_unknown=True)
+    if frame_bytes is not None:
+        write_capture_frame(new_runner.state, frame_bytes)
     start_pc_sw = new_runner.state.pc_sw
     injected: list[float] = []
     steps = 0
@@ -1642,7 +1905,10 @@ def call_frame_with_track_injection(
     while steps < max_steps:
         pc_sw = new_runner.state.pc_sw
         if pc_sw == MASTER_STAGE_CALL_PC:
-            injected = inject_track_buffer(new_runner.state, record, track=track)
+            if inject_track:
+                injected = inject_track_buffer(new_runner.state, record, track=track)
+            else:
+                injected = read_voice_work_buffer_decimated(new_runner.state, record)
         elif write_master_mix and pc_sw == MASTER_MIX_INJECT_PC:
             inject_master_mix(new_runner.state, injected)
         if patch_table:
@@ -1683,6 +1949,28 @@ def _merge_patch_tables(*tables: sv.PatchTable | None) -> sv.PatchTable:
     return merged
 
 
+def read_track_mix(state, track: int) -> tuple[list[float], list[float]]:
+    """TRACK's own 32+32 planar float32 (L, R) master-stage input words
+    (`track_mix_address()`) -- the same address `inject_track_buffer()`
+    writes and `FUN_1c207b`'s own per-track dispatch reads, for measuring
+    that stage's own content directly (lane E1's "measure at each stage")
+    instead of only inferring it from ring A/master-mix downstream."""
+
+    def read_channel(channel: str) -> list[float]:
+        base = track_mix_address(track, channel=channel)
+        out = []
+        for i in range(TRACK_MIX_CHANNEL_WORDS):
+            raw = st._dm_read(state, base + i * 4, 4)
+            out.append(
+                struct.unpack("<f", struct.pack("<I", raw.value & 0xFFFFFFFF))[0]
+                if raw is not None
+                else 0.0
+            )
+        return out
+
+    return read_channel("L"), read_channel("R")
+
+
 def render_frames_to_ring_a(
     memory,
     image: str,
@@ -1697,6 +1985,12 @@ def render_frames_to_ring_a(
     mix_scalar_patch: sv.PatchTable | None = CONTINUOUS_MIX_SCALAR_PATCH,
     max_steps: int = 4_000_000,
     write_master_mix: bool = True,
+    inject_track: bool = True,
+    capture: sharc_capture.Capture | None = None,
+    capture_frame_start: int | None = None,
+    mask_master_bus_table: bool = True,
+    provisional_forms: Sequence[str] = (),
+    provisional_interpretations: Mapping[str, str] | None = None,
 ) -> dict:
     """Render N frames of one voice's own `freq` Hz sine on ONE continuous
     Runner (one `run_init()`, N `Runner.fresh_call()`s at block_handler via
@@ -1747,21 +2041,85 @@ def render_frames_to_ring_a(
     itself to carry phase since every frame's record restarted at
     `start=0`).
 
+    **CAPTURE (lane E1, 2026-09-25).** If given (an `emu.sharc_capture.load()`
+    result), frame `i`'s own real RX bytes -- `capture_frame_bytes(capture,
+    (capture_frame_start or find_settled_capture_frame(capture,
+    min_frame=DEFAULT_CAPTURE_FRAME_INDEX)) + i)`, wrapping modulo
+    `len(capture.dspi2_frames)` if `n_frames` runs past the end -- are
+    written at CAPTURE_FRAME_BASE before that frame's own call (via
+    `capture_frame_bytes_for_render()`, `MASK_MASTER_BUS_TABLE` -- default
+    True -- zeroing MASTER_BUS_TABLE_RANGE; see that constant's own
+    docstring for why: real content there deterministically trips a
+    brand-new sharc_core gap on the second real-frame call), so FUN_1c642a's
+    per-track dispatch and FUN_1c207b's master-stage compressor see a real
+    device's own machine-type and per-track gate tables (not a blank
+    synthetic frame) for every track except `voice`'s own synthetic tone.
+    Without `capture` (the default, `None`), behaviour is unchanged from
+    before this lane: no frame bytes are written at all.
+
+    `INJECT_TRACK` (default True) and `WRITE_MASTER_MIX` (default True) are
+    passed straight through to `call_frame_with_track_injection()` (see its
+    own docstring): both True is this project's original hack combination;
+    either or both False, together with `capture` given, is how this lane
+    measures whether real frame data removes the need for a given hack --
+    see this module's own report for the actual per-configuration results.
+
+    **`PROVISIONAL_FORMS`/`PROVISIONAL_INTERPRETATIONS` (lane E1).** Passed
+    to `run_init()` (see its own docstring), so they cover every frame this
+    call makes, not just init's own run. Real CAPTURE bytes hit a genuinely
+    new fork from frame 1 onward that an empty synthetic frame never
+    reached: an "uncertain or undecodable form" halt at 0x1c32b0
+    (`21p_undoc16`, this repo's scratchpad STATE.md's own "opt-in
+    provisional interpretation ... stops at 0x1c32b1" note) -- pass
+    `provisional_forms=["21p_undoc16"],
+    provisional_interpretations={"21p_undoc16": "nop"}` to get past it (a
+    `sharc_core`-provided, already-tested opt-in, not a fix made here); left
+    off by default so a caller not using `capture` sees unchanged behaviour.
+
     Returns `{"ring_a_mono": [...], "ring_a_left": [...], "ring_a_right":
-    [...], "per_frame": [...], "any_new_stop": bool}`; `per_frame[i]` is
-    `{"frame", "instructions", "halt", "injected_max_abs",
-    "ring_a_nonzero"}`. Measure `ring_a_left`/`ring_a_right` separately,
-    not `ring_a_mono` -- see the "ring A's own L channel is deliberately
-    negated" module note above `MASTER_MIX_INJECT_PC` for why the mono
-    downmix cancels to silence for a coherent tone.
+    [...], "per_frame": [...], "any_new_stop": bool}`; `per_frame[i]` adds
+    `"track_mix_left"/"track_mix_right"` (`read_track_mix()`, TRACK's own
+    master-stage input after this frame) and `"master_mix"` (`read_master_mix()`,
+    64 floats) to `{"frame", "instructions", "halt", "injected_max_abs",
+    "ring_a_nonzero"}`, for measuring each stage of voice -> track -> master
+    -> ring A per frame, not just the final ring A output. Measure
+    `ring_a_left`/`ring_a_right` separately, not `ring_a_mono` -- see the
+    "ring A's own L channel is deliberately negated" module note above
+    `MASTER_MIX_INJECT_PC` for why the mono downmix cancels to silence for
+    a coherent tone.
     """
-    init = run_init(memory, image)
+    init = run_init(
+        memory,
+        image,
+        provisional_forms=provisional_forms,
+        provisional_interpretations=provisional_interpretations,
+    )
     if not init.ran or init.runner is None:
         raise ValueError("render_frames_to_ring_a: run_init failed: %s" % init.error)
 
     sample_len = _default_sample_len(n_frames, pitch_step)
     sample_base = 0x310000
     combined_patches = _merge_patch_tables(patch_table, mix_scalar_patch)
+
+    capture_start: int | None = None
+    if capture is not None:
+        capture_start = (
+            capture_frame_start
+            if capture_frame_start is not None
+            else find_settled_capture_frame(
+                capture, min_frame=DEFAULT_CAPTURE_FRAME_INDEX
+            )
+        )
+        if capture_start is None:
+            raise ValueError(
+                "render_frames_to_ring_a: capture has no frame past "
+                "min_frame=%d satisfying SETTLED_FRAME_RANGES"
+                % DEFAULT_CAPTURE_FRAME_INDEX
+            )
+        # Narrow for mypy: capture_start is int from here on (the loop
+        # below re-checks `capture is not None`, a separate condition mypy
+        # cannot tie back to this one across the intervening code).
+        assert capture_start is not None
 
     runner = init.runner
     state = runner.state
@@ -1785,6 +2143,13 @@ def render_frames_to_ring_a(
     ring_a_right: list[float] = []
     per_frame: list[dict] = []
     for frame_index in range(n_frames):
+        frame_bytes = None
+        if capture is not None:
+            assert capture_start is not None  # established above; see its own note
+            index = (capture_start + frame_index) % len(capture.dspi2_frames)
+            frame_bytes = capture_frame_bytes_for_render(
+                capture, index, mask_master_bus_table=mask_master_bus_table
+            )
         runner, result, injected = call_frame_with_track_injection(
             runner,
             image,
@@ -1793,6 +2158,8 @@ def render_frames_to_ring_a(
             patch_table=combined_patches,
             max_steps=max_steps,
             write_master_mix=write_master_mix,
+            inject_track=inject_track,
+            frame_bytes=frame_bytes,
         )
         ring = read_ring_a(memory, image, runner)
         left = [v or 0.0 for v in ring["left"]]
@@ -1804,6 +2171,7 @@ def render_frames_to_ring_a(
         ring_a_left.extend(left)
         ring_a_right.extend(right)
         ring_a_mono.extend(mono)
+        track_left, track_right = read_track_mix(runner.state, track)
         per_frame.append(
             {
                 "frame": frame_index,
@@ -1812,6 +2180,9 @@ def render_frames_to_ring_a(
                 "injected_max_abs": max((abs(v) for v in injected), default=0.0),
                 "ring_a_nonzero": sum(1 for v in left if v)
                 + sum(1 for v in right if v),
+                "track_mix_left": track_left,
+                "track_mix_right": track_right,
+                "master_mix": read_master_mix(memory, image, runner),
             }
         )
     return {
@@ -1822,6 +2193,7 @@ def render_frames_to_ring_a(
         "any_new_stop": any(
             f["halt"] != "return without followed call" for f in per_frame
         ),
+        "capture_frame_start": capture_start,
     }
 
 

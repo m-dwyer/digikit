@@ -24,6 +24,7 @@ import sharc_harness as h  # noqa: E402
 import sharc_run as sr  # noqa: E402
 
 DT2_116_BLOB = pathlib.Path("out/sections/dt2-1.16/section_7_BLOB.bin")
+DEFAULT_CAPTURE = pathlib.Path(h.DEFAULT_CAPTURE_PATH)
 SCRATCH = (
     pathlib.Path(os.environ.get("CLAUDE_SCRATCHPAD", "/tmp")) / "test_sharc_harness"
 )
@@ -910,6 +911,175 @@ class RingAMilestoneTest(unittest.TestCase):
         self.assertEqual(
             digest,
             "88335070b1bd16edf007a8f4e67815d50e4c64bcd9e87ab88a0020e42050d071",
+        )
+
+
+@unittest.skipUnless(
+    DEFAULT_CAPTURE.exists(), "the fulltx play capture is not available"
+)
+class CaptureFrameBytesTest(unittest.TestCase):
+    """Lane E1's capture-loading helpers: pure parsing/slicing over a real
+    tools/sharc_capture_run.py capture, no firmware image needed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cap = h.load_capture()
+
+    def test_frame_0_is_not_settled(self):
+        frame0 = h.capture_frame_bytes(self.cap, 0)
+        self.assertEqual(len(frame0), h.CAPTURE_FRAME_LEN)
+        for lo, hi in h.SETTLED_FRAME_RANGES:
+            self.assertFalse(any(frame0[lo:hi]))
+
+    def test_default_capture_frame_index_is_settled(self):
+        idx = h.find_settled_capture_frame(
+            self.cap, min_frame=h.DEFAULT_CAPTURE_FRAME_INDEX
+        )
+        self.assertEqual(idx, h.DEFAULT_CAPTURE_FRAME_INDEX)
+
+    def test_no_settled_frame_past_the_end_returns_none(self):
+        self.assertIsNone(
+            h.find_settled_capture_frame(self.cap, min_frame=len(self.cap.dspi2_frames))
+        )
+
+    def test_machine_type_field_for_default_track(self):
+        # docs/findings/04's "The machine type reaches the SHARC, at TX
+        # frame offset 0x94 + 2i" -- a big-endian word per track.
+        frame = h.capture_frame_bytes(self.cap, h.DEFAULT_CAPTURE_FRAME_INDEX)
+        offset = 0x94 + 2 * h.DEFAULT_CAPTURE_TRACK
+        value = struct.unpack_from(">H", frame, offset)[0]
+        self.assertEqual(value, 2)
+        # No other track has one assigned in this capture (this lane's own
+        # finding -- see DEFAULT_CAPTURE_TRACK's own docstring).
+        for track in range(16):
+            if track == h.DEFAULT_CAPTURE_TRACK:
+                continue
+            other = struct.unpack_from(">H", frame, 0x94 + 2 * track)[0]
+            self.assertEqual(
+                other, 0, "track %d unexpectedly has a machine type" % track
+            )
+
+    def test_out_of_range_index_raises(self):
+        with self.assertRaises(IndexError):
+            h.capture_frame_bytes(self.cap, len(self.cap.dspi2_frames))
+
+    def test_capture_frame_bytes_for_render_masks_only_the_master_bus_range(self):
+        raw = h.capture_frame_bytes(self.cap, h.DEFAULT_CAPTURE_FRAME_INDEX)
+        masked = h.capture_frame_bytes_for_render(
+            self.cap, h.DEFAULT_CAPTURE_FRAME_INDEX
+        )
+        lo, hi = h.MASTER_BUS_TABLE_RANGE
+        self.assertTrue(any(raw[lo:hi]), "fixture assumption: real bytes are nonzero")
+        self.assertFalse(any(masked[lo:hi]))
+        self.assertEqual(raw[:lo], masked[:lo])
+        self.assertEqual(raw[hi:], masked[hi:])
+
+    def test_capture_frame_bytes_for_render_can_leave_it_unmasked(self):
+        raw = h.capture_frame_bytes(self.cap, h.DEFAULT_CAPTURE_FRAME_INDEX)
+        unmasked = h.capture_frame_bytes_for_render(
+            self.cap, h.DEFAULT_CAPTURE_FRAME_INDEX, mask_master_bus_table=False
+        )
+        self.assertEqual(raw, unmasked)
+
+
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+@unittest.skipUnless(
+    DEFAULT_CAPTURE.exists(), "the fulltx play capture is not available"
+)
+class WriteCaptureFrameTest(unittest.TestCase):
+    """write_capture_frame() actually lands the bytes at CAPTURE_FRAME_BASE."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.memory = h.load_image_memory("dt2-1.16")
+        cls.cap = h.load_capture()
+
+    def test_written_bytes_read_back(self):
+        runner = h.new_runner(self.memory, "dt2-1.16")
+        frame = h.capture_frame_bytes(self.cap, h.DEFAULT_CAPTURE_FRAME_INDEX)
+        h.write_capture_frame(runner.state, frame)
+        # Sample every 251st byte (coprime with typical alignment, so this
+        # covers a spread of offsets) rather than reading all 2,050.
+        for i in range(0, len(frame), 251):
+            raw = sr.st._dm_read(runner.state, h.CAPTURE_FRAME_BASE + i, 1)
+            self.assertEqual(raw.value & 0xFF, frame[i])
+
+    def test_wrong_length_raises(self):
+        runner = h.new_runner(self.memory, "dt2-1.16")
+        with self.assertRaises(ValueError):
+            h.write_capture_frame(runner.state, b"\x00" * 10)
+
+
+@pytest.mark.slow
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+@unittest.skipUnless(
+    DEFAULT_CAPTURE.exists(), "the fulltx play capture is not available"
+)
+class RealFrameRingAMilestoneTest(unittest.TestCase):
+    """render_frames_to_ring_a()'s own milestone with REAL capture frame
+    bytes (lane E1, 2026-09-26), replacing RingAMilestoneTest's synthetic,
+    permanently-empty RX frame as the reference configuration this project
+    now targets.
+
+    **Two of RingAMilestoneTest's three hacks are gone.** With the real
+    per-track gate source and machine type (track `DEFAULT_CAPTURE_TRACK`)
+    driving `FUN_1c642a`'s dispatch -- master-bus table masked out (see
+    `MASTER_BUS_TABLE_RANGE`'s own docstring for why) -- this lane's own
+    16/20/384-frame experiments (see its report) found `inject_track_buffer`
+    (`inject_track=False` here) and `CONTINUOUS_MIX_SCALAR_PATCH`
+    (`mix_scalar_patch=None` here) make NO difference to ring A's own output
+    once `inject_master_mix` (`write_master_mix=True`, still the one
+    surviving hack -- the real per-track accumulate path still does not
+    carry a track's samples to the master mix even with this real gate data,
+    see docs/findings/06's own "[C]" update) is active. `FRAME_PATCH_TABLE`
+    stays: its own two forks (`0x1c2fec`, `0x1c4965`) are unrelated to
+    per-track mixing.
+
+    Real frame data changes the render's own instruction count per frame
+    (fewer instructions once the gate data lets more of the per-track
+    dispatch actually run its "has content" branches instead of the
+    "everything is zero" default path) and, unlike RingAMilestoneTest's
+    permanently-empty frame, is genuine, real-device data -- so this is a
+    NEW pin, not a refinement of the old one; both are kept (RingAMilestoneTest
+    still exercises the capture=None/backward-compatible path with an
+    unchanged hash)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.memory = h.load_image_memory("dt2-1.16")
+        cls.cap = h.load_capture()
+
+    def test_eight_frame_real_frame_ring_a_milestone(self):
+        result = h.render_frames_to_ring_a(
+            self.memory,
+            "dt2-1.16",
+            n_frames=8,
+            voice=0,
+            freq=1000.0,
+            track=h.DEFAULT_CAPTURE_TRACK,
+            capture=self.cap,
+            capture_frame_start=h.DEFAULT_CAPTURE_FRAME_INDEX,
+            inject_track=False,
+            write_master_mix=True,
+            mix_scalar_patch=None,
+        )
+        self.assertFalse(result["any_new_stop"])
+        self.assertEqual(result["capture_frame_start"], h.DEFAULT_CAPTURE_FRAME_INDEX)
+        for frame in result["per_frame"]:
+            self.assertEqual(frame["halt"], "return without followed call")
+
+        left = result["ring_a_left"]
+        right = result["ring_a_right"]
+        self.assertEqual(len(left), 8 * 32)
+        self.assertEqual(len(right), 8 * 32)
+        self.assertGreater(max(abs(v) for v in left), 0.0)
+        self.assertGreater(max(abs(v) for v in right), 0.0)
+
+        rounded = [round(v, 6) for v in left] + [round(v, 6) for v in right]
+        digest = hashlib.sha256(repr(rounded).encode()).hexdigest()
+        self.assertEqual(
+            digest,
+            "4164f02956ae73c2ee8de616ea3177cc1075e6c9ad9dcdf2cedcf387185a2177",
         )
 
 
