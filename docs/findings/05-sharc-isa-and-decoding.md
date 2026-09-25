@@ -946,3 +946,189 @@ None is resolved to `0x252658` yet. **[D][O]**
   the live tracer/runner, so that fix is silent here and only changes
   `tools/sharc.py` query results. Updated with `uv run python
   tests/test_sharc_golden.py --update`. **[V]**
+
+## One decode path: `decode_at()` now makes the database's own width/form choice **[V]**
+
+- Instruction decoding used to happen two ways that disagreed. The program
+  database (`tools/sharcdb.py build`, via `tools/sharcimm.py`'s
+  `decode_all()`) walks a whole code block and re-checks a wide form's own
+  width choice against its successors (`_prefer_confident_widths`, see the
+  "Type22a is idle"-era `_WIDTH_LOOKAHEAD` comment this section's history
+  carries): a wide form that only wins `tools/sharc_isa.py`'s
+  `select_frame()` on a leading-fixed-bits tie is rejected in favour of a
+  narrower form when the narrower reading decodes confidently for
+  `WIDTH_LOOKAHEAD` (8) more instructions where the wide reading does not,
+  or independently rejoins one of the wide reading's own successor
+  boundaries. `tools/sharc_core.sequencer.decode_at()` -- the tracer's and
+  concrete runner's only decode entry -- instead called `select_frame()`
+  once, with no successor context, so it kept the wide form in exactly the
+  cases the database's second pass exists to reject.
+- **Measured first** (`tools/sharc_coverage.py <image> --compare-decode-at`,
+  now a permanent, reusable check -- `compare_decode_at()` in that file):
+  for every `aligned=1` row of the `insn` table in all four images, decode
+  at that row's `sw` with `decode_at()` against this image's own
+  `LoadedMemory` (no database access), and compare width, form and fields.
+  Before the fix:
+
+  | image | aligned rows | stale-bytes (excluded, see below) | decode_at mismatches | all classified as |
+  |---|---:|---:|---:|---|
+  | dt2-1.16 | 51,032 | 2,269 | 49 | width |
+  | dn2-1.11 | 65,372 | 12,661 | 46 | width |
+  | dt2-1.15C | 50,983 | 2,269 | 49 | width |
+  | dn2-1.10E | 64,586 | 12,075 | 47 | width |
+
+  Every mismatch was one of exactly two `(db_form, decode_at_form, width)`
+  patterns, on every image: `2c`(2 bytes) vs `2b`(4 bytes) -- 44-47 of them
+  -- and `22c`(2 bytes) vs `22p_undoc48`(6 bytes) -- 2 of them. Both are
+  the wide-wins-a-leading-bits-tie pattern the database's second pass
+  already corrects; none was a form choice among same-width candidates or
+  a fields-only difference. DT2 1.16's two `2c`/`2b` instances at `sw
+  0x1c502b` and `sw 0x1c59ce` are exactly `tools/sharc_harness.py`'s
+  `_KNOWN_BAD_DECODE_PCS` workaround (that module's own docstring already
+  named this "a systematic decode-table/disassembler bug, not two isolated
+  ones" and asked for it to be reported rather than patched locally) -- the
+  fix below makes that workaround unnecessary, though `sharc_harness.py`
+  is lane A2's file and was not edited here. **[V]**
+- **Fix: one function.** `tools/sharc_disasm.py` gained
+  `resolve_confident_width(pos, insn, raw_at, narrow_at, lookahead)`, the
+  width/form decision itself, position- and source-agnostic (a byte offset
+  into a flat buffer, or twice a short-word PC for loader-backed memory);
+  `NEVER_ALIGNED_FORMS` and `WIDTH_LOOKAHEAD` moved there with it as the
+  decoder's own policy constants. Two entry points call it:
+  `decode_confident(data, offset)` (flat buffer) and
+  `decode_confident_loaded(reader, pc_sw)` (loader-backed memory), both
+  failing closed exactly as `disassemble()`/`decode_loaded_at()` already do
+  when nothing decodes at all. `NEVER_ALIGNED_FORMS` is excluded only from
+  a *successor* in the width-lookahead chain (matching `decode_all()`'s
+  `table.get()`, which never records one as "aligned" real code either),
+  not from the PC the caller asked to decode directly: an earlier version
+  of this fix also refused to decode a `NEVER_ALIGNED_FORMS` pattern landed
+  on directly, which broke `tests/test_sharc_trace.py`'s
+  `PhaseAOpcodeRegressionTest` (it decodes a synthetic Type10a_rel at PC 0
+  on purpose, to check the form's own split `reladdr` fields -- a
+  legitimate use `decode_at()` never promised to refuse). The database has
+  no opinion on such a PC at all, not a "definitely not code" one, so
+  `decode_confident()`/`decode_confident_loaded()` do not either.
+  `tools/sharc_core.sequencer.decode_at()` (the only file this task
+  was allowed to change in `sharc_core/`) now calls these instead of a bare
+  `disassemble()`/`decode_loaded_at()` call -- no database access at decode
+  time, exactly the emulator's own constraint. `tools/sharcimm.py`'s
+  `decode_all()` was refactored to call `resolve_confident_width()` too,
+  passing its own memoized `table.get` as `raw_at` so a whole-image walk
+  stays O(n) instead of re-decoding each lookahead step; `_NEVER_ALIGNED_
+  FORMS`/`_narrow_candidates`/`_confident_reach`/`_prefer_confident_widths`
+  no longer exist as a second, separately-maintained copy of the same
+  logic. This is a pure refactor of `decode_all()`: rebuilding
+  `out/sharcdb/dt2-1.16.sqlite` (private per-lane copy) before and after
+  gives byte-identical `insn` rows (107,911 of them) and identical row
+  counts in every other table (`functions`, `edges`, `mem_access`,
+  `dataref`, `regdef`, `reguse`, `reach`, `ptr`, ...) -- `DB_VERSION` stays
+  at 12, no rebuild is required for anyone reading an existing database.
+  **[V]**
+- **After the fix**, the same `--compare-decode-at` check gives 0
+  mismatches on all four images (stale-bytes counts unchanged, see below):
+
+  | image | aligned rows | stale-bytes | decode_at mismatches |
+  |---|---:|---:|---:|
+  | dt2-1.16 | 51,032 | 2,269 | 0 |
+  | dn2-1.11 | 65,372 | 12,661 | 0 |
+  | dt2-1.15C | 50,983 | 2,269 | 0 |
+  | dn2-1.10E | 64,586 | 12,075 | 0 |
+
+  **[V]**
+- **"Stale-bytes" is a separate, real thing this check surfaces, not a
+  decode bug.** For 2,269 of DT2 1.16's/1.15C's aligned rows (12,661 /
+  12,075 for DN2 1.11/1.10E) -- all of DT2 1.16's in loader block 1, `sw
+  0x120203`-`0x12161b` -- the database's own recorded `raw` bytes for that
+  row do not match what `LoadedMemory.read_sw()` returns at the same `sw`
+  today. Cause: block 1 is a `code` loader block (`base_sw` `0x1201f8`,
+  10,312 bytes), but its whole byte range is overwritten in the same boot
+  stream by later blocks (mostly one large 86,216-byte `FILL` of zeros,
+  block 18, plus a few small `data` patches) before `LoadedMemory`'s
+  documented last-write-wins resolution reaches a final answer -- so the
+  bytes `tools/sharcdb.py`'s per-block scan decoded were never resident in
+  the image the emulator (or `decode_at()`) actually runs from. DN2 1.11/
+  1.10E's larger counts are the same block-1 pattern (2,269 rows) plus a
+  second, larger, not-yet-characterized block (block 57, 10,392/9,806
+  rows) -- open. `compare_decode_at()` treats this as a third outcome
+  (`stale_bytes`), skipped rather than compared, so it cannot masquerade
+  as a decode mismatch; the check first appends `raw` bytes to the query
+  (`_raw_le_bytes()`, the 16-bit-little-endian-word packing `tools/sharc_isa.py`'s
+  `frame_of()`/`DecodedInstruction.raw` use) and compares against
+  `read_sw()` before ever calling `decode_at()`. **[V][O]** (real and
+  reproducible; whether block 1 is dead scratch code from an earlier boot
+  stage or something worth modelling is open, and is lane A2/whoever owns
+  `sharc_core/memory.py`'s question, not a decode-path one).
+- **Golden.** Only `trace_voice` changed (`cov_render`, `cov_all`,
+  `run_voice`, `run_frame`, `trace_frame` are byte-identical). Compared
+  old vs. new `output("trace_voice")` directly (not just the hash, by
+  running the pre-fix code from a checked-out copy of the four changed
+  files): 9 of 76 states differ, all in the same way, all downstream of
+  the `sw 0x1c502b` fix -- the old run stopped there
+  ("unsupported full compute cu=0x0 opcode=0x0", the wrong `2b` decode's
+  compute field), the new run executes the correct `2c` (`R0 =
+  add(R0, R0)`), advances to `sw 0x1c502c`, and keeps going until it hits
+  this case's own `--max-states 64` cap instead. No other state, and no
+  other case, differs. Updated with `uv run python
+  tests/test_sharc_golden.py --update`. **[V]**
+- **Gap triage** (`tools/sharc_coverage.py dt2-1.16 --root 0x1c2b24` /
+  `--all-roots`, unchanged counts before and after the fix -- render path 3
+  gap instructions, all roots 11):
+  - **`sw 0x1c32b0` (`21p_undoc16`, 2 bytes) and `sw 0x1c32b4`
+    (`8p_undoc48`, 6 bytes).** Real code: bytes match the database exactly
+    (not stale), `decode_at()` agrees with the database's width and form
+    (successor-confident -- both sit in a dense, ordinary compiled
+    sequence of `2a_short`/`14a`/`17a`/`8a_rel` around them, `sw
+    0x1c32a0`-`0x1c32c8`). The one-decode-path fix does not touch either
+    -- they were already correct before it, since neither is a
+    wide-vs-narrow width dispute. What they need: real semantics.
+    `decode_table.json` marks both `unconfirmed_bits` (their `source`
+    reads "firmware only" territory, the same status Type3d/4d/14d had
+    before that section's two-source promotion above) -- someone still
+    needs to find what SHARC+ instruction these bit patterns actually
+    encode, from a manual page not yet cross-referenced or from more
+    firmware corroboration, the way the Type3d/4d/14d section above did.
+    **[O]**
+  - **`sw 0x1c32b1` (`1a`, `cu=3 opcode=0xe0`) and, all-roots only, `sw
+    0xb88e8b` (`2a_short`, `cu=2 opcode=0x40`) / `sw 0xb88edb`
+    (`5a_move`, `cu=2 opcode=0x40`, both in loader block 69, the L2
+    decimator region -- `tools/sharc_harness.py`'s `ADDRESSES["decimator"]
+    = 0xb80000`).** Real code, bytes match, decode already confident and
+    already agrees with the database. `sharc_coverage.py`'s "compute" gap
+    kind means exactly what it says: `sharc_trace._compute`/`sharc_core.
+    forms_compute` has no handler for these `cu`/`opcode` combinations. Not
+    a decode-path issue at all -- these three need a compute-opcode
+    handler, in files this task does not own (`sharc_core/forms_compute.py`,
+    `compute_alu.py`, `compute_mult.py`). **[O]**
+  - **`sw 0x1208e4`, `0x1208ff`, `0x12096d`, `0x12099c`, `0x1209b5`,
+    `0x1209c4` (`26a`, uncertain, all-roots only).** All six are inside
+    loader block 1 -- the exact stale-bytes region above. The database
+    decodes block 1's own (overwritten-before-boot) bytes as `26a` (SYNC,
+    still `unconfirmed_bits`); `decode_at()`, reading the same `sw`
+    through `LoadedMemory`, sees the all-zero bytes actually resident
+    there and confidently decodes `21a` (the idle/NOP-like catch-all) --
+    exactly what `--compare-decode-at` reports as `stale_bytes` for these
+    six rows, not a decode mismatch. Verdict: **not real code** in the
+    image the emulator boots into, and **not a live decode disagreement**
+    either -- the database's per-block scan simply analyzed input bytes
+    that never reach the final image. The one-decode-path fix cannot
+    "resolve" this (there is no live candidate to choose differently
+    between; the input itself differs), and fixing it for real means
+    teaching `tools/sharcdb.py`'s block scan to skip -- or teaching
+    `sharc_coverage.py`'s gap report to exclude -- a `code` block a later
+    block in the same stream fully overwrites, which is a database/
+    lifecycle change, not a decoder one. **[V][O]**
+- **Tests.** `tests/test_sharc_coverage.py` (new): `_raw_le_bytes()`
+  against a real DT2 1.16 example; `compare_decode_at()`'s four
+  classifications (agreeing, stale-bytes, width, form, fields mismatch) on
+  hand-built images; `RealImageAgreementTest` asserts 0 mismatches on the
+  real DT2 1.16 database (skipped when the blob is absent -- the
+  acceptance fact behind this section). `tests/test_sharc_disasm.py`
+  gained `ConfidentDecodeTest`: `decode_confident()`/`decode_confident_
+  loaded()` reproduce `tests/test_sharcimm.py`'s existing
+  `WidthPreferenceTest` fixture; both still decode a `NEVER_ALIGNED_FORMS`
+  pattern landed on directly (`_raw_at_flat`/`_raw_at_loaded` exclude it
+  only from a successor chain, checked directly too); `decode_confident_
+  loaded()` fails closed on a genuinely unmapped loader PC.
+  `tests/test_sharcimm.py`'s own tests (unchanged) still pass, since
+  `decode_all()`'s behaviour is unchanged. **[V]**

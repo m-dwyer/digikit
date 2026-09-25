@@ -10,9 +10,12 @@ sys.path.insert(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"),
 )
 
+from test_sharcldr import block  # noqa: E402
+
 import sharc_disasm  # noqa: E402
 import sharc_visa_tables as T  # noqa: E402
 import sharccompare  # noqa: E402
+import sharcldr  # noqa: E402
 
 
 def encode(name, extra=0):
@@ -170,6 +173,116 @@ class CompareTest(unittest.TestCase):
             sharccompare.compare(ours, spec, 5)["same_form"],
             sharccompare.compare(ours, spec, 5)["common_instructions"],
         )
+
+
+def _pack48(value):
+    """Little-endian bytes of a raw 48-bit word (test_sharcimm.py's helper,
+    duplicated rather than cross-imported to avoid a test-module cycle)."""
+    words = [(value >> (48 - 16 * (i + 1))) & 0xFFFF for i in range(3)]
+    return struct.pack("<3H", *words)
+
+
+def _insn17a(ureg, value):
+    return encode(
+        "17a",
+        put(
+            "17a",
+            **{
+                "ureg[6:0]": ureg,
+                "data[31:16]": value >> 16,
+                "data[15:0]": value & 0xFFFF,
+            },
+        ),
+    )
+
+
+def put(name, **values):
+    fields = T.get_type(name)["fields"]
+    extra = 0
+    for label, value in values.items():
+        hi, lo = fields[label]
+        extra |= value << lo
+    return extra
+
+
+class ConfidentDecodeTest(unittest.TestCase):
+    """tools/sharc_disasm.resolve_confident_width()'s two entry points --
+    decode_confident() (flat buffer) and decode_confident_loaded() (loader-
+    backed memory) -- both used by tools/sharc_core.sequencer.decode_at(), so
+    a single-PC decode makes the identical width/form choice a whole-image
+    walk (tools/sharcimm.py's decode_all(), tests/test_sharcimm.py's
+    WidthPreferenceTest) makes. See docs/findings/05-sharc-isa-and-decoding.md,
+    "One decode path"."""
+
+    def test_flat_prefers_narrower_form_over_naive_wide_pick(self):
+        # Same fixture as tests/test_sharcimm.py's WidthPreferenceTest: word0
+        # is Type2c (16 bits) but also satisfies Type2b's (32-bit) mask, and
+        # select_frame() alone picks the wider form on the leading-fixed-bits
+        # tie-break -- until real code follows and its own run breaks down.
+        word0 = encode("2c", 0)
+        naive = next(sharc_disasm.disassemble(word0 + b"\x00" * 24, 0, count=1))
+        self.assertEqual(naive.type_name, "2b")  # sanity: naive pick is wrong
+
+        filler = b"".join(_insn17a(4 + (i % 8), 0x1000 + i) for i in range(12))
+        data = word0 + filler
+        resolved = sharc_disasm.decode_confident(data, 0)
+        self.assertEqual((resolved.type_name, resolved.length_bytes), ("2c", 2))
+
+    def test_flat_lands_on_never_aligned_form_directly_and_still_decodes(self):
+        # decode_confident() only excludes NEVER_ALIGNED_FORMS from a
+        # *successor* chain (see _raw_at_flat below); landing on one
+        # directly still decodes it -- decode_all()'s table simply has no
+        # verdict on a PC only reachable this way (never "aligned" real
+        # code), not a "this PC is definitely not code" one. See
+        # tests/test_sharc_trace.py's PhaseAOpcodeRegressionTest, which
+        # relies on this for Type10a_rel's own field layout.
+        data = _pack48(0xE00000000000)  # a pure Type10a_rel decode trap
+        resolved = sharc_disasm.decode_confident(data, 0)
+        self.assertEqual((resolved.type_name, resolved.kind), ("10a_rel", "confident"))
+
+    def test_raw_at_flat_excludes_never_aligned_forms(self):
+        # The successor-chain exclusion decode_confident() does keep, so a
+        # wide form's own chain "breaking" on a decode-trap word is treated
+        # exactly as decode_all()'s table.get() treats it: as no successor
+        # at all (DT2 1.16 sw 0x1c4b99, tests/test_sharcimm.py's
+        # WidthPreferenceTest).
+        data = _pack48(0xE00000000000)
+        self.assertIsNone(sharc_disasm._raw_at_flat(data, 0))
+
+    def test_loaded_matches_flat_on_the_same_bytes(self):
+        word0 = encode("2c", 0)
+        filler = b"".join(_insn17a(4 + (i % 8), 0x1000 + i) for i in range(12))
+        data = word0 + filler
+        flat = sharc_disasm.decode_confident(data, 0)
+
+        sw = 0x100000
+        addr = sharcldr.sw_to_byte(sw)
+        mem = sharcldr.LoadedMemory.from_stream(block(0, addr, len(data), payload=data))
+        loaded = sharc_disasm.decode_confident_loaded(mem, sw)
+        self.assertEqual(
+            (loaded.type_name, loaded.length_bytes), (flat.type_name, flat.length_bytes)
+        )
+        self.assertEqual(loaded.fields, flat.fields)
+
+    def test_loaded_lands_on_never_aligned_form_directly_and_still_decodes(self):
+        sw = 0x100000
+        addr = sharcldr.sw_to_byte(sw)
+        data = _pack48(0xE00000000000)
+        mem = sharcldr.LoadedMemory.from_stream(block(0, addr, len(data), payload=data))
+        resolved = sharc_disasm.decode_confident_loaded(mem, sw)
+        self.assertEqual((resolved.type_name, resolved.kind), ("10a_rel", "confident"))
+
+    def test_raw_at_loaded_excludes_never_aligned_forms(self):
+        sw = 0x100000
+        addr = sharcldr.sw_to_byte(sw)
+        data = _pack48(0xE00000000000)
+        mem = sharcldr.LoadedMemory.from_stream(block(0, addr, len(data), payload=data))
+        self.assertIsNone(sharc_disasm._raw_at_loaded(mem, 2 * sw))
+
+    def test_loaded_unmapped_pc_fails_closed(self):
+        mem = sharcldr.LoadedMemory.from_stream(b"")
+        resolved = sharc_disasm.decode_confident_loaded(mem, 0x100000)
+        self.assertEqual(resolved.kind, "unknown")
 
 
 if __name__ == "__main__":

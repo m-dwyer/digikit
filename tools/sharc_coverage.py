@@ -15,6 +15,14 @@ modify, long-word access, unresolved predicates): they depend on state.
 
     uv run python tools/sharc_coverage.py dt2-1.16 --root 0x1c2b24
     uv run python tools/sharc_coverage.py dt2-1.16 --all-roots --json
+
+Also compares the two decode paths this project keeps in sync (see
+docs/findings/05-sharc-isa-and-decoding.md, "One decode path"):
+tools/sharcdb.py's whole-image successor-confidence walk (the `insn` table)
+against tools/sharc_core.sequencer.decode_at()'s single-PC decode, for every
+aligned instruction:
+
+    uv run python tools/sharc_coverage.py dt2-1.16 --compare-decode-at
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import networkx as nx  # noqa: E402
 import sharc  # noqa: E402
 import sharc_trace  # noqa: E402
 from sharc_core.forms import FORMS  # noqa: E402
+from sharc_core.sequencer import decode_at  # noqa: E402
 
 ONE = sharc_trace.Const(0x3F800000)
 SHIFT_IMMEDIATE_FORMS = ("6b_shiftimm", "6a_mem")
@@ -137,6 +146,106 @@ def coverage(img, functions=None):
     }
 
 
+def _raw_le_bytes(raw, width):
+    """The little-endian byte sequence a WIDTH-byte, MSB-aligned raw
+    instruction value occupies in memory: 16-bit little-endian words, most
+    significant short word first (tools/sharc_disasm.py's module docstring;
+    the same packing tools/sharc_isa.py's frame_of()/DecodedInstruction.raw
+    use)."""
+    words = width // 2
+    out = bytearray()
+    for i in range(words):
+        out += ((raw >> (16 * (words - 1 - i))) & 0xFFFF).to_bytes(2, "little")
+    return bytes(out)
+
+
+def compare_decode_at(img, example_cap=25):
+    """For every aligned instruction in IMG, compare tools/sharcdb.py's own
+    decode (the `insn` table row: width, form, fields -- built by
+    tools/sharcimm.py's successor-confidence walk over one loader block's own
+    payload bytes) against tools/sharc_core.sequencer.decode_at() at the same
+    short-word PC, run against this image's own LoadedMemory (the merged,
+    last-write-wins final boot image; no database access at decode time).
+    -> {image, total, stale_bytes, mismatches, by_kind, by_key, examples}:
+
+    - stale_bytes: rows skipped because LoadedMemory's bytes at that PC
+      already differ from the database's own recorded `raw` bytes for that
+      row -- not a decode disagreement, since the two paths are not even
+      decoding the same bytes. Seen on dt2-1.16 block 1 (sw 0x120203-
+      0x12161b): a 'code' loader block whose whole byte range a later block
+      in the same boot stream overwrites (mostly with a large FILL of
+      zeros) before the image LoadedMemory models is reached, so the
+      database's per-block scan decoded bytes that never persist into the
+      image the emulator (and decode_at) actually runs from. Not fixable by
+      a decoder change; reported separately so it does not mask genuine
+      decode disagreements.
+    - by_kind (bytes-agreeing rows only): counts of "width" (decode_at chose
+      a different instruction length), "form" (same width, different form)
+      and "fields" (same width and form, different decoded field values)
+      mismatches -- a row is classified by the first of these that differs.
+    - by_key: one row per (db_form, decode_at_form, db_width,
+      decode_at_width) combination, most frequent first.
+    """
+    mem = img._mem()
+    rows = img.sql(
+        "SELECT sw, width, raw, form, fields FROM insn WHERE image=? AND aligned=1",
+        img.name,
+    )
+    total = len(rows)
+    by_key = collections.Counter()
+    by_kind = collections.Counter()
+    stale_bytes = 0
+    examples = []
+    for sw, db_width, db_raw_hex, db_form, db_fields_json in rows:
+        if db_width and db_raw_hex is not None:
+            want = _raw_le_bytes(int(db_raw_hex, 16), db_width)
+            if mem.read_sw(sw, db_width) != want:
+                stale_bytes += 1
+                continue
+        insn = decode_at(mem, None, sw)
+        at_width, at_form = insn.length_bytes, insn.type_name
+        db_fields = json.loads(db_fields_json or "{}")
+        if at_width == db_width and at_form == db_form and insn.fields == db_fields:
+            continue
+        if at_width != db_width:
+            kind = "width"
+        elif at_form != db_form:
+            kind = "form"
+        else:
+            kind = "fields"
+        by_kind[kind] += 1
+        by_key[(db_form, at_form, db_width, at_width)] += 1
+        if len(examples) < example_cap:
+            examples.append(
+                {
+                    "sw": "0x%x" % sw,
+                    "kind": kind,
+                    "db_form": db_form,
+                    "decode_at_form": at_form,
+                    "db_width": db_width,
+                    "decode_at_width": at_width,
+                }
+            )
+    return {
+        "image": img.name,
+        "total": total,
+        "stale_bytes": stale_bytes,
+        "mismatches": sum(by_kind.values()),
+        "by_kind": dict(by_kind),
+        "by_key": [
+            {
+                "db_form": k[0],
+                "decode_at_form": k[1],
+                "db_width": k[2],
+                "decode_at_width": k[3],
+                "count": v,
+            }
+            for k, v in sorted(by_key.items(), key=lambda kv: -kv[1])
+        ],
+        "examples": examples,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("image", help="database name, e.g. dt2-1.16")
@@ -154,9 +263,44 @@ def main(argv=None):
     parser.add_argument(
         "--fail", action="store_true", help="exit 1 when any gap remains"
     )
+    parser.add_argument(
+        "--compare-decode-at",
+        action="store_true",
+        help="compare sharc_core.sequencer.decode_at() against the database's own "
+        "decode for every aligned instruction, instead of the tracer-coverage report",
+    )
     args = parser.parse_args(argv)
 
     img = sharc.load(args.image)
+
+    if args.compare_decode_at:
+        result = compare_decode_at(img)
+        if args.json:
+            print(json.dumps(result, indent=1))
+        else:
+            print(
+                "%s: %d aligned instructions, %d stale-bytes (skipped), "
+                "%d decode_at mismatches"
+                % (
+                    result["image"],
+                    result["total"],
+                    result["stale_bytes"],
+                    result["mismatches"],
+                )
+            )
+            for row in result["by_key"]:
+                print(
+                    "%6d  db=%-14s decode_at=%-14s db_width=%-4s decode_at_width=%-4s"
+                    % (
+                        row["count"],
+                        row["db_form"],
+                        row["decode_at_form"],
+                        row["db_width"],
+                        row["decode_at_width"],
+                    )
+                )
+        return 1 if args.fail and result["mismatches"] else 0
+
     result = coverage(img, function_set(img, args.root, args.all_roots))
     if args.kind:
         result["gaps"] = [g for g in result["gaps"] if g["kind"] == args.kind]

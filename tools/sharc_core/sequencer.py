@@ -5,7 +5,11 @@ Moved verbatim from tools/sharc_trace.py.
 
 from __future__ import annotations
 
-from sharc_disasm import Instruction, decode_loaded_at, disassemble
+from sharc_disasm import (
+    Instruction,
+    decode_confident,
+    decode_confident_loaded,
+)
 from sharcldr import LoadedMemory
 
 from .encoding import (
@@ -46,9 +50,15 @@ from .values import (
 def decode_at(
     data: bytes | LoadedMemory, base_sw: int | None, pc_sw: int
 ) -> Instruction:
-    """Decode exactly at PC_SW from a flat image or loader-backed memory."""
+    """Decode exactly at PC_SW from a flat image or loader-backed memory,
+    with sharc_disasm.resolve_confident_width()'s successor-confidence width
+    correction applied -- the same one tools/sharcdb.py's whole-image build
+    makes (via tools/sharcimm.py's decode_all()), so a PC that is a real,
+    aligned instruction in the program database decodes identically here,
+    from the image alone (see docs/findings/05-sharc-isa-and-decoding.md,
+    "One decode path")."""
     if isinstance(data, LoadedMemory):
-        return decode_loaded_at(data, pc_sw)
+        return decode_confident_loaded(data, pc_sw)
     if base_sw is None:
         raise ValueError("base_sw is required for flat image decoding")
     offset = (pc_sw - base_sw) * 2
@@ -56,7 +66,7 @@ def decode_at(
         return Instruction(
             offset, None, "unknown", kind="unknown", note="PC outside image"
         )
-    return next(disassemble(data, start_offset=offset, count=1))
+    return decode_confident(data, offset)
 
 
 def _advance(state: State, insn: Instruction) -> list[State]:

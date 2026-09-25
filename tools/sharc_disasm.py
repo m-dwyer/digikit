@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from sharc_isa import load_instruction_set
+from sharc_isa import frame_of, load_instruction_set
 from sharc_visa_tables import TYPES, get_type
 
 ISA = load_instruction_set()
@@ -196,6 +196,222 @@ def decode_loaded_at(reader: ShortWordReader, pc_sw: int) -> Instruction:
             return next(disassemble(window, count=1))
     return Instruction(
         0, None, "unknown", kind="unknown", note="PC unmapped in loader memory"
+    )
+
+
+# --- Successor-confidence width correction -----------------------------
+#
+# tools/sharc_isa.py's InstructionSet.select_frame() ranks matching forms by
+# leading fixed bits, so a wider form whose header shares a narrower form's
+# prefix always wins the tie even when every one of its confirmed bits sits
+# inside the first word(s) -- it has verified nothing a narrower reading
+# didn't already verify, and its "extra" word(s) are free bits that decode
+# into *something* almost any time (DT2 1.16 sw 0x1c4b99: Type2b, 32 bits
+# cut down to leading_fixed_bits=9, fixed_bits=9, outranks Type2c,
+# fixed_bits=4, on the same word, even though the wider reading's own 6-byte
+# gap only decodes as a NEVER_ALIGNED_FORMS trap; sw 0x1c4e10: the wider
+# reading's extra word is provably free -- a narrower reading rejoins one of
+# its own successor offsets a few instructions later).
+#
+# resolve_confident_width() is the one function that decides this, so a
+# single-PC decode (decode_confident()/decode_confident_loaded() below, used
+# by tools/sharc_core.sequencer.decode_at()) and a whole-image walk
+# (tools/sharcimm.py's decode_all(), which calls resolve_confident_width()
+# directly with its own memoized table as raw_at, for speed over a whole
+# image) make the identical choice -- see docs/findings/05-sharc-isa-and-
+# decoding.md, "One decode path".
+WIDTH_LOOKAHEAD = 8
+
+# tools/sharcfn.py's module docstring: Type10a_rel (and, as measured there,
+# Type10a_abs too) is absent from tools/sharc_visa_tables.py's VISA form set
+# entirely, so any real occurrence is a disassembler desync landing on a
+# coincidental bit-pattern match, not a genuine instruction -- confirmed on
+# DT2 1.16 (only 4 of 4,808 raw Type10a_rel matches in the whole image ever
+# reach "aligned" status, all four raw field dumps with no real semantics,
+# tools/sharcimm.py's decode_all() v. history). Never treated as a real
+# decoded instruction anywhere in this project.
+NEVER_ALIGNED_FORMS = {"10a_rel", "10a_abs"}
+
+
+def _narrow_candidates_from_words(
+    words: list[int], offset: int, max_bits: int
+) -> list[Instruction]:
+    """Confident/uncertain Instructions decodable from WORDS (as read at
+    OFFSET) from forms narrower than MAX_BITS, using tools/sharc_isa.py's own
+    form list and matches()/extract_fields() directly -- bypassing
+    select_frame()'s width-priority tie-break so a narrower form it
+    discarded is visible here too."""
+    if not words:
+        return []
+    frame = frame_of(words)
+    widths = sorted({f.extent_bits for f in ISA.forms if f.extent_bits < max_bits})
+    out = []
+    for width in widths:
+        if len(words) < width // 16:
+            continue
+        forms = [f for f in ISA.forms if f.extent_bits == width and f.matches(frame)]
+        if not forms:
+            continue
+        best = max(f.fixed_bits for f in forms)
+        ties = [f for f in forms if f.fixed_bits == best]
+        if len(ties) != 1:
+            continue
+        form = ties[0]
+        field_values = {
+            item.field.label: item.value for item in form.extract_fields(frame)
+        }
+        out.append(
+            Instruction(
+                offset=offset,
+                length_bytes=width // 8,
+                type_name=form.id,
+                fields=field_values,
+                raw=frame >> form.width_shift,
+                kind="uncertain" if form.uncertain else "confident",
+                note="",
+            )
+        )
+    return out
+
+
+def _narrow_candidates(data: bytes, offset: int, max_bits: int) -> list[Instruction]:
+    return _narrow_candidates_from_words(_read_words(data, offset), offset, max_bits)
+
+
+def _read_words(data: bytes, offset: int) -> list[int]:
+    words = []
+    for i in range(3):
+        word = _read_u16(data, offset + 2 * i)
+        if word is None:
+            break
+        words.append(word)
+    return words
+
+
+def resolve_confident_width(pos, insn, raw_at, narrow_at, lookahead=WIDTH_LOOKAHEAD):
+    """The one width/form choice both tools/sharcimm.py's decode_all() and
+    tools/sharc_core.sequencer.decode_at() make: prefer a narrower form over
+    a wider one at the same position when the narrower form's own successor
+    chain decodes confidently for LOOKAHEAD instructions where the wider
+    form's does not, or independently rejoins one of the wider form's own
+    successor boundaries -- proof its extra word(s) added no information a
+    narrower reading lacked (see this module's WIDTH_LOOKAHEAD comment).
+
+    pos is the instruction's own position, in whatever unit insn.length_bytes
+    advances it by and raw_at/narrow_at accept (a byte offset into a flat
+    buffer for decode_confident(); twice a short-word PC for
+    decode_confident_loaded()). raw_at(pos) -> Instruction | None is the
+    *uncorrected* single-form decode at pos (already excluding
+    NEVER_ALIGNED_FORMS); narrow_at(pos, max_bits) -> list[Instruction] is
+    _narrow_candidates()/_narrow_candidates_from_words() or equivalent.
+    """
+    if insn is None or insn.length_bytes is None or insn.length_bytes <= 2:
+        return insn
+
+    def confident_reach(pos0, insn0):
+        boundaries = {pos0}
+        cur, p = insn0, pos0
+        for _ in range(lookahead):
+            if cur is None or cur.kind != "confident":
+                return boundaries, False
+            p += cur.length_bytes
+            boundaries.add(p)
+            cur = raw_at(p)
+        return boundaries, True
+
+    wide_boundaries, wide_clean = confident_reach(pos, insn)
+    candidates = narrow_at(pos, insn.length_bytes * 8)
+    if not candidates:
+        return insn
+    wide_targets = wide_boundaries - {pos}
+    for cand in candidates:
+        if cand.kind != "confident":
+            continue
+        cand_boundaries, cand_clean = confident_reach(pos, cand)
+        if not cand_clean:
+            continue
+        if not wide_clean or (cand_boundaries & wide_targets):
+            return cand
+    return insn
+
+
+def _raw_at_flat(data: bytes, offset: int) -> Instruction | None:
+    """The uncorrected single-form decode at OFFSET in a flat buffer, or
+    None where disassemble() cannot decode there at all or only matches a
+    NEVER_ALIGNED_FORMS decode trap."""
+    insn = next(disassemble(data, offset, count=1), None)
+    if insn is None or insn.kind == "unknown" or insn.type_name in NEVER_ALIGNED_FORMS:
+        return None
+    return insn
+
+
+def decode_confident(data: bytes, offset: int) -> Instruction:
+    """Single-instruction decode at OFFSET in a flat buffer, with
+    resolve_confident_width() applied -- the same correction
+    tools/sharcimm.py's decode_all() makes over a whole image. Fails closed
+    exactly as disassemble(..., count=1) does when nothing decodes at OFFSET
+    at all. Unlike decode_all()'s whole-image table, this does not exclude a
+    NEVER_ALIGNED_FORMS decode landed on directly (decode_all() never records
+    one as an "aligned" real instruction anywhere, so the database gives no
+    verdict on a PC only reachable this way, and excluding it here would
+    change decode_confident()'s own contract for a caller that lands there on
+    purpose -- see tests/test_sharc_trace.py's PhaseAOpcodeRegressionTest for
+    Type10a_rel's own field layout). raw_at() below still excludes it from a
+    *successor* chain, exactly as decode_all()'s table does, so the width
+    correction remains identical to the database's."""
+    insn = next(disassemble(data, offset, count=1), None)
+    if insn is None:
+        return Instruction(offset, None, "unknown", kind="unknown", note="no data")
+    if insn.kind == "unknown":
+        return insn
+    return resolve_confident_width(
+        offset,
+        insn,
+        lambda p: _raw_at_flat(data, p),
+        lambda p, mb: _narrow_candidates(data, p, mb),
+    )
+
+
+def _loaded_words(reader: ShortWordReader, pc_sw: int) -> list[int]:
+    """Up to 3 16-bit words at PC_SW, from the largest contiguous mapped
+    window (6, 4, then 2 bytes) -- the same window strategy
+    decode_loaded_at() uses, so a partial mapping recovers exactly the words
+    a real decode there would see."""
+    for size in (6, 4, 2):
+        window = reader.read_sw(pc_sw, size)
+        if window is not None:
+            return list(struct.unpack("<%dH" % (size // 2), window))
+    return []
+
+
+def _raw_at_loaded(reader: ShortWordReader, pos: int) -> Instruction | None:
+    pc_sw, remainder = divmod(pos, 2)
+    if remainder:
+        return None
+    insn = decode_loaded_at(reader, pc_sw)
+    if insn.kind == "unknown" or insn.type_name in NEVER_ALIGNED_FORMS:
+        return None
+    return insn
+
+
+def decode_confident_loaded(reader: ShortWordReader, pc_sw: int) -> Instruction:
+    """Same correction as decode_confident(), for loader-backed memory
+    addressed by a short-word PC -- tools/sharc_core.sequencer.decode_at()'s
+    LoadedMemory path, the tracer's and concrete runner's only decode entry.
+    Fails closed exactly as decode_loaded_at() does; see decode_confident()'s
+    docstring for why a NEVER_ALIGNED_FORMS decode landed on directly is not
+    excluded here either (only from a successor chain, via raw_at())."""
+    insn = decode_loaded_at(reader, pc_sw)
+    if insn.kind == "unknown":
+        return insn
+    pos = 2 * pc_sw
+    return resolve_confident_width(
+        pos,
+        insn,
+        lambda p: _raw_at_loaded(reader, p),
+        lambda p, mb: _narrow_candidates_from_words(
+            _loaded_words(reader, p // 2), p, mb
+        ),
     )
 
 
