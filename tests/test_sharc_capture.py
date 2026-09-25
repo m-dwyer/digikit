@@ -129,6 +129,86 @@ class CaptureRoundTripTest(unittest.TestCase):
         # Pinned: changing this breaks every capture already on disk.
         self.assertEqual(MAGIC, b"DT2CAP1\n")
 
+    def test_dspi1_call_round_trips(self):
+        # tools/sharc_capture_run.py's observational hook on FUN_400cd48a
+        # (docs/findings/04-coldfire-dsp-link.md, "eDMA and DSPI transfer
+        # inventory"): records the call's own arguments only.
+        path = "/tmp/test_sharc_capture_dspi1.dt2cap"
+        try:
+            writer = CaptureWriter(path, frame_bytes=2748, kind="idle")
+            writer.write_dspi1_call(123, 0x300, 0x4FE7A340, 0x42948B04)
+            writer.write_dspi1_call(None, 0x10, 0, 0)
+            writer.close()
+            cap = load(path)
+            self.assertEqual(len(cap.dspi1_calls), 2)
+            first, second = cap.dspi1_calls
+            self.assertEqual(first.instr_count, 123)
+            self.assertEqual(first.length, 0x300)
+            self.assertEqual(first.src, 0x4FE7A340)
+            self.assertEqual(first.callback, 0x42948B04)
+            self.assertIsNone(second.instr_count)
+            self.assertEqual(second.length, 0x10)
+            self.assertEqual(second.src, 0)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_mem_write_round_trips(self):
+        # tools/sharc_capture_run.py's --watch-mem hook (e.g. the FlexBus
+        # 0x8c000000 window): address plus the bytes actually written.
+        path = "/tmp/test_sharc_capture_memwrite.dt2cap"
+        try:
+            writer = CaptureWriter(path, frame_bytes=2748, kind="idle")
+            writer.write_mem_write(500, 0x8C000002, b"\xff\x81")
+            writer.write_mem_write(600, 0x8C00000A, b"\x80")
+            writer.close()
+            cap = load(path)
+            self.assertEqual(len(cap.mem_writes), 2)
+            self.assertEqual(cap.mem_writes[0].address, 0x8C000002)
+            self.assertEqual(cap.mem_writes[0].data, b"\xff\x81")
+            self.assertEqual(cap.mem_writes[1].address, 0x8C00000A)
+            self.assertEqual(cap.mem_writes[1].data, b"\x80")
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_old_capture_without_new_record_types_still_loads(self):
+        # Format-extension contract (see the module docstring): a capture
+        # written before REC_DSPI1_CALL/REC_MEM_WRITE existed has none, and
+        # must still load with empty lists, not an error.
+        path = "/tmp/test_sharc_capture_old_format.dt2cap"
+        try:
+            self._write(path, kind="idle", frames=1, ssi0=0)
+            cap = load(path)
+            self.assertEqual(cap.dspi1_calls, [])
+            self.assertEqual(cap.mem_writes, [])
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_mixed_record_types_preserve_order_per_type(self):
+        # A real run interleaves DSPI2 frames, DSPI1 calls and memory
+        # writes; each type's own list must come back in the order written.
+        path = "/tmp/test_sharc_capture_mixed.dt2cap"
+        try:
+            writer = CaptureWriter(path, frame_bytes=4, kind="play")
+            peer = CapturingPeer(writer, counter=lambda: 0)
+            peer.exchange(b"\x01\x02\x03\x04")
+            writer.write_dspi1_call(10, 4, 0, 0)
+            writer.write_mem_write(20, 0x8C000002, b"\x00")
+            peer.exchange(b"\x05\x06\x07\x08")
+            writer.write_mem_write(30, 0x8C00000A, b"\x80")
+            writer.close()
+            cap = load(path)
+            self.assertEqual(len(cap.dspi2_frames), 2)
+            self.assertEqual(cap.dspi2_frames[1].tx, b"\x05\x06\x07\x08")
+            self.assertEqual(len(cap.dspi1_calls), 1)
+            self.assertEqual(len(cap.mem_writes), 2)
+            self.assertEqual(cap.mem_writes[1].address, 0x8C00000A)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
 
 class CapturingPeerContractTest(unittest.TestCase):
     """CapturingPeer must satisfy the same shapes emu.dspi2/emu.ssi expect

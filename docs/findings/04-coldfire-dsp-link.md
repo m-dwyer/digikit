@@ -1782,3 +1782,155 @@ copy.
 `400d15f4: b4 af 00 30` is a four-byte `cmp.l (local_c,SP),D2`, and `0x400d15f6`
 is its third byte. A whole-image `refscan` finds exactly one literal reference to
 `0x400cec70`, at `0x400ceee8`.
+
+## Note trigger and sample data: DSPI2, DSPI1 and FlexBus all show no signal in a bounded run **[V][C][O]**
+
+Lane Z1, 2026-09-25, `tools/sharc_capture_run.py` extended to also observe the
+DSPI1 driver call and a watched raw-address range (`emu/sharc_capture.py`'s
+`REC_DSPI1_CALL`/`REC_MEM_WRITE`), then run against `snapshots/dt2-1.16/
+boot400M.snap` with the real `Digitakt_II_OS1.16.syx` (sha-256
+`278541e4...`, matching `sections/.source-sha256`).
+
+**FlexBus `0x8c000000` is the SHARC program loader's boot handshake on 1.16,
+not a sample-data path.** The existing "Ruled out as the control link" bullet
+above names `FUN_400cfd40`/`FUN_40146148`/`FUN_4014653c`/`FUN_401465a4`/
+`FUN_400cf4a8`/`FUN_400cf534`/`FUN_400cf67c` -- none of these addresses
+resolve to a function in `out/ghidra/dt2-1.16-emac` (checked against
+`functions`/`function_ranges` in its `xrefs.sqlite`), so that bullet is
+1.15C-only and was never re-verified on 1.16 despite sitting in a `[D]`
+(not `[O]`) bullet. **[C]** Re-run on 1.16: `tools/refscan.py` over
+`sections/section_3_MAIN_OS.bin` for `0x8c000000`-`0x8c000010` (96.78%
+coverage) finds 25 hits, all inside two functions, both reachable only from
+the boot path:
+
+- `FUN_400ccda0` (`0x400ccda0`-`0x400ccdeb`): `_DAT_8c00000a = 0x80; while
+  ((_DAT_8c000002 & 1) == 0) {} ; _DAT_8c000002 = param<<8;` -- a
+  request/ack handshake over two FlexBus-mapped bytes, not a data mover.
+- `FUN_400ccf74` (`0x400ccf74`-`0x400cd28f`, the 1.16 relocation of the
+  documented "boot routine `FUN_400cf67c`"): programs GPIO and `0xec038000`
+  (DSPI2's own MCR/CTAR/PUSHR, `PUSHR_TAG=0x8001` at the same offsets
+  `emu/dspiframe.py` documents for the frame link), reads a boot section
+  (`FUN_401361b6(7, ...)`), decompresses it (`FUN_40136cea`), then bit-bangs
+  it out over DSPI2 with a GPIO handshake per byte
+  (`MCF5441X_MMIO::GPIO_PPDSDR_A & 0x10`) before writing `0x18000000` to
+  `_DAT_ec038034` (DSPI2 PUSHR) at the end. Two `_DAT_8c0000xx` writes (`0`
+  and `0xff80`/`0xff81`) bracket this, matching a boot-mode/reset strobe to
+  the SHARC, not sample paging. **[V]**
+
+So the FlexBus window's confirmed 1.16 role is loading the SHARC's *own
+program* at boot over the same physical DSPI2 pins the periodic frame later
+reuses -- consistent with, not contradicting, "sample pages and slot headers"
+being a stale carry-over from an unresolved 1.15C address. Whether *sample
+audio* also crosses this boot-time bit-bang path (as a second boot section)
+or something else entirely is not established either way here: this section
+only pins down what the *0x8c000000 register window* itself does, and a
+resumed mid-session snapshot cannot observe the boot path running again
+(the next bullet's zero-writes result is post-boot only). **[O]**
+
+**DSPI1 (`FUN_400cd48a`, channel 14) uses a private ColdFire SDRAM staging
+pair, and fires zero times in every kind of bounded run tried.** Its
+decompile confirms the existing `[D]` "different bus" reading and sharpens
+it: `_DAT_fc0451d0 = 0x4fe79340` (RX) and TX staging is built at
+`0x4fe7a340` with the identical `0x8001`-tag convention DSPI2 uses (same
+silicon IP, reused), but the physical PUSHR/POPR pair is `0xfc03c034`/
+`0xfc03c03a` -- **DSPI1**, not DSPI2's `0xec038034`/`0xec03803a`. Both
+staging addresses are `0x4fe7xxxx`, nowhere near any `0x80xxxxxx`-range
+address the SHARC program references (docs/findings/06's synthesis tables at
+`0x8045a6c8`/`0x8055c440`, or the frame link's own `0x80005348`, which is
+ColdFire on-chip SRAM, not this SDRAM). **[V]**
+
+An observational hook at `FUN_400cd48a`'s entry (`tools/sharc_capture_run.py
+install_dspi1_observer` -- logs the call's own three arguments without
+altering control flow, unlike the DSPI2 driver hook, which must fake a
+reply) recorded **zero DSPI1 calls** across every capture run below. **[V]**
+
+**The DSPI2 periodic frame shows no difference at all between idle, a bare
+panel TRIG, and the sequencer actually playing.** Four within-run comparisons
+on the same snapshot, `--force-period` unchanged (the default 50,000, so a
+frame builds every ~51,480 ColdFire instructions):
+
+| capture | kind | instrs | frames | dspi1 calls | mem-writes (FlexBus) |
+| --- | --- | --- | --- | --- | --- |
+| `dt2-1.16-idle-ext.dt2cap` | idle | 2.0M | 38 | 0 | 0 |
+| `dt2-1.16-note-ext.dt2cap` | note (panel TRIG 1) | 4.0M | 77 | 0 | 0 |
+| `dt2-1.16-play-ext.dt2cap` | play (panel PLAY; pattern trigs on tracks 3/12/13/15) | 15.0M | 291 | 0 | 0 |
+
+In every one of the three, exactly the same 46 TX-frame byte offsets change,
+and only once each -- between frame index 0 and frame index 1, never again
+-- to the same values in every capture (`idle[-1] == play[10] == note[-1]`
+byte for byte over the full 2,050-byte payload). This is the frame-build
+gate settling (`tools/sharc_capture_run.py` writes 0 to `prof["gate"]`
+before the first frame builds, per "The frame capture runs; the frame build
+is switched off"), **not** anything caused by the panel input each kind
+injects: idle gets no panel input at all and shows the identical settle.
+**[C]** This corrects an earlier same-day reading (recorded only in a
+scratchpad, never committed here) that treated a `play`-only offset diff as
+PLAY-specific; a same-run idle/note/play comparison shows it is not.
+
+The 46 offsets are the already-documented per-track arrays reindexing for a
+context switch, not a new field: byte 1 (a header flag), the two amp/FX-send
+words at mirror index 52 and 54 (frame offsets `0x11c` and `0x120` for
+track 0, `+track*0x60` for the rest, tiling all 16 tracks -- see "The mirror
+index to TX frame map"), and three still-unmapped small ranges (`0xd8`-`0xd9`,
+`0x736`-`0x739`, `0x7dd`-`0x801`) that change once here but were not
+otherwise investigated -- flagged as a lead, not resolved. **[O]**
+
+**A controlled A/B isolates the trigger itself.** `--poke-track-type 3:2`
+(seed track 3's machine-type mirror byte, bypassing the queue -- see that
+flag's own docstring) plus `--kind idle` (no panel input) versus the same
+poke plus `--kind note` (a real panel TRIG 1) on otherwise identical 3.0M-
+instruction runs:
+
+- Both show the same 48 changed offsets (the 46 above, plus `0x9b`/`0x743` --
+  track 3's machine-type low byte and its `0x73c`-array "active" flag low
+  byte, exactly matching the documented formulas for track index 3).
+- The two runs' final, settled TX frames are **byte-for-byte identical**
+  over all 2,050 bytes. `dspi1_calls` and `mem_writes` are 0 in both.
+
+So firing a real panel TRIG, once the row already carries the same
+machine-type/active state a bare poke already produces, adds **no**
+observable byte to the periodic frame beyond what the row refresh alone
+already contributes. The frame's per-track "active" field (`0x73c`) is a
+level (does this track have a configured, non-empty machine), not an edge
+(a note started now); nothing in it, or anywhere else in the 2,050-byte
+payload, flips because a trigger fired. **[V]**
+
+**Net reading.** Across every channel this lane can observe from the
+ColdFire side, no distinct "play this sample now" message was found:
+DSPI2's frame is unchanged by a real trigger once row state is held equal;
+DSPI1 never fires; FlexBus never writes post-boot. Ruled out as the
+transport for sample audio specifically, regardless of the trigger question:
+DSPI2 (2,050 bytes total for 16 tracks -- far too small for PCM, and this
+section's own evidence that the payload doesn't even carry a trigger pulse);
+DSPI1 (private SDRAM, disjoint address space, zero calls observed); FlexBus
+post-boot (zero writes; its confirmed pre-boot role is the SHARC's own
+*program* loader, not sample paging). The leading remaining hypothesis,
+consistent with everything found so far and not tested here, is that the
+SHARC times and drives its own sample playback internally -- reading
+pattern/sample data already resident in its own external memory from a
+boot/project-load transfer this lane's post-boot snapshots cannot observe --
+using the frame's *level* state (machine type, the `0x73c` active flag, the
+smoothed amp/filter/SRC parameters) as its only ongoing input from the
+ColdFire, with no separate note-on pulse at all. Untested: hooking the boot-
+time DSPI2 bit-bang loader itself (`FUN_400ccf74`, above) from a *pre-boot*
+snapshot, and whatever code loads a project's own sample set at project-load
+time (not attempted here -- out of this lane's bounded scope). **[O]**
+
+**Where a DSPI2-frame byte lands on the SHARC side, for a future lane.**
+Already established by execution, not re-derived here:
+`docs/findings/06-sharc-engine-and-startup.md`, "The ColdFire frame is
+mapped into SHARC DM at `0x2558dc`" and `tools/sharc_framemap.py`: ColdFire
+TX frame byte offset `O` (this file's own numbering, `tx_base + O`) lands at
+SHARC DM address `0x2558dc + O`, byte for byte, confirmed both by eleven
+independent literal per-track scalar bases matching exactly and by an
+execution run logging every SHARC read inside that window. `FUN_001c2b24`
+(the frame-RX consumer) reads the per-track fields at relative offsets
+`{0x54, 0x73c, 0x75c, 0x94}` off that base per track. DSPI1 and FlexBus have
+no landing to document here: nothing was observed crossing either in this
+lane's runs.
+
+Reproduced with: `uv run python tools/sharc_capture_run.py
+snapshots/dt2-1.16/boot400M.snap --out out/captures/dt2-1.16-<kind>-ext.dt2cap
+--kind <idle|note|play> --instrs N --syx <a 1.16 .syx whose sha-256 matches
+sections/.source-sha256>`. Captures are firmware-derived and were not
+committed (`out/` is gitignored).

@@ -126,10 +126,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from unicorn import UC_HOOK_MEM_WRITE  # noqa: E402
 from unicorn.m68k_const import (  # noqa: E402
     UC_M68K_REG_A7,
     UC_M68K_REG_D0,
@@ -142,6 +144,24 @@ from emu.dtim import Dtims, Timers  # noqa: E402
 from emu.longrun import build, spin  # noqa: E402
 from emu.pit import Pits  # noqa: E402
 from emu.sharc_capture import CaptureWriter, CapturingPeer  # noqa: E402
+
+# The DSPI1 driver, docs/findings/04-coldfire-dsp-link.md "eDMA and DSPI
+# transfer inventory" (channel 14, `0xfc03c034` PUSHR -- a *different*
+# physical DSPI block than the SHARC's own `0xec038034`). Confirmed at this
+# address on DT2 1.16 only (`out/ghidra/dt2-1.16-emac`); not re-checked on
+# 1.15C, so the hook below is gated on the resolved profile's name.
+DSPI1_DRIVER_ADDR = 0x400CD48A
+DSPI1_PROFILE_NAME = "Digitakt II 1.16"
+
+# The FlexBus window this lane tested as a candidate sample-data/control
+# path and ruled out: confirmed by `tools/refscan.py` on the 1.16 image plus
+# a decompile of the two functions that touch it (`FUN_400ccda0`,
+# `FUN_400ccf74`) to be the SHARC program loader's own boot-time GPIO/status
+# handshake, not a data channel -- see docs/findings/04, "Ruled out as the
+# control link" (1.16 correction). Watched by default on 1.16 so a capture
+# still records if that reading is ever wrong, or if some other code starts
+# using the window after boot.
+FLEXBUS_WATCH = (0x8C000000, 0x8C000010)
 
 # docs/findings/03-ui-and-panel.md's "A panel-path track trigger joins
 # machine invalidation to the refresh queue": the host-replayed wire event
@@ -193,6 +213,52 @@ def parse_track_type_poke(spec: str) -> tuple[int, int]:
     return track, type_
 
 
+def parse_mem_range(spec: str) -> tuple[int, int]:
+    """'LO:HI' -> (lo, hi), both plain ints (0x-prefixed or decimal), for
+    `--watch-mem`: every write with lo <= address < hi becomes a
+    `emu.sharc_capture.CaptureWriter.write_mem_write` record."""
+    if ":" not in spec:
+        raise ValueError("bad --watch-mem %r (want LO:HI)" % spec)
+    lo_s, hi_s = spec.split(":", 1)
+    lo, hi = int(lo_s, 0), int(hi_s, 0)
+    if hi <= lo:
+        raise ValueError("bad --watch-mem %r: HI must be > LO" % spec)
+    return lo, hi
+
+
+def install_dspi1_observer(at, writer, counter) -> None:
+    """Log every call to the DSPI1 driver (`DSPI1_DRIVER_ADDR`'s own
+    docstring), without altering control flow: unlike the DSPI2 driver hook
+    in `run()`, which must fake a reply since nothing here answers as a real
+    SHARC would, this is a plain observer -- the same idiom
+    `emu.longrun.build()`'s own `task_create`/`do_print` hooks use -- so
+    whatever the real firmware does next (including a real hang, if this
+    turns out to matter) happens exactly as it would with no hook at all."""
+
+    def dspi1_hook(uc, addr, size, data):
+        sp = uc.reg_read(UC_M68K_REG_A7)
+        _ret, length, src, callback = struct.unpack(">IIII", bytes(uc.mem_read(sp, 16)))
+        writer.write_dspi1_call(counter(), length, src, callback)
+
+    at(DSPI1_DRIVER_ADDR, dspi1_hook)
+
+
+def install_mem_write_watch(m, writer, counter, lo: int, hi: int) -> None:
+    """Record every guest write in `[lo, hi)` as a
+    `emu.sharc_capture.CaptureWriter.write_mem_write` record. `value` comes
+    straight from Unicorn's own `UC_HOOK_MEM_WRITE` callback (the same
+    convention `emu/console.py`'s `on_write` uses for UART8), packed
+    big-endian to `size` bytes -- the ColdFire's own byte order, matching
+    every other field this format records."""
+
+    def mem_write_hook(uc, access, address, size, value, data):
+        writer.write_mem_write(
+            counter(), address, (value & ((1 << (8 * size)) - 1)).to_bytes(size, "big")
+        )
+
+    m.uc.hook_add(UC_HOOK_MEM_WRITE, mem_write_hook, begin=lo, end=hi - 1)
+
+
 def poke_track_type(m, track: int, type_: int) -> None:
     """Set TRACK's machine-type mirror byte directly (see TRACK_9A_BASE's
     own docstring) -- the same address/mechanism docs/findings/04's
@@ -220,6 +286,7 @@ def run(
     chunk: int = 200_000,
     unblock: bool = False,
     poke_track_types: tuple[tuple[int, int], ...] = (),
+    watch_mem: tuple[tuple[int, int], ...] = (),
 ) -> dict:
     if kind not in ("idle", "note", "play"):
         raise ValueError("kind must be 'idle', 'note' or 'play', got %r" % (kind,))
@@ -294,6 +361,17 @@ def run(
 
     at(prof["driver"], driver_hook)
 
+    if prof["name"] == DSPI1_PROFILE_NAME:
+        install_dspi1_observer(at, writer, lambda: pits.now)
+
+    # Watch the FlexBus boot-loader window by default on 1.16 (see
+    # FLEXBUS_WATCH's own docstring), plus whatever the caller asked for.
+    mem_ranges = tuple(watch_mem)
+    if prof["name"] == DSPI1_PROFILE_NAME:
+        mem_ranges = (FLEXBUS_WATCH, *mem_ranges)
+    for lo, hi in mem_ranges:
+        install_mem_write_watch(m, writer, lambda: pits.now, lo, hi)
+
     triggered = {"done": False}
     forced = {"last": 0}
 
@@ -334,6 +412,8 @@ def run(
         "instructions": done,
         "frames": writer.counts["dspi2_frames"],
         "ssi0_rx": writer.counts["ssi0_rx"],
+        "dspi1_calls": writer.counts["dspi1_calls"],
+        "mem_writes": writer.counts["mem_writes"],
         "ssi0_status": ssi0_status,
         "triggered": triggered["done"] if kind in ("note", "play") else None,
         "image_sha256": image_sha256,
@@ -371,6 +451,17 @@ def parse_args(argv=None):
         help="seed a track's machine-type mirror byte before capturing (see "
         "poke_track_type()'s own docstring); repeatable",
     )
+    p.add_argument(
+        "--watch-mem",
+        dest="watch_mem",
+        action="append",
+        default=[],
+        metavar="LO:HI",
+        help="record every write in [LO, HI) as a REC_MEM_WRITE record (see "
+        "parse_mem_range()'s own docstring); repeatable. On the 1.16 "
+        "profile, FLEXBUS_WATCH (0x8c000000-0x8c000010) is always added, "
+        "in addition to whatever this gives",
+    )
     return p.parse_args(argv)
 
 
@@ -380,6 +471,7 @@ def main(argv=None) -> int:
     poke_track_types = tuple(
         parse_track_type_poke(spec) for spec in args.poke_track_type
     )
+    watch_mem = tuple(parse_mem_range(spec) for spec in args.watch_mem)
     result = run(
         args.snapshot,
         args.out,
@@ -392,13 +484,17 @@ def main(argv=None) -> int:
         chunk=args.chunk,
         unblock=args.unblock,
         poke_track_types=poke_track_types,
+        watch_mem=watch_mem,
     )
     print(
-        "%s: %d frame(s), %d ssi0-rx, stop=%s, instructions=%d, ssi0=%s%s"
+        "%s: %d frame(s), %d ssi0-rx, %d dspi1-calls, %d mem-writes, "
+        "stop=%s, instructions=%d, ssi0=%s%s"
         % (
             args.out,
             result["frames"],
             result["ssi0_rx"],
+            result["dspi1_calls"],
+            result["mem_writes"],
             result["stop"],
             result["instructions"],
             result["ssi0_status"],

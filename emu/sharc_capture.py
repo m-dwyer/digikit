@@ -1,6 +1,6 @@
 """Opt-in capture of real ColdFire<->SHARC traffic, for tools/sharc_replay.py.
 
-Two independent things a run can record, both off unless a caller wires
+Four independent things a run can record, all off unless a caller wires
 them in (nothing here is installed by `emu.longrun.build()` on its own):
 
 - Every DSPI2 frame the ColdFire's driver call builds and sends toward the
@@ -12,6 +12,28 @@ them in (nothing here is installed by `emu.longrun.build()` on its own):
   size and cadence only, again always silence, since real input hardware
   is unmodeled (this matches `tools/sharc_proc.py`'s own
   `audio_mode="silence"` convention).
+- Every call to the DSPI1 driver (`FUN_400cd48a` on DT2 1.16, docs/findings/
+  04-coldfire-dsp-link.md "eDMA and DSPI transfer inventory", channel 14):
+  a candidate second ColdFire<->something link this lane tested and ruled
+  out as a note/sample-data transport to the SHARC (its TX/RX staging pair,
+  `0x4fe7a340`/`0x4fe79340`, sits in the ColdFire's own external SDRAM, far
+  from any `0x80xxxxxx`-range address the SHARC program references, and
+  the driver uses a *different* physical DSPI block, `0xfc03c034`, than the
+  SHARC's own `0xec038034`) -- kept as a record type so a future run can
+  reopen the question with evidence instead of re-deriving the address.
+  Observational only (`tools/sharc_capture_run.py`'s hook does not alter
+  control flow, unlike the DSPI2 driver hook below, which must fake a reply
+  since nothing here answers as a real SHARC would): logs the call's own
+  three arguments (length, source pointer or 0, completion callback), never
+  the peripheral's behaviour.
+- Any write into a watched raw memory range (`tools/sharc_capture_run.py`'s
+  `--watch-mem LO:HI`): this lane's other candidate for a shared/bulk
+  transport, the 16-byte FlexBus window at `0x8c000000` (docs/findings/04,
+  "Ruled out as the control link"; confirmed on 1.16 by `tools/refscan.py`
+  to be the SHARC program loader's own boot-time GPIO/status handshake,
+  `FUN_400ccda0`/`FUN_400ccf74`, not a sample-data path -- see the finding's
+  1.16 correction). Generic by address range, not tied to FlexBus, so the
+  same mechanism can watch any other candidate window later.
 
 `CapturingPeer` implements both `emu.dspi2`'s peer contract (`.exchange`)
 and `emu.ssi`'s (`.rx`/`.tx`), the same way `emu.sharc_peer.SharcServerPeer`
@@ -32,6 +54,7 @@ transport modeled -- only what crossed it).
               "source_sha256": "...", ...caller-supplied metadata}
     then records, back to back, each:
         type     1 byte    1=DSPI2 TX  2=DSPI2 RX  3=SSI0 RX
+                           4=DSPI1 call  5=watched memory write
         instr    8 bytes   big-endian ColdFire instruction count, or
                            0xFFFFFFFFFFFFFFFF when not known
         length   4 bytes   big-endian payload length
@@ -39,7 +62,13 @@ transport modeled -- only what crossed it).
     to EOF. A DSPI2 TX record is always immediately followed by its RX
     record (one `write_dspi2()` call writes both) -- `load()` pairs them
     positionally and raises if that invariant is violated by a
-    hand-truncated file.
+    hand-truncated file. Type 4's payload is `>III` (length, source pointer,
+    callback), a fixed 12 bytes. Type 5's payload is `>I` (guest address)
+    followed by the bytes written, so its length varies with the access
+    width. Readers of an old capture never see types 4/5: they were not
+    written before this format extension, so the file simply has none, and
+    `load()` leaves the new `Capture.dspi1_calls`/`mem_writes` lists empty
+    -- old captures stay readable exactly as before.
 
 `instr` is whatever the caller's `counter` callable returns, e.g. a
 `spin()`-driven run's `pits.now` -- accurate to the last scheduling
@@ -59,9 +88,13 @@ MAGIC = b"DT2CAP1\n"
 REC_DSPI2_TX = 1
 REC_DSPI2_RX = 2
 REC_SSI0_RX = 3
+REC_DSPI1_CALL = 4
+REC_MEM_WRITE = 5
 
 _NO_COUNT = 0xFFFFFFFFFFFFFFFF
 _REC_HEADER = struct.Struct(">BQI")
+_DSPI1_CALL = struct.Struct(">III")  # length, src pointer (0 if none), callback
+_MEM_WRITE_ADDR = struct.Struct(">I")
 
 VALID_KINDS = ("idle", "note", "play")
 
@@ -69,8 +102,8 @@ VALID_KINDS = ("idle", "note", "play")
 class CaptureWriter:
     """Writes one capture file (see the module docstring for the format).
 
-    `counts` is a running tally (`dspi2_frames`, `ssi0_rx`) a driver can
-    print without re-reading the file back.
+    `counts` is a running tally (`dspi2_frames`, `ssi0_rx`, `dspi1_calls`,
+    `mem_writes`) a driver can print without re-reading the file back.
     """
 
     def __init__(
@@ -99,7 +132,12 @@ class CaptureWriter:
         self._fh.write(MAGIC)
         self._fh.write(struct.pack(">I", len(body)))
         self._fh.write(body)
-        self.counts = {"dspi2_frames": 0, "ssi0_rx": 0}
+        self.counts = {
+            "dspi2_frames": 0,
+            "ssi0_rx": 0,
+            "dspi1_calls": 0,
+            "mem_writes": 0,
+        }
 
     def _write(self, rec_type: int, instr_count, payload: bytes) -> None:
         payload = bytes(payload)
@@ -115,6 +153,26 @@ class CaptureWriter:
     def write_ssi0_rx(self, instr_count, data: bytes) -> None:
         self._write(REC_SSI0_RX, instr_count, data)
         self.counts["ssi0_rx"] += 1
+
+    def write_dspi1_call(
+        self, instr_count, length: int, src: int, callback: int
+    ) -> None:
+        """Record one observed call to the DSPI1 driver (see the module
+        docstring): the call's own arguments only, never a reply -- this
+        record type is observational (`tools/sharc_capture_run.py`'s hook
+        does not intercept the call), unlike a DSPI2 TX/RX pair."""
+        self._write(
+            REC_DSPI1_CALL, instr_count, _DSPI1_CALL.pack(length, src, callback)
+        )
+        self.counts["dspi1_calls"] += 1
+
+    def write_mem_write(self, instr_count, address: int, data: bytes) -> None:
+        """Record one write the guest made into a watched raw address range
+        (`tools/sharc_capture_run.py --watch-mem`)."""
+        self._write(
+            REC_MEM_WRITE, instr_count, _MEM_WRITE_ADDR.pack(address) + bytes(data)
+        )
+        self.counts["mem_writes"] += 1
 
     def close(self) -> None:
         self._fh.close()
@@ -139,6 +197,21 @@ class Ssi0Rx:
     data: bytes
 
 
+@dataclass(frozen=True)
+class Dspi1Call:
+    instr_count: int | None
+    length: int
+    src: int
+    callback: int
+
+
+@dataclass(frozen=True)
+class MemWrite:
+    instr_count: int | None
+    address: int
+    data: bytes
+
+
 @dataclass
 class Capture:
     frame_bytes: int
@@ -148,6 +221,8 @@ class Capture:
     meta: dict = field(default_factory=dict)
     dspi2_frames: list[Dspi2Frame] = field(default_factory=list)
     ssi0_rx: list[Ssi0Rx] = field(default_factory=list)
+    dspi1_calls: list[Dspi1Call] = field(default_factory=list)
+    mem_writes: list[MemWrite] = field(default_factory=list)
 
 
 def load(path: str) -> Capture:
@@ -160,6 +235,8 @@ def load(path: str) -> Capture:
         meta = json.loads(fh.read(hlen).decode("utf-8"))
         dspi2_frames: list[Dspi2Frame] = []
         ssi0_rx: list[Ssi0Rx] = []
+        dspi1_calls: list[Dspi1Call] = []
+        mem_writes: list[MemWrite] = []
         pending_tx = None
         while True:
             header = fh.read(_REC_HEADER.size)
@@ -186,6 +263,18 @@ def load(path: str) -> Capture:
                 pending_tx = None
             elif rec_type == REC_SSI0_RX:
                 ssi0_rx.append(Ssi0Rx(instr, payload))
+            elif rec_type == REC_DSPI1_CALL:
+                if len(payload) != _DSPI1_CALL.size:
+                    raise ValueError("%s: bad DSPI1 call record length" % path)
+                length_, src, callback = _DSPI1_CALL.unpack(payload)
+                dspi1_calls.append(Dspi1Call(instr, length_, src, callback))
+            elif rec_type == REC_MEM_WRITE:
+                if len(payload) < _MEM_WRITE_ADDR.size:
+                    raise ValueError("%s: bad memory-write record length" % path)
+                (address,) = _MEM_WRITE_ADDR.unpack(payload[: _MEM_WRITE_ADDR.size])
+                mem_writes.append(
+                    MemWrite(instr, address, payload[_MEM_WRITE_ADDR.size :])
+                )
             else:
                 raise ValueError("%s: unknown record type %d" % (path, rec_type))
         if pending_tx is not None:
@@ -198,6 +287,8 @@ def load(path: str) -> Capture:
             meta=meta,
             dspi2_frames=dspi2_frames,
             ssi0_rx=ssi0_rx,
+            dspi1_calls=dspi1_calls,
+            mem_writes=mem_writes,
         )
 
 
