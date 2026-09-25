@@ -41,7 +41,11 @@ stretched.
 default 18720000 (4x INSTR_PER_SEC); 0 keeps the default rate; ignored when
 --ips or --ips-at is given.
 `--intro-timers pit3` drives an in-progress intro with its real PIT3 while
-holding DTIM until handover.  The historical default, `held`, keeps every
+holding DTIM until handover.  `deliver` is `pit3` with DTIM3 delivered too:
+no hold on either timer while the intro is live, full PIT cadence at
+handover.  It is the policy an intro that paces its own frames off the
+timers needs (stock completes under it as well; measured 2026-09-19 in
+work/sharc-port/host/EMULATED_BOOT.md).  The historical default, `held`, keeps every
 timer held for exploratory runs that use semaphore unblocking.
 `--trace-ui` prints the firmware UI path (UI queue sends/pops with wait,
 key dispatch offers to views, view activate/close; see emu/uitrace.py) and
@@ -123,6 +127,15 @@ def parse_args(argv):
     p.add_argument('--poke', action='append', default=[], type=parse_poke,
                    metavar='ADDR=LONG')
     p.add_argument('--watch', action='append', default=[], type=parse_watch)
+    p.add_argument('--post-sem', action='append', default=[], type=lambda t: int(t, 0),
+                   help='run the firmware sem_post on this semaphore right after restore, waking a '
+                        'task that was already blocked inside sem_pend when the snapshot was taken')
+    p.add_argument('--recheck', action='append', default=[], type=lambda t: int(t, 0),
+                   help='pend CALLER (return address) that unblock must never force-satisfy')
+    p.add_argument('--sem-post-fn', type=lambda t: int(t, 0), default=0x4000155c,
+                   help='address of the firmware sem_post() that --post-sem calls '
+                        '(default 0x4000155c: DT2 1.15C MAIN OS, and the same address '
+                        'on DN2 1.11 by a static read; pass the build\'s own otherwise)')
     p.add_argument('--watch-max', type=int, default=16)
     p.add_argument('--ips', type=parse_when, default=None)
     p.add_argument('--ips-at', action='append', default=[], type=parse_ips_at)
@@ -134,7 +147,7 @@ def parse_args(argv):
     p.add_argument('--post-intro-ips', type=parse_when,
                    default=4 * INSTR_PER_SEC)
     p.add_argument(
-        '--intro-timers', choices=('held', 'pit3', 'all'), default='held',
+        '--intro-timers', choices=('held', 'pit3', 'all', 'deliver'), default='held',
         help='while the intro is active: hold PITs (historical default), '
              'drive only PIT3, or drive all PIT channels; DTIM stays held '
              'until intro handover',
@@ -191,10 +204,14 @@ def release_intro_timers(timers):
 
 def construct_timers(machine, args, intro):
     """Construct the requested pre/post-intro timer topology."""
-    pit_channels = ((3,) if intro and args.intro_timers == 'pit3'
+    # deliver: PIT3 only while the intro is live (PIT0/2 during the intro let
+    # it end but stop the six OS tasks spawning), and NO hold on DTIM3 either;
+    # release_intro_timers() widens to (3, 2, 0) at intro_done.
+    deliver = args.intro_timers == 'deliver'
+    pit_channels = ((3,) if intro and args.intro_timers in ('pit3', 'deliver')
                     else (3, 2, 0))
     pit_hold = intro and args.intro_timers == 'held'
-    dtim_hold = intro
+    dtim_hold = intro and not deliver
     if args.ips is not None:
         return Timers(
             Pits(machine, channels=pit_channels, hold=pit_hold,
@@ -348,6 +365,25 @@ def stack_scan(uc, depth):
     return a7, found
 
 
+
+SEM_POST = 0x4000155c        # DT2 1.15C sem_post(sem); override per build with --sem-post-fn
+POST_STUB = 0x35000000       # scratch for the synthesised call stub (serial.py uses 0x32/0x34000000)
+POST_VECTOR = 203            # serial.py uses 201/202
+
+
+def post_sem(m, sem, fn=SEM_POST):
+    """Run the firmware's own sem_post(sem) from an injected exception, then rte. -> new PC."""
+    stub = (struct.pack('>HI', 0x4879, sem)        # pea.l sem
+            + struct.pack('>HI', 0x4EB9, fn)        # jsr sem_post
+            + b'\x58\x8f'                           # addq.l #4,sp
+            + b'\x4e\x73')                          # rte
+    m.ensure(POST_STUB)
+    m.uc.mem_write(POST_STUB, stub)
+    m.uc.mem_write(0x40000000 + POST_VECTOR * 4, struct.pack('>I', POST_STUB))
+    m.raise_vector(POST_VECTOR)
+    return m.uc.reg_read(UC_M68K_REG_PC)
+
+
 def main():
     args = parse_args(sys.argv[1:])
     if args.ssi0_upgrade_legacy and args.ssi0_request_hz is None:
@@ -367,6 +403,18 @@ def main():
                                     ssi0_legacy_upgrade=args.ssi0_upgrade_legacy,
                                     **extra)
 
+    for sem in args.post_sem:
+        before = struct.unpack('>i', m.uc.mem_read(sem, 4))[0]
+        # the driver's own loop executes the stub: it runs pea/jsr sem_post/rte and
+        # returns to the restored PC; a separate emu_start here left the loop
+        # inconsistent (HALTED: pc zero) although the post itself was correct
+        pc = post_sem(m, sem, args.sem_post_fn)
+        after = struct.unpack('>i', m.uc.mem_read(sem, 4))[0]
+        print('[guirun] host post_sem 0x%08x: count %d -> %d, waiter now 0x%08x (calibration)'
+              % (sem, before, after, struct.unpack('>I', m.uc.mem_read(sem + 4, 4))[0]))
+    if args.recheck:
+        ev['unblock_skip_callers'] |= set(args.recheck)
+        print('[guirun] host recheck callers: %s' % ', '.join('0x%08x' % a for a in args.recheck))
     for addr, data in args.poke:
         try:
             m.uc.mem_write(addr, data)
