@@ -214,6 +214,51 @@ class Type5aSwapTest(unittest.TestCase):
         self.assertEqual(result.trace[-1]["action"], "dreg-swap-skipped")
 
 
+class Type4bTest(unittest.TestCase):
+    def test_long_word_load_post_modify_real_instance(self):
+        # real SW 0x1c6b4c: d=0 load into R4 (dreg 4), l=1, x=1, w=1 ->
+        # ACCESS_WIDTHS[(1, 1, 1)] = "long-word", u=1 post-modify, I3,
+        # data=7 (six-bit signed +7).
+        #
+        # tools/sharc_widthaudit.py's frame-render audit found this: this
+        # handler's own local ``widths`` dict (before this fix) mis-keyed
+        # (1, 1, 1) as ("normal-word", 4, False) -- ACCESS_WIDTHS' own
+        # (1, 1, 1) is "long-word" -- so 0x1c6b4c (and 316 more Type4b
+        # sites with these same three bits, all in the frame render) read
+        # a wrong, concrete 4-byte word instead of correctly declining an
+        # 8-byte access this tracer does not model (sharc_core.memory.
+        # _dm_read refuses width=8, "a register pair, which this tracer
+        # does not model" -- see its own docstring).
+        fields = {
+            "cond[4:0]": 31,
+            "d": 0,
+            "data[4:0]": 7,
+            "data[5:5]": 0,
+            "dreg[3:0]": 4,
+            "g": 0,
+            "i[2:0]": 3,
+            "l": 1,
+            "u": 1,
+            "w": 1,
+            "x": 1,
+        }
+        state = T.State(0x10, {T.UREG_CODES["I3"]: T.Const(0x4000)})
+        [result] = T._execute(state, insn("4b", fields, length=6))
+        self.assertIsNone(result.stopped)
+        load = result.trace[-1]
+        self.assertEqual(load["action"], "load")
+        self.assertEqual(load["access_width"], "long-word")
+        self.assertEqual(load["addressing_mode"], "post-modify")
+        self.assertEqual(load["address"], 0x4000)
+        # No concrete backing memory (this State has none) -- and even
+        # with one, sharc_core.memory._dm_read declines an 8-byte read
+        # outright -- so the load is Unknown, never a wrong Const.
+        self.assertIsInstance(result.uregs[T.UREG_CODES["R4"]], T.Unknown)
+        # Post-modify: long-word's own scale is fixed at 8, so
+        # I3 = 0x4000 + 7 * 8 = 0x4038.
+        self.assertEqual(result.uregs[T.UREG_CODES["I3"]], T.Const(0x4038))
+
+
 class Type4dTest(unittest.TestCase):
     def test_byte_store_pre_modify_real_instance(self):
         # real SW 0x1c4b91 (1856721): d=1 store, l=x=w=0 -> byte, u=0
@@ -295,9 +340,20 @@ class Type4dTest(unittest.TestCase):
 
 
 class Type3dTest(unittest.TestCase):
-    def test_normal_word_load_pre_modify_real_instance(self):
+    def test_byte_access_load_pre_modify_real_instance(self):
         # real SW 0xb7febf (12059647): d=0 load into R2 (ureg 2), ex=0,
-        # w=0 -> plain normal-word ACCESS, u=0 pre-modify.
+        # w=0, l=0, x=0, u=0 pre-modify. This is dt2-1.16's single most
+        # common Type3d encoding (46/72 occurrences, tools/sharc.py's
+        # insn table: `select fields, count(*) from insn where form='3d'
+        # group by fields`), which rules out "l/x unused, always
+        # normal-word" for this (ex, w) = (0, 0) group: a spread of 46
+        # (0,0,0,0) + 3 (0,0,0,1) + 5 (0,0,1,0) + 10 (0,0,1,1) instances
+        # (a real compiler using every l/x combination) only makes sense
+        # if l/x actually select the access width, exactly as
+        # ACCESS_WIDTHS[(l, x, 0)] already does for Type3b/Type4d -- see
+        # _type_3d's own docstring (tools/sharc_core/forms_move.py) for
+        # the PRM citation. l=0, x=0 -> "byte" (ACCESS_WIDTHS[(0, 0, 0)]),
+        # not "normal-word" as this test asserted before that fix.
         fields = {
             "cond[4:0]": 31,
             "d": 0,
@@ -320,12 +376,83 @@ class Type3dTest(unittest.TestCase):
         load = result.trace[-1]
         self.assertEqual(load["action"], "load")
         self.assertEqual(load["space"], "DM")
-        self.assertEqual(load["access_width"], "normal-word")
+        self.assertEqual(load["access_width"], "byte")
         self.assertEqual(load["addressing_mode"], "pre-modify")
         self.assertEqual(load["address"], 0x4004)
         # Pre-modify (matching Type3a/4a's own convention): I5 itself is
         # left unchanged; only this access's address was offset.
         self.assertEqual(result.uregs[T.UREG_CODES["I5"]], T.Const(0x4000))
+
+    def test_short_word_store_pre_modify_real_instance(self):
+        # real SW 0x1c29d4: d=1 store of ureg 2 (R2), ex=0, w=0, l=1,
+        # x=0 -> ACCESS_WIDTHS[(1, 0, 0)] = "short-word", u=0 pre-modify,
+        # I5/M7.
+        fields = {
+            "cond[4:0]": 31,
+            "d": 1,
+            "ex": 0,
+            "g": 0,
+            "i[2:0]": 5,
+            "l": 1,
+            "m[2:0]": 7,
+            "u": 0,
+            "ureg[6:0]": 2,
+            "w": 0,
+            "x": 0,
+        }
+        state = T.State(
+            0x10,
+            {
+                T.UREG_CODES["I5"]: T.Const(0x5000),
+                T.UREG_CODES["M7"]: T.Const(1),
+                T.UREG_CODES["R2"]: T.Const(0x1234),
+            },
+        )
+        [result] = T._execute(state, insn("3d", fields, length=6))
+        self.assertIsNone(result.stopped)
+        store = result.trace[-1]
+        self.assertEqual(store["action"], "store")
+        self.assertEqual(store["access_width"], "short-word")
+        self.assertEqual(store["addressing_mode"], "pre-modify")
+        # short-word's own scale is fixed at 2, independent of
+        # assume_nw32 (sharc_core.memory._access_modifier_scale): M7=1
+        # scales to 2, so I5=0x5000 + 2 = 0x5002.
+        self.assertEqual(store["address"], 0x5002)
+        # Pre-modify: I5 itself is left unchanged.
+        self.assertEqual(result.uregs[T.UREG_CODES["I5"]], T.Const(0x5000))
+
+    def test_short_word_sign_extended_load_post_modify_real_instance(self):
+        # real SW 0x1c419d: d=0 load into ureg 2 (R2), ex=0, w=0, l=1,
+        # x=1 -> ACCESS_WIDTHS[(1, 1, 0)] = "short-word-sign-extended",
+        # u=1 post-modify, I4/M7.
+        fields = {
+            "cond[4:0]": 31,
+            "d": 0,
+            "ex": 0,
+            "g": 0,
+            "i[2:0]": 4,
+            "l": 1,
+            "m[2:0]": 7,
+            "u": 1,
+            "ureg[6:0]": 2,
+            "w": 0,
+            "x": 1,
+        }
+        state = T.State(
+            0x10,
+            {T.UREG_CODES["I4"]: T.Const(0x6000), T.UREG_CODES["M7"]: T.Const(1)},
+        )
+        [result] = T._execute(state, insn("3d", fields, length=6))
+        self.assertIsNone(result.stopped)
+        load = result.trace[-1]
+        self.assertEqual(load["action"], "load")
+        self.assertEqual(load["access_width"], "short-word-sign-extended")
+        self.assertEqual(load["addressing_mode"], "post-modify")
+        # Post-modify: the access itself uses I4 unchanged.
+        self.assertEqual(load["address"], 0x6000)
+        # short-word's own scale is fixed at 2 (not gated by
+        # assume_nw32): M7=1 scales to 2, so I4 becomes 0x6000 + 2.
+        self.assertEqual(result.uregs[T.UREG_CODES["I4"]], T.Const(0x6002))
 
     def test_conditional_store_real_instance(self):
         # real SW 0xb7fec8 (12059656): d=1 store of ureg 45 (M13), cond

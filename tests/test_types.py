@@ -23,6 +23,7 @@ TYPED = [
     "tools/sharc_survey.py",
     "tools/sharc_symbols.py",
     "tools/sharc_trace.py",
+    "tools/sharc_widthaudit.py",
     "tools/sharcldr.py",
 ]
 

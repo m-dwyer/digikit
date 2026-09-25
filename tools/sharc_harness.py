@@ -696,65 +696,20 @@ def call_render(
     register value the previous run (``run_init()`` or a prior
     ``call_render()``) happened to leave R12 at.
 
-    **Loop-wrap ACTIVE fixup (task 3, 2026-09-25).** docs/findings/06 claims
-    "a wrap copies +0x1bc [FIELD_LOOP] to +0x1b8 [FIELD_ACTIVE]" (0x1c50fe
-    forward, 0x1c530a/0x1c5325 reverse). An earlier version of this lane's
-    own test (``test_setup_voice_loop_wraps_phase_but_still_deactivates_
-    on_wrap``, see its git history) *refuted* that with a concrete run:
-    ACTIVE cleared to 0 at 0x1c50fe even with FIELD_LOOP=1. Root-caused
-    (not guessed) by decoding the actual instruction fields and
-    single-stepping both the forward and reverse sites with register dumps
-    (``tools/sharc.py``'s ``insn`` table, ``Runner.step()``):
-
-    - 0x1c50fe/0x1c5325 (``DM(I1-3) = R2`` / ``DM(I2-3) = R2``) are Type4d
-      stores; Type4d *does* derive its access width from
-      ``ACCESS_WIDTHS[(l, x, w)]`` (``tools/sharc_core/forms_move.py``'s
-      ``_type_4d``), and for this instruction's own decoded fields
-      (l=0, x=0, w=0) that is ``"byte"`` -- a correct 1-byte store at
-      ``I1 - 3`` (I1 = the record's own +0x1bb REVERSE byte, so I1-3 =
-      +0x1b8 = FIELD_ACTIVE, matching the finding).
-    - The value stored, R2, comes from 0x1c50fb/0x1c5322 (``R2 = DM(I1, M6)
-      u=0``), a Type3d instruction. **``_type_3d``'s own ex=0 branch
-      hardcodes ``access_width = "normal-word"`` whenever w=0
-      (``tools/sharc_core/forms_move.py``, the ``if _field(f, "w"): ...``/
-      ``if _field(f, "ex"): ...`` guards followed by the unconditional
-      ``access_width = "normal-word"``) -- it never consults the
-      instruction's own l/x fields the way ``_type_3b``/``_type_4d``
-      (the sibling forms at the *other* two wrap sites, 0x1c5008's read and
-      0x1c530a's own upstream read at 0x1c5308, which decode correctly)
-      do.** This instruction's own decoded fields are also (l=0, x=0,
-      w=0) -- the same key that gives ``"byte"`` for the sibling forms --
-      so per ``ACCESS_WIDTHS``, this read should also be a 1-byte access at
-      ``I1 + M6*1`` (M6=1 in every concrete run checked: I1+1 = +0x1bc =
-      FIELD_LOOP, exactly the finding's claim), not the emulator's actual
-      4-byte word read at ``I1 + M6*4`` = +0x1bf (three bytes into the
-      record's own unused padding past FIELD_LOOP, always 0 under
-      ``explicit_memory_model`` since nothing ever writes there). This is a
-      confirmed ``tools/sharc_core`` gap (a missing ``ACCESS_WIDTHS`` fixup
-      in ``_type_3d``'s w=0/ex=0 branch), out of this lane's own scope (see
-      this lane's task brief: "do not edit sharc_core"), not fixed here --
-      reported instead, the same way lane L13's ASTATX/PartialConst gap was
-      (see FRAME_PATCH_TABLE's own docstring).
-
-    Confirmed by overriding R2 mid-step to what the corrected byte read
-    would produce (the record's own FIELD_LOOP byte) immediately before the
-    store executes: ACTIVE then stays 1 across the wrap, exactly as
-    docs/findings/06 originally documented, for both the forward (0x1c50fe)
-    and reverse (0x1c5325) sites -- see
-    ``/private/tmp/claude-501/-Users-em-src-digi-digitakt2/89c5e6c8-2a58-496e-84a0-527f96e6f55a/scratchpad/wrap_trace.py``
-    and ``wrap_trace2.py`` for the traces this is drawn from. So a real,
-    bug-free FUN_1c4f81 keeps a looping voice's ACTIVE equal to its own
-    FIELD_LOOP after every wrap; **this function reproduces that documented
-    net effect directly** (Const(FIELD_LOOP's byte value) in place of the
-    concretely-wrong Const(0) the buggy Type3d read currently produces),
-    the same way ``setup_voice()`` already hand-pokes a trigger's own
-    documented net effect elsewhere in this module, rather than leaving a
-    known sharc_core gap to silently deactivate every looping voice this
-    harness renders. It only ever touches ACTIVE when the record was both
-    active before this call and had FIELD_LOOP set -- a non-looping voice
-    (the default) or one already inactive is untouched, so this changes
-    nothing for this module's existing non-loop tests/check_correctness()
-    cases.
+    **Loop-wrap ACTIVE (task 3, 2026-09-25; fixed at the source by lane
+    W1, 2026-09-25).** docs/findings/06 claims "a wrap copies +0x1bc
+    [FIELD_LOOP] to +0x1b8 [FIELD_ACTIVE]" (0x1c50fe forward, 0x1c530a/
+    0x1c5325 reverse). The wrap's read at 0x1c50fb/0x1c5322
+    (``R2 = DM(I1, M6)``, a Type3d instruction, fields l=0, x=0, w=0,
+    ex=0) used to be misdecoded by ``tools/sharc_core/forms_move.py``'s
+    ``_type_3d``, which hardcoded ``access_width = "normal-word"`` for
+    its w=0/ex=0 branch instead of consulting ``ACCESS_WIDTHS[(l, x, 0)]``
+    the way the sibling Type4d store at the very same site already did --
+    see that function's own docstring for the PRM citation and the
+    register-override confirmation. With that fixed, this run's own
+    Type3d load now performs the correct 1-byte read, and ACTIVE tracks
+    FIELD_LOOP across a wrap on its own, with no harness-side fixup
+    needed; no ``call_render()`` code doctors ACTIVE any more.
     """
     from sharc_core.encoding import UREG_CODES
 
@@ -775,9 +730,6 @@ def call_render(
     runner.form_counts.clear()
     runner.max_call_depth_reached = 0
 
-    active_before = _read_byte(state, record + FIELD_ACTIVE)
-    loop_flag = _read_byte(state, record + FIELD_LOOP)
-
     result = runner.run(max_steps=20_000)
     floats = []
     for i in range(64):
@@ -787,15 +739,6 @@ def call_render(
             if raw is not None
             else 0.0
         )
-
-    # See this function's own "Loop-wrap ACTIVE fixup" docstring section
-    # above: a tools/sharc_core Type3d width bug makes a real wrap
-    # (FIELD_LOOP=1) clear ACTIVE instead of copying FIELD_LOOP into it.
-    # Restore the documented net effect here, but only when this call
-    # actually found the voice active and looping beforehand -- never
-    # touches ACTIVE for a non-looping or already-inactive voice.
-    if loop_flag and active_before and not _read_byte(state, record + FIELD_ACTIVE):
-        _poke(state, record + FIELD_ACTIVE, 1, width=1)
 
     return result, floats
 

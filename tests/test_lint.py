@@ -37,6 +37,7 @@ CLEAN = [
     "tests/test_sharc_trace_forms.py",
     "tests/test_sharc_trace_mult.py",
     "tests/test_sharc_trace_simd.py",
+    "tests/test_sharc_widthaudit.py",
     "tests/test_sharcldr.py",
     "tests/test_types.py",
     "tools/sharc.py",
@@ -49,6 +50,7 @@ CLEAN = [
     "tools/sharc_run.py",
     "tools/sharc_survey.py",
     "tools/sharc_symbols.py",
+    "tools/sharc_widthaudit.py",
     "tools/sharcldr.py",
 ]
 

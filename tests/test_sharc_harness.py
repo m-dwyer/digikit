@@ -733,9 +733,25 @@ class FrameRenderFromInitTest(unittest.TestCase):
         # stops (0xb88e4b, 0x1c4969); the Type18a bit test on a partly known
         # ASTATX now resolves the third (0x1c088e). The frame then stops on
         # a computed return in the 0xb82xxx routines.
+        #
+        # pc_sw and instructions both moved (from 0xb82a30/191363) once
+        # tools/sharc_widthaudit.py's own audit found and this lane fixed
+        # two sharc_core width bugs it reaches: Type3d's w=0 branch
+        # ignoring l/x (tools/sharc_core/forms_move.py's _type_3d, see its
+        # own docstring) and Type4b's local width table mis-keying (1, 1,
+        # 1)/(0, 1, 1) against ACCESS_WIDTHS (_type_4b's own docstring).
+        # Before those fixes, both handlers silently performed a
+        # concretely wrong-width memory access instead of the correct one
+        # (Type3d) or an Unknown/no-op (Type4b's now-declined long-word
+        # case); the frame render used those wrong concrete values for
+        # longer before finally diverging, reaching this same class of
+        # halt 111,706 instructions later than it now does. This new stop
+        # is the more trustworthy one -- it reflects a run that stopped
+        # guessing on schedule (a wrong-width memory access misleading
+        # nothing) -- not a regression.
         self.assertIn("differs from recorded return", halt.reason)
-        self.assertEqual(halt.pc_sw, 0xB82A30)
-        self.assertEqual(results[0].instructions, 191363)
+        self.assertEqual(halt.pc_sw, 0xB82BF1)
+        self.assertEqual(results[0].instructions, 79625)
 
 
 @unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")

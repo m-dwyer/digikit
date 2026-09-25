@@ -524,19 +524,32 @@ def _type_4b(
 ) -> list[State]:
     """4b."""
     # SHARC+ Core Programming Reference rev. 1.4, pp. 13-29--13-32:
-    # conditional DM/PM transfer with a signed six-bit immediate modifier.
+    # conditional DM/PM transfer with a signed six-bit immediate modifier,
+    # the same 3-bit ACCESS/BH/BHSE (l, x, w) table as Type3b/Type4d --
+    # ACCESS_WIDTHS (sharc_core/encoding.py), not a separate hand-rolled
+    # one. This handler previously carried its own local ``widths`` dict
+    # that mis-keyed two of ACCESS_WIDTHS' six entries: (1, 1, 1) mapped
+    # here to ("normal-word", 4, False) -- ACCESS_WIDTHS' own (1, 1, 1) is
+    # "long-word" -- and (0, 1, 1) (ACCESS_WIDTHS' real normal-word key)
+    # was missing entirely, so that combination always stopped as
+    # "unsupported". Found by tools/sharc_widthaudit.py on dt2-1.16's
+    # frame render: every Type4b (l, x, w) = (1, 1, 1) access there (317
+    # occurrences) read/wrote a 4-byte normal word where the decoded
+    # fields select an 8-byte long-word access.
     width_fields = (_field(f, "l"), _field(f, "x"), _field(f, "w"))
-    widths = {
-        (1, 1, 1): ("normal-word", 4, False),
-        (0, 0, 0): ("byte", 1, False),
-        (1, 0, 0): ("short-word", 2, False),
-        (0, 1, 0): ("byte-sign-extended", 1, True),
-        (1, 1, 0): ("short-word-sign-extended", 2, True),
-    }
-    access_spec = widths.get(width_fields)
-    if access_spec is None:
+    access_width = ACCESS_WIDTHS.get(width_fields)
+    if access_width is None:
         return [_stop(state, insn, "unsupported Type4b access width")]
-    access_width, width, signed = access_spec
+    widths = {
+        "normal-word": 4,
+        "byte": 1,
+        "byte-sign-extended": 1,
+        "short-word": 2,
+        "short-word-sign-extended": 2,
+        "long-word": 8,
+    }
+    width = widths[access_width]
+    signed = access_width.endswith("sign-extended")
     store = bool(_field(f, "d"))
     if store and signed:
         return [_stop(state, insn, "unsupported Type4b sign-extended store")]
@@ -1392,19 +1405,50 @@ def _type_3d(
     # adds byte/short and exclusive-access options Type3a does not
     # support ("extension to 3a instruction (exclusive access without
     # compute option)", p.13-22 NOTE), so there is no compute field.
-    # w selects the ACCESS (0) vs WACCESS (1) group and ex marks an
+    # w selects the ACCESS (0) vs WACCESS (1) group; ex marks an
     # exclusive-access monitor this tracer does not model, matching
-    # the existing "14d" handler's ex=1 stop above; both are left
-    # unsupported here rather than guessed. The w=0/ex=0 ACCESS group
-    # is a plain normal-word transfer (l/x unused); w=0/ex=1 is
-    # BH/BHSE, the same (l, x, 0) slice of ACCESS_WIDTHS as Type3b/4d
-    # use, but always exclusive, so it also stops.
+    # the existing "14d" handler's ex=1 stop below -- left unsupported
+    # rather than guessed.
+    #
+    # docs/findings/06 ("Wrap copies +0x1bc"): the w=0 ACCESS group's own
+    # encode table (p.324, "ACCESS (Type 3d)") names every u/g/d row's
+    # modifier from the BH ("... BH (Type 3d)", a store) or BHSE
+    # ("... BHSE (Type 3d)", a load) sub-table that immediately follows
+    # it -- both indexed by ex, l and (BHSE only) x -- not from a
+    # separate "no modifier when ex=0" case. Those sub-tables' own (l, x)
+    # columns are exactly Type3b/Type4d's byte/short(-sign-extended)
+    # ACCESS_WIDTHS (l, x, w=0) slice (PRM pp.13-16--13-19/13-31--13-35).
+    # This handler previously hardcoded w=0 (any ex) as normal-word,
+    # l/x unused ("the plain 48-bit re-encoding of Type3a"): a concrete
+    # run of dt2-1.16's voice render refuted that (sw 0x1c50fb/0x1c5322,
+    # decoded fields l=0, x=0, w=0, ex=0 -- confirmed via tools/sharc.py's
+    # insn table). With the hardcoded normal-word read, a looping voice's
+    # ACTIVE flag was cleared on every wrap instead of tracking
+    # FIELD_LOOP the way docs/findings/06's "Flags and seed" documents;
+    # overriding the load to the ACCESS_WIDTHS-correct 1-byte value
+    # (matching the sibling Type4d byte store at the very same site)
+    # reproduced the documented wrap behaviour. So w=0 uses
+    # ACCESS_WIDTHS[(l, x, 0)] regardless of ex -- only WACCESS (w=1)
+    # and the exclusive-monitor semantics of ex=1 remain unsupported.
     if _field(f, "w"):
         return [_stop(state, insn, "unsupported Type3d WACCESS")]
     if _field(f, "ex"):
         return [_stop(state, insn, "unsupported Type3d exclusive access")]
-    access_width = "normal-word"
+    access_width = ACCESS_WIDTHS.get((_field(f, "l"), _field(f, "x"), _field(f, "w")))
+    if access_width is None:
+        return [_stop(state, insn, "unsupported Type3d access width")]
     store = bool(_field(f, "d"))
+    if store and access_width.endswith("sign-extended"):
+        return [_stop(state, insn, "unsupported Type3d sign-extended store")]
+    widths = {
+        "normal-word": 4,
+        "byte": 1,
+        "byte-sign-extended": 1,
+        "short-word": 2,
+        "short-word-sign-extended": 2,
+        "long-word": 8,
+    }
+    width = widths[access_width]
     bank = 8 if _field(f, "g") else 0
     index, modifier = _field(f, "i") + bank, _field(f, "m") + bank
     post_modify = bool(_field(f, "u"))
@@ -1433,14 +1477,35 @@ def _type_3d(
                 value=value,
                 address=address,
                 expression=_render(address),
-                concrete_write=_dm_write(executed, address, 4, value)
+                concrete_write=_dm_write(executed, address, width, value)
                 if space == "DM"
                 else False,
                 addressing_mode="post-modify" if post_modify else "pre-modify",
                 access_width=access_width,
             )
         else:
-            loaded = _load_normal_ureg(executed, space, address, ureg)
+            loaded = (
+                _load_normal_ureg(executed, space, address, ureg)
+                if access_width == "normal-word"
+                else (
+                    _dm_read(
+                        executed,
+                        address,
+                        width,
+                        access_width.endswith("sign-extended"),
+                    )
+                    if space == "DM"
+                    else None
+                )
+            )
+            if access_width != "normal-word":
+                # The dict[str, int] PX1/PX2 summary only comes back from
+                # the access_width == "normal-word" branch above (see
+                # Type4d's identical guard); this branch never sees it.
+                assert not isinstance(loaded, dict)
+                executed.uregs[ureg] = loaded or Unknown(
+                    "memory-address " + _render(address)
+                )
             _event(
                 executed,
                 insn,
