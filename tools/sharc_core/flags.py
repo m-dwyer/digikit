@@ -170,6 +170,42 @@ def _float_alu_updates(
     return updates
 
 
+def _double_alu_updates(
+    hi_value: Value,
+    lo_value: Value,
+    *,
+    av: bool | None = False,
+    an_zero: bool = False,
+    ai: bool | None = None,
+) -> dict[int, bool | None]:
+    """ASTATX update dict for the 64-bit float ALU ops (SC58x/2158x PRM
+    ch.20 "64-bit Floating-Point Computations"; per-op flags cited at each
+    call site). Same shape as ``_float_alu_updates``: AN is HI_VALUE's own
+    sign bit; AZ needs *both* halves zero (unlike AN, a zero HI half alone
+    does not imply LO is also zero -- a subnormal double can have a
+    zero-looking HI word with a nonzero LO mantissa tail). AS (sign of a
+    separate operand, e.g. abs's input sign) never appears in any 64-bit
+    ALU flags table this project has read, unlike the 32-bit abs op, so it
+    is not modeled here -- every 64-bit op's AS column is "Cleared" per the
+    manual.
+    """
+    updates: dict[int, bool | None] = {
+        AC_BIT: False,
+        AF_BIT: True,
+        AV_BIT: av,
+        AI_BIT: ai,
+        AS_BIT: False,
+    }
+    if isinstance(hi_value, Const) and isinstance(lo_value, Const):
+        bits = hi_value.value
+        updates[AZ_BIT] = (bits & 0x7FFFFFFF) == 0 and lo_value.value == 0
+        updates[AN_BIT] = False if an_zero else bool(bits & 0x80000000)
+    else:
+        updates[AZ_BIT] = None
+        updates[AN_BIT] = False if an_zero else None
+    return updates
+
+
 def _astatx_bit_test(source: Value, mask: int, xor: bool) -> bool | None:
     """BIT TST / BIT XOR (SHARC+ Core Programming Reference, "Type 18a
     ISA/VISA (register bit manipulation)", p.401/16-2-16-3): the test

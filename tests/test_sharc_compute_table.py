@@ -70,12 +70,15 @@ UNDOCUMENTED = {
     ("mult", 0x10): "compute_mult.mult_undocumented_10",
     ("shift", 0x14): "compute_shift.shift_undocumented_14",
     ("shift", 0xB0): "compute_shift.shift_undocumented_b0",
-    ("cu3", 0xD6): "compute._compute_reserved_cu3",
+    ("cu3", 0xD6): "compute._make_reserved_cu3(0xd6)",
+    ("cu3", 0xE0): "compute._make_reserved_cu3(0xe0)",
 }
 
 
 def test_alu_ops_documented_in_json():
-    rows = COMPUTE_TABLE["aluop_32_40bit"]["rows"]
+    rows = (
+        COMPUTE_TABLE["aluop_32_40bit"]["rows"] + COMPUTE_TABLE["aluop_64bit"]["rows"]
+    )
     for opcode in ALU_OPS:
         assert _documented(rows, "opcode", opcode, 8), hex(opcode)
 
@@ -166,15 +169,18 @@ def test_dispatch_tables_have_no_duplicate_or_shadowed_keys():
     # compute_mult.py/compute_shift.py/compute_multi.py (a Python dict
     # literal cannot contain a duplicate key, but confirms the count
     # actually intended, not just "it didn't raise").
-    assert len(ALU_OPS) == 43  # +1: 0x89 Fn = (Fx + Fy) / 2 (PRM p.19-4)
+    # 43 (32/40-bit) + 15 (SC58x/2158x PRM Table 18-6, 64-bit float ALU,
+    # opcodes 0x11-0x1f, lane F1) = 58.
+    assert len(ALU_OPS) == 58  # +1: 0x89 Fn = (Fx + Fy) / 2 (PRM p.19-4)
     # MULT_OPS is generated from PRM Table 17-7's MOD1/MOD2/MOD3 bit layout
     # (compute_mult.py's _build_mult_ops), not hand-typed per opcode: 16 sat
     # + 2 clear + 8 rnd + 36 plain-multiply + 96 accumulate/subtract, minus
     # 0xB4/0xB0 (compute.py intercepts those before MULT_OPS), + float (1) +
-    # undocumented 0x10 (1) = 158.
-    assert len(MULT_OPS) == 158
+    # undocumented 0x10 (1) + 64-bit float (Table 18-8, opcodes 0x31-0x33,
+    # lane F1) (3) = 161.
+    assert len(MULT_OPS) == 161
     assert len(SHIFT_OPS) == 13
-    assert len(CU3_OPS) == 1
+    assert len(CU3_OPS) == 2  # lane F1: 0xd6 (pre-existing) and 0xe0
     assert len(SHORT_OPS) == 16
     assert len(MULTIFN_MUL_ALU_OPS) == 7
 

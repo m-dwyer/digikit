@@ -434,6 +434,267 @@ def _float_round32(value: Value, expression: str) -> tuple[Value, bool | None]:
     return Const(bits), False
 
 
+# ---------------------------------------------------------------------------
+# 64-bit (IEEE double) floating-point compute support (ADSP-SC58x/2158x PRM,
+# out/refs/sc58x-2158x-prm; not in the classic PRM/PGR this project otherwise
+# cites -- SHARC+ adds these on top of the base ISA).
+#
+# A "DBLREG" operand Fm:n/Fx:y/Fz:w is a neighbor register pair: p.3-35
+# Table 3-20 ("pair F1:0 consists of R1 and R0"), decoded from the *same*
+# rn/rx/ry 4-bit field positions as a 32-bit compute (Table 18-23/Figure
+# 18-1); only even codes are valid pair selectors (p.18-16/17 Table 18-27/
+# 18-28: opcode 0000->F1:0, 0010->F3:2, ... 1110->F15:14, odd codes "-").
+# The higher-numbered register holds the more-significant half (all.txt:
+# 32507 "REGF_MR0F contains the least significant 32 bits", 32651
+# "REGF_MR2F contains the most significant 16 bits" -- the same low-number-
+# is-low-half convention applied to a register pair), matching Figure 28-2's
+# (p.28-2) standard IEEE-754 binary64 layout (sign:bit63, 11-bit exponent:
+# bits62-52, 52-bit mantissa:bits51-0) split across hi=bits63-32/lo=bits31-0.
+#
+# Python floats already are IEEE-754 binary64, so (unlike the float32 path
+# above, which has to hand-round every result through struct) ordinary
+# Python arithmetic on the unpacked doubles already produces the correctly-
+# rounded IEEE double result, including overflow-to-infinity. Matching this
+# module's own documented simplification for the 32-bit path (this file's
+# header comment: denormal-flush-to-zero "is also not modeled ... this only
+# matters for subnormal magnitudes, which real audio sample/parameter data
+# essentially never produces"), the 64-bit ops below do not flush denormal
+# inputs/outputs to zero either, even though several PRM pages document that
+# as the real hardware's behaviour: AZ/MU still report a denormal result
+# correctly (computed from its real bit pattern), only the *flush* itself is
+# skipped.
+# ---------------------------------------------------------------------------
+
+_DOUBLE_ALL_ONES_HI = Const(0xFFFFFFFF)
+_DOUBLE_ALL_ONES_LO = Const(0xFFFFFFFF)
+
+
+def _double(hi: Value, lo: Value) -> float | None:
+    """Combine a register pair (HI = more-significant half, LO =
+    less-significant half) into a Python double. None when either half
+    isn't a fully known Const."""
+    if not isinstance(hi, Const) or not isinstance(lo, Const):
+        return None
+    bits = ((hi.value & 0xFFFFFFFF) << 32) | (lo.value & 0xFFFFFFFF)
+    return struct.unpack(">d", struct.pack(">Q", bits))[0]
+
+
+def _double_pair_bits(value: float) -> tuple[int, int]:
+    """(hi, lo) 32-bit halves of VALUE's IEEE-754 binary64 pattern. Unlike
+    ``_float32_bits``, this never raises/needs an overflow fallback: VALUE
+    is already a Python double (the type every 64-bit op here computes
+    with), so it already IS the correctly-rounded binary64 result verbatim
+    (including a literal ``inf`` on overflow)."""
+    bits = struct.unpack(">Q", struct.pack(">d", value))[0]
+    return (bits >> 32) & 0xFFFFFFFF, bits & 0xFFFFFFFF
+
+
+def _double_binary(
+    hi_a: Value, lo_a: Value, hi_b: Value, lo_b: Value, expression: str, operation
+) -> tuple[Value, Value, bool | None, bool | None]:
+    """Evaluate a 64-bit float ALU/multiplier binary OPERATION; return
+    (hi_result, lo_result, overflowed, invalid). Mirrors ``_float_binary``'s
+    NAN-input override (PRM p.20-22 "A NAN input returns an all 1s
+    result") and overflow detection (a literal ``inf`` OPERATION result
+    with two finite inputs -- the real IEEE-754 double range, unlike
+    float32, so no manual struct-overflow fallback is needed)."""
+    a, b = _double(hi_a, lo_a), _double(hi_b, lo_b)
+    if a is None or b is None:
+        return Unknown(expression), Unknown(expression), None, None
+    if math.isnan(a) or math.isnan(b):
+        return _DOUBLE_ALL_ONES_HI, _DOUBLE_ALL_ONES_LO, False, True
+    raw = operation(a, b)
+    hi, lo = _double_pair_bits(raw)
+    overflowed = math.isinf(raw) and math.isfinite(a) and math.isfinite(b)
+    return Const(hi), Const(lo), overflowed, math.isnan(raw)
+
+
+def _double_unary(
+    hi: Value, lo: Value, expression: str, operation
+) -> tuple[Value, Value, bool | None, bool | None]:
+    """Unary counterpart of ``_double_binary`` (see its docstring)."""
+    a = _double(hi, lo)
+    if a is None:
+        return Unknown(expression), Unknown(expression), None, None
+    if math.isnan(a):
+        return _DOUBLE_ALL_ONES_HI, _DOUBLE_ALL_ONES_LO, False, True
+    raw = operation(a)
+    hi_bits, lo_bits = _double_pair_bits(raw)
+    return Const(hi_bits), Const(lo_bits), False, math.isnan(raw)
+
+
+def _double_compare(
+    hi_a: Value, lo_a: Value, hi_b: Value, lo_b: Value, label: str
+) -> tuple[Value, bool | None]:
+    """comp(FX:Y, FZ:W) (SC58x/2158x PRM p.20-24): same AZ(bit0)/AN(bit2)/
+    CACC-MSB(bit31) encoding as ``_compare_flags_float``, consumed the same
+    way by ``_astatx_compare``."""
+    a, b = _double(hi_a, lo_a), _double(hi_b, lo_b)
+    if a is None or b is None:
+        return Unknown(label), None
+    if math.isnan(a) or math.isnan(b):
+        return Const(0), True
+    return (
+        Const(
+            (0x1 if a == b else 0)
+            | (0x4 if a < b else 0)
+            | (0x80000000 if a > b else 0)
+        ),
+        False,
+    )
+
+
+def _double_to_fixed(
+    hi: Value, lo: Value, mode1: Value, always_truncate: bool, expression: str
+) -> tuple[Value, bool | None, bool | None]:
+    """RN = fix FX:Y / RN = trunc FX:Y (SC58x/2158x PRM p.20-28/20-30,
+    p.20-29/20-32 for the BY RY forms -- the caller pre-scales HI/LO via
+    ``_scale_double_input``): same rounding/saturation rule as
+    ``_float_to_fixed``, reading a 64-bit input and always producing a
+    plain 32-bit RN (Table 18-28: the fix/trunc destination column is
+    "Rn/Rx/Ry/Rz", not a register pair)."""
+    a = _double(hi, lo)
+    if a is None:
+        return Unknown(expression), None, None
+    saturating = _astatx_known_bit(mode1, ALUSAT_BIT)
+    if math.isnan(a) or math.isinf(a):
+        if saturating:
+            return (
+                Const(0x7FFFFFFF if (math.isnan(a) or a > 0) else 0x80000000),
+                True,
+                True,
+            )
+        if saturating is False:
+            return Unknown(expression + " (unsaturated NAN/infinity fix)"), True, True
+        return Unknown(expression), None, True
+    if always_truncate:
+        rounded = math.trunc(a)
+    else:
+        truncate_mode = _astatx_known_bit(mode1, TRUNCATE_BIT)
+        if truncate_mode is None:
+            return Unknown(expression), None, False
+        rounded = math.trunc(a) if truncate_mode else int(round(a))
+    if -(1 << 31) <= rounded <= (1 << 31) - 1:
+        return Const(rounded & 0xFFFFFFFF), False, False
+    if saturating:
+        return Const(0x7FFFFFFF if rounded > 0 else 0x80000000), True, False
+    if saturating is False:
+        return Unknown(expression + " (unsaturated fix overflow)"), True, False
+    return Unknown(expression), None, False
+
+
+def _scale_double_input(
+    hi: Value, lo: Value, scale: Value, expression: str
+) -> tuple[Value, Value]:
+    """(hi, lo) of Fx:y * 2**Ry (exponent add), the shared first step of
+    RN = FIX/TRUNC FX:Y BY RY (SC58x/2158x PRM p.20-29: "the fixed-point
+    two's-complement integer in Ry is added to the exponent of the
+    floating-point operand in Fx:y before the conversion"). The only two
+    callers immediately feed this pair back into ``_double_to_fixed``."""
+    a = _double(hi, lo)
+    if a is None or not isinstance(scale, Const):
+        return Unknown(expression), Unknown(expression)
+    shift = _signed32(scale.value)
+    if math.isnan(a) or math.isinf(a):
+        scaled = a  # NAN/infinity pass straight through; _double_to_fixed
+        # applies its own NAN/infinity special case to the unscaled value.
+    else:
+        try:
+            scaled = math.ldexp(a, shift)
+        except OverflowError:
+            scaled = math.copysign(math.inf, a)
+    hi_bits, lo_bits = _double_pair_bits(scaled)
+    return Const(hi_bits), Const(lo_bits)
+
+
+def _fixed_to_double(value: Value, expression: str) -> tuple[Value, Value, bool | None]:
+    """FM:N = float RX (SC58x/2158x PRM p.20-33): numeric int32->double
+    conversion (always exact -- int32's range is a tiny sliver of double's),
+    AI/AV architecturally fixed 0 (p.20-33/20-34 ASTATx/y Flags). Returns
+    (hi, lo, invalid=False when computable)."""
+    if not isinstance(value, Const):
+        return Unknown(expression), Unknown(expression), None
+    hi, lo = _double_pair_bits(float(_signed32(value.value)))
+    return Const(hi), Const(lo), False
+
+
+def _fixed_to_double_scaled(
+    value: Value, scale: Value, expression: str
+) -> tuple[Value, Value, bool | None]:
+    """FM:N = float RX by RY (SC58x/2158x PRM p.20-34): ``_fixed_to_double``
+    then RY's exponent add (p.20-34: "the fixed-point two's-complement
+    integer in Ry is added to the exponent of the floating-point result").
+    AV is data-dependent here (p.20-34: "Set if the result overflows
+    (unbiased exponent > 1023)"), unlike the unscaled form."""
+    if not isinstance(value, Const) or not isinstance(scale, Const):
+        return Unknown(expression), Unknown(expression), None
+    unscaled = float(_signed32(value.value))
+    shift = _signed32(scale.value)
+    try:
+        scaled = math.ldexp(unscaled, shift)
+    except OverflowError:
+        scaled = math.copysign(math.inf, unscaled) if unscaled != 0.0 else 0.0
+    hi, lo = _double_pair_bits(scaled)
+    overflowed = math.isinf(scaled)
+    return Const(hi), Const(lo), overflowed
+
+
+def _double_scalb(
+    hi: Value, lo: Value, scale: Value, expression: str
+) -> tuple[Value, Value, bool | None, bool | None]:
+    """FM:N = scalb FX:Y by RY (SC58x/2158x PRM p.20-27): adds the
+    fixed-point two's-complement integer in Ry to Fx:y's exponent. A NAN
+    input returns the all-1s sentinel; zero/infinity pass through
+    unchanged (``math.ldexp`` already preserves both)."""
+    a = _double(hi, lo)
+    if a is None or not isinstance(scale, Const):
+        return Unknown(expression), Unknown(expression), None, None
+    if math.isnan(a):
+        return _DOUBLE_ALL_ONES_HI, _DOUBLE_ALL_ONES_LO, False, True
+    shift = _signed32(scale.value)
+    try:
+        scaled = math.ldexp(a, shift)
+    except OverflowError:
+        scaled = math.copysign(math.inf, a)
+    hi_bits, lo_bits = _double_pair_bits(scaled)
+    overflowed = math.isinf(scaled) and not math.isinf(a)
+    return Const(hi_bits), Const(lo_bits), overflowed, False
+
+
+def _double_to_float32(
+    hi: Value, lo: Value, expression: str
+) -> tuple[Value, bool | None, bool | None]:
+    """FN = cvt FX:Y (SC58x/2158x PRM p.20-36): double -> single-precision
+    narrowing conversion, round-to-nearest (this tracer does not model
+    MODE1.TRUNCATE's alternate rounding for this op, the same limitation
+    ``_float_round32`` documents for its own rounding-mode citation).
+    A NAN input returns the float32 all-1s sentinel; a finite double
+    outside float32 range overflows to +-infinity (matching
+    ``_float32_bits``'s own overflow fallback)."""
+    a = _double(hi, lo)
+    if a is None:
+        return Unknown(expression), None, None
+    if math.isnan(a):
+        return _FLOAT_ALL_ONES, False, True
+    bits, overflowed = _float32_bits(a)
+    return Const(bits), overflowed, False
+
+
+def _float32_to_double(
+    value: Value, expression: str
+) -> tuple[Value, Value, bool | None]:
+    """FM:N = cvt FX (SC58x/2158x PRM p.20-35): single -> double-precision
+    widening conversion (always exact; every float32 value is exactly
+    representable as a double). A NAN input returns the all-1s sentinel."""
+    a = _float32(value)
+    if a is None:
+        return Unknown(expression), Unknown(expression), None
+    if math.isnan(a):
+        return _DOUBLE_ALL_ONES_HI, _DOUBLE_ALL_ONES_LO, True
+    hi, lo = _double_pair_bits(a)
+    return Const(hi), Const(lo), False
+
+
 def _approx_recips(left: Value) -> tuple[Value, dict[int, bool | None]]:
     """Opt-in ``--approx-recips`` model of ``FN = recips FX``.
 

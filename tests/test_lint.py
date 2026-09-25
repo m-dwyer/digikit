@@ -41,6 +41,7 @@ CLEAN = [
     "tests/test_sharc_survey.py",
     "tests/test_sharc_symbols.py",
     "tests/test_sharc_trace_alu.py",
+    "tests/test_sharc_trace_double.py",
     "tests/test_sharc_trace_forms.py",
     "tests/test_sharc_trace_mult.py",
     "tests/test_sharc_trace_simd.py",

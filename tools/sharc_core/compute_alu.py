@@ -34,14 +34,24 @@ from .flags import (
     _astatx_from_updates,
     _compare_flags,
     _compare_flags_float,
+    _double_alu_updates,
     _float_alu_updates,
     _or_updates,
 )
 from .floats import (
     _approx_recips,
+    _double_binary,
+    _double_compare,
+    _double_scalb,
+    _double_to_fixed,
+    _double_to_float32,
+    _double_unary,
+    _fixed_to_double,
+    _fixed_to_double_scaled,
     _fixed_to_float,
     _fixed_to_float_scaled,
     _float32_bits,
+    _float32_to_double,
     _float_binary,
     _float_clip,
     _float_copysign,
@@ -54,9 +64,10 @@ from .floats import (
     _float_to_fixed,
     _float_to_fixed_trunc,
     _float_unary,
+    _scale_double_input,
     _scale_fixed_input,
 )
-from .state import _ureg_raw
+from .state import _ureg, _ureg_raw
 from .values import (
     Const,
     Operand,
@@ -796,6 +807,260 @@ def alu_rsqrts_seed(rn, rx, ry, left, right, values, special, approx_recips) -> 
     return _alu_recip_seed_impl(rn, rx, left, "rsqrts", approx_recips)
 
 
+# ---------------------------------------------------------------------------
+# 64-bit (IEEE double) ALU ops (ADSP-SC58x/2158x PRM p.20-6/Table 18-6,
+# opcodes 0x11-0x1F -- cu=0, the same ALU unit as every op above, just a
+# gap in the classic PRM/PGR's opcode table that SHARC+ fills). RN/RX/RY
+# are read from the *same* field positions as a 32-bit op (Table 18-23);
+# only the register-pair operands (Fm:n/Fx:y/Fz:w) additionally read their
+# neighbour register via ``_ureg`` -- LEFT/RIGHT (already resolved by
+# ``_compute`` against the plain rx/ry codes) are unused here except where
+# an operand really is a single 32-bit register (fix/trunc/float's Rn or
+# Ry scale factor), named explicitly at each call site instead of reusing
+# LEFT/RIGHT's generic names, since which operand is a pair and which is
+# plain differs op to op (Table 18-28's "Rn/Rx/Ry/Rz" vs "Fm:n/Fx:y/Fz:w"
+# columns). None of these opcodes appears in dt2-1.16, dt2-1.15C, dn2-1.11
+# or dn2-1.10E's aligned, in-function code (tools/sharc.py census, lane F1)
+# -- implemented from the manual ahead of any observed use, like the
+# multiplier/shifter's own already-decoded-but-unobserved corners.
+def alu_double_add(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    hi, lo, overflow, invalid = _double_binary(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        _ureg(values, ry + 1),
+        _ureg(values, ry),
+        "F%d:%d + F%d:%d" % (rx + 1, rx, ry + 1, ry),
+        lambda a, b: a + b,
+    )
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-add",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=overflow, ai=invalid)),
+    )
+
+
+def alu_double_subtract(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    hi, lo, overflow, invalid = _double_binary(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        _ureg(values, ry + 1),
+        _ureg(values, ry),
+        "F%d:%d - F%d:%d" % (rx + 1, rx, ry + 1, ry),
+        lambda a, b: a - b,
+    )
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-subtract",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=overflow, ai=invalid)),
+    )
+
+
+def alu_double_compare(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    label = "comp F%d:%d, F%d:%d" % (rx + 1, rx, ry + 1, ry)
+    value, invalid = _double_compare(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        _ureg(values, ry + 1),
+        _ureg(values, ry),
+        label,
+    )
+    return rn, value, "double-compare", _astatx_compare_float(value, invalid)
+
+
+def alu_double_negate(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    hi, lo, _overflow, invalid = _double_unary(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        "-F%d:%d" % (rx + 1, rx),
+        lambda a: -a,
+    )
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-negate",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=False, ai=invalid)),
+    )
+
+
+def alu_double_abs(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    hi, lo, _overflow, invalid = _double_unary(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        "abs F%d:%d" % (rx + 1, rx),
+        abs,
+    )
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-abs",
+        _astatx_from_updates(
+            _double_alu_updates(hi, lo, av=False, an_zero=True, ai=invalid)
+        ),
+    )
+
+
+def alu_double_pass(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    hi, lo, _overflow, invalid = _double_unary(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        "pass F%d:%d" % (rx + 1, rx),
+        lambda a: a,
+    )
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-pass",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=False, ai=invalid)),
+    )
+
+
+def alu_double_fix(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    mode1 = _ureg_raw(values, UREG_CODES["MODE1"])
+    value, overflow, invalid = _double_to_fixed(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        mode1,
+        False,
+        "fix F%d:%d" % (rx + 1, rx),
+    )
+    return (
+        rn,
+        value,
+        "double-fix",
+        _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
+    )
+
+
+def alu_double_fix_scaled(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    mode1 = _ureg_raw(values, UREG_CODES["MODE1"])
+    hi, lo = _scale_double_input(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        right,
+        "F%d:%d * 2**R%d" % (rx + 1, rx, ry),
+    )
+    value, overflow, invalid = _double_to_fixed(
+        hi, lo, mode1, False, "fix F%d:%d by R%d" % (rx + 1, rx, ry)
+    )
+    return (
+        rn,
+        value,
+        "double-fix-scaled",
+        _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
+    )
+
+
+def alu_double_trunc(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    mode1 = _ureg_raw(values, UREG_CODES["MODE1"])
+    value, overflow, invalid = _double_to_fixed(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        mode1,
+        True,
+        "trunc F%d:%d" % (rx + 1, rx),
+    )
+    return (
+        rn,
+        value,
+        "double-trunc",
+        _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
+    )
+
+
+def alu_double_trunc_scaled(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    mode1 = _ureg_raw(values, UREG_CODES["MODE1"])
+    hi, lo = _scale_double_input(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        right,
+        "F%d:%d * 2**R%d" % (rx + 1, rx, ry),
+    )
+    value, overflow, invalid = _double_to_fixed(
+        hi, lo, mode1, True, "trunc F%d:%d by R%d" % (rx + 1, rx, ry)
+    )
+    return (
+        rn,
+        value,
+        "double-trunc-scaled",
+        _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
+    )
+
+
+def alu_double_float(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    hi, lo, invalid = _fixed_to_double(left, "float R%d" % rx)
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-float",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=False, ai=invalid)),
+    )
+
+
+def alu_double_float_scaled(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    hi, lo, overflow = _fixed_to_double_scaled(
+        left, right, "float R%d by R%d" % (rx, ry)
+    )
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-float-scaled",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=overflow, ai=False)),
+    )
+
+
+def alu_double_scalb(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    hi, lo, overflow, invalid = _double_scalb(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        right,
+        "scalb F%d:%d by R%d" % (rx + 1, rx, ry),
+    )
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "double-scalb",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=overflow, ai=invalid)),
+    )
+
+
+def alu_double_to_float32(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    value, overflow, invalid = _double_to_float32(
+        _ureg(values, rx + 1), _ureg(values, rx), "cvt F%d:%d" % (rx + 1, rx)
+    )
+    return (
+        rn,
+        value,
+        "double-to-float32",
+        _astatx_from_updates(_float_alu_updates(value, av=overflow, ai=invalid)),
+    )
+
+
+def alu_float32_to_double(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    hi, lo, invalid = _float32_to_double(left, "cvt F%d" % rx)
+    return (
+        (rn + 1, rn),
+        (hi, lo),
+        "float32-to-double",
+        _astatx_from_updates(_double_alu_updates(hi, lo, av=False, ai=invalid)),
+    )
+
+
 ALU_OPS: dict[int, Handler] = {
     0x01: alu_add,
     0x02: alu_subtract,
@@ -840,4 +1105,19 @@ ALU_OPS: dict[int, Handler] = {
     0xDD: alu_trunc_scaled,
     0xC4: alu_recips_seed,
     0xC5: alu_rsqrts_seed,
+    0x11: alu_double_add,
+    0x12: alu_double_subtract,
+    0x13: alu_double_compare,
+    0x14: alu_double_negate,
+    0x15: alu_double_abs,
+    0x16: alu_double_pass,
+    0x17: alu_double_fix,
+    0x18: alu_double_fix_scaled,
+    0x19: alu_double_trunc,
+    0x1A: alu_double_trunc_scaled,
+    0x1B: alu_double_float,
+    0x1C: alu_double_float_scaled,
+    0x1D: alu_float32_to_double,
+    0x1E: alu_double_to_float32,
+    0x1F: alu_double_scalb,
 }

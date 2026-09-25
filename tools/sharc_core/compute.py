@@ -105,29 +105,53 @@ __all__ = [
 # PRM top-level compute selector (tools/sharcspec/compute_table.json's
 # top_level_structure.single_function_selector): the reserved cu=3 (called
 # "cu=11" there, its 2-bit field value) is "not used by SINGLEFN" -- no
-# compute unit is documented for it, in either public source. Only the one
-# opcode this image's coverage scan actually found (0xd6, `sw 0x1c32ba`,
-# sitting between two otherwise-ordinary instructions -- not an obvious
-# data-as-code region) is decoded, like compute_shift.py's undocumented
-# 0xb0/0x14 and compute_mult.py's undocumented 0x10, rather than guessed
-# at; every other cu=3 opcode still raises, since there is no evidence it
-# is real or what it would mean.
-def _compute_reserved_cu3(
-    rn, rx, ry, left, right, values, special, approx_recips
-) -> tuple:
-    label = (
-        "reserved compute unit cu=3 opcode=%#x R%d, R%d (PRM: cu=11 not used by SINGLEFN)"
-        % (0xD6, rx, ry)
-    )
-    return (
-        rn,
-        Unknown(label),
-        "compute-reserved-cu3",
-        lambda astatx: _astatx_forget(astatx, ALU_FLAGS_MASK | SHIFT_FLAGS_MASK),
-    )
+# compute unit is documented for it, in either public source. Two opcodes
+# this image's coverage scan actually found are decoded (like
+# compute_shift.py's undocumented 0xb0/0x14 and compute_mult.py's
+# undocumented 0x10), rather than guessed at; every other cu=3 opcode
+# still raises, since there is no evidence it is real or what it would
+# mean:
+#   - 0xd6, `sw 0x1c32ba` in FUN_1c3289, form 7a.
+#   - 0xe0, `sw 0x1c32b1`, TWO INSTRUCTIONS EARLIER in the SAME function,
+#     form 1a. Lane F1 checked the SC58x/2158x PRM's 64-bit floating-point
+#     chapters (out/refs/sc58x-2158x-prm) specifically for this one, since
+#     0xe0 is also the opcode the real per-machine synthesis path hits
+#     once the master-bus table is unmasked -- they do not explain it: the
+#     manual's 64-bit float ops occupy cu=0 opcode 0x11-0x1f (Table 18-6,
+#     compute_alu.py's ALU_OPS) and cu=1 opcode 0x31-0x33 (Table 18-8,
+#     compute_mult.py's MULT_OPS), never cu=3, and tools/sharcspec/
+#     compute_table.json's own top_level_structure confirms cu=11 has no
+#     "format" row at all. Neither opcode is used by any of the 64-bit ops
+#     this project implemented from that chapter, in any of dt2-1.16,
+#     dt2-1.15C, dn2-1.11 or dn2-1.10E's aligned, in-function code either
+#     (same census). Both instructions sit in a run bracketed by an index
+#     clamped to 0-15 (0x1c32a0-0x1c32a9), the undocumented multiplier
+#     opcode 0x10 (0x1c32ab), a USTAT2 read (0x1c32ad), an undocumented
+#     16-bit form (0x1c32b0, operand 0x25) and an undocumented 48-bit form
+#     (0x1c32b4) -- a cluster worth treating as "possibly a table read
+#     through the instruction stream, not real compute" in a future lane,
+#     not chased further here.
+def _make_reserved_cu3(opcode: int) -> Callable:
+    def handler(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+        label = (
+            "reserved compute unit cu=3 opcode=%#x R%d, R%d "
+            "(PRM: cu=11 not used by SINGLEFN; not the SC58x/2158x PRM's "
+            "64-bit float ops either, which live at cu=0/cu=1)" % (opcode, rx, ry)
+        )
+        return (
+            rn,
+            Unknown(label),
+            "compute-reserved-cu3",
+            lambda astatx: _astatx_forget(astatx, ALU_FLAGS_MASK | SHIFT_FLAGS_MASK),
+        )
+
+    return handler
 
 
-CU3_OPS: dict[int, Callable] = {0xD6: _compute_reserved_cu3}
+CU3_OPS: dict[int, Callable] = {
+    0xD6: _make_reserved_cu3(0xD6),
+    0xE0: _make_reserved_cu3(0xE0),
+}
 
 # REGF_STKYX/REGF_STKYY sticky bit positions this module latches for
 # multiplier ops (SHARC+ PRM p.28-83/28-84, Table 28-46): MOS latches the

@@ -20,10 +20,19 @@ every generated key against ``tools/sharcspec/compute_table.json``.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 
 from .flags import _astatx_apply_bits, _astatx_mult_clear, _astatx_mult_forget
-from .floats import _float_binary
+from .floats import (
+    _DOUBLE_ALL_ONES_HI,
+    _DOUBLE_ALL_ONES_LO,
+    _double,
+    _double_binary,
+    _double_pair_bits,
+    _float32,
+    _float_binary,
+)
 from .state import MR, MR_ZERO, _mr_from_signed, _mr_read_word, _mr_write_word, _ureg
 from .values import (
     ComputeDest,
@@ -200,6 +209,37 @@ def _astatx_mult_float(
         mn = bool(bits & 0x80000000)
         mv = bool(overflowed)
         mu = (bits & 0x7F800000) == 0 and (bits & 0x007FFFFF) != 0
+    updates = {MN_BIT: mn, MV_BIT: mv, MU_BIT: mu, MI_BIT: invalid}
+    return lambda astatx: _astatx_apply_bits(astatx, updates)
+
+
+def _astatx_mult_double(
+    hi_result: Value, lo_result: Value, overflowed: bool | None, invalid: bool | None
+) -> Callable[[Value], Value]:
+    """SC58x/2158x PRM ch.23 "64-bit Floating-Point Operations" (p.23-2..
+    23-4), each op's identical "ASTATx/y Flags" table: MN/MV/MU/MI, the
+    same shape as ``_astatx_mult_float`` above but reading the register
+    pair's bits (HI bit31=sign, HI bits30-20=the 11-bit biased exponent,
+    HI bits19-0 + LO = the 52-bit mantissa) instead of a 32-bit float's.
+    MU ("unbiased exponent < -1022") is a true denormal HI:LO result
+    (biased exponent field 0, mantissa nonzero -- excluding exact zero,
+    matching ``_astatx_mult_float``'s own ``!= 0`` mantissa check); this
+    project's 64-bit ops do not flush denormal results to zero
+    (``floats.py``'s 64-bit header comment), so a genuine denormal double
+    is reported here exactly as computed. The manual's own NAN-sign
+    refinement ("if only one operand is a NAN, the sign of the result is
+    the sign of that NAN operand") is not modeled: like every other NAN
+    case in this project, ``_double_binary`` returns a fixed all-1s (thus
+    always-negative) sentinel regardless of which operand was NAN.
+    """
+    mn = mv = mu = None
+    if isinstance(hi_result, Const) and isinstance(lo_result, Const):
+        hi_bits, lo_bits = hi_result.value, lo_result.value
+        mn = bool(hi_bits & 0x80000000)
+        mv = bool(overflowed)
+        biased_exp = (hi_bits >> 20) & 0x7FF
+        mantissa_nonzero = (hi_bits & 0xFFFFF) != 0 or lo_bits != 0
+        mu = biased_exp == 0 and mantissa_nonzero
     updates = {MN_BIT: mn, MV_BIT: mv, MU_BIT: mu, MI_BIT: invalid}
     return lambda astatx: _astatx_apply_bits(astatx, updates)
 
@@ -447,6 +487,92 @@ def mult_float(rn, rx, ry, left, right, values, special, approx_recips) -> tuple
     return rn, result, "float-multiply", astatx
 
 
+# ---------------------------------------------------------------------------
+# 64-bit (IEEE double) multiplier ops (ADSP-SC58x/2158x PRM ch.23, Table
+# 18-8, opcodes 0x31-0x33 -- cu=1, right after 0x30's plain 32-bit float
+# multiply, the classic PRM/PGR's MULOP table has no entries above 0x30).
+# The manual documents a WARNING for all three ("the data in MR register
+# at the end of execution ... is not valid") -- this tracer has no pipeline
+# model where that would show up (MRF/MRB are only ever touched here via
+# the ordinary accumulator special-dict slots the fixed-point MAC rows use,
+# and none of these three ops reads or writes one), so it is not modeled.
+# None of the three appears in dt2-1.16, dt2-1.15C, dn2-1.11 or dn2-1.10E's
+# aligned, in-function code (lane F1 census); implemented ahead of any
+# observed use, like ``mult_undocumented_10`` below is decoded ahead of a
+# public source.
+# ---------------------------------------------------------------------------
+def mult_double_multiply(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    """FM:N = FX:Y * FZ:W (p.23-2): both operands are register pairs."""
+    hi, lo, overflowed, invalid = _double_binary(
+        _ureg(values, rx + 1),
+        _ureg(values, rx),
+        _ureg(values, ry + 1),
+        _ureg(values, ry),
+        "F%d:%d * F%d:%d" % (rx + 1, rx, ry + 1, ry),
+        lambda a, b: a * b,
+    )
+    astatx = _astatx_mult_double(hi, lo, overflowed, invalid)
+    return (rn + 1, rn), (hi, lo), "double-multiply", astatx
+
+
+def mult_double_multiply_single(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    """FM:N = FX:Y * FY (p.23-3): FX:Y a register pair, FY (RIGHT) a plain
+    single-precision register."""
+    label = "F%d:%d * F%d" % (rx + 1, rx, ry)
+    a = _double(_ureg(values, rx + 1), _ureg(values, rx))
+    b = _float32(right)
+    if a is None or b is None:
+        astatx = _astatx_mult_double(Unknown(label), Unknown(label), None, None)
+        return (
+            (rn + 1, rn),
+            (Unknown(label), Unknown(label)),
+            "double-multiply-single",
+            astatx,
+        )
+    if math.isnan(a) or math.isnan(b):
+        hi, lo = _DOUBLE_ALL_ONES_HI, _DOUBLE_ALL_ONES_LO
+        astatx = _astatx_mult_double(hi, lo, False, True)
+        return (rn + 1, rn), (hi, lo), "double-multiply-single", astatx
+    raw = a * b
+    hi_int, lo_int = _double_pair_bits(raw)
+    hi, lo = Const(hi_int), Const(lo_int)
+    overflowed = math.isinf(raw) and math.isfinite(a) and math.isfinite(b)
+    astatx = _astatx_mult_double(hi, lo, overflowed, False)
+    return (rn + 1, rn), (hi, lo), "double-multiply-single", astatx
+
+
+def mult_float_widening_multiply(
+    rn, rx, ry, left, right, values, special, approx_recips
+) -> tuple:
+    """FM:N = FX * FY (p.23-4): both operands plain single-precision
+    registers (LEFT/RIGHT, already resolved by ``_compute`` against the
+    plain rx/ry codes); the double-precision result is exact (a
+    float32*float32 product always fits a double's 52-bit mantissa
+    exactly), so overflow is architecturally impossible here."""
+    label = "F%d * F%d" % (rx, ry)
+    a, b = _float32(left), _float32(right)
+    if a is None or b is None:
+        astatx = _astatx_mult_double(Unknown(label), Unknown(label), None, None)
+        return (
+            (rn + 1, rn),
+            (Unknown(label), Unknown(label)),
+            "float-widening-multiply",
+            astatx,
+        )
+    if math.isnan(a) or math.isnan(b):
+        hi, lo = _DOUBLE_ALL_ONES_HI, _DOUBLE_ALL_ONES_LO
+        astatx = _astatx_mult_double(hi, lo, False, True)
+        return (rn + 1, rn), (hi, lo), "float-widening-multiply", astatx
+    hi_int, lo_int = _double_pair_bits(a * b)
+    hi, lo = Const(hi_int), Const(lo_int)
+    astatx = _astatx_mult_double(hi, lo, False, False)
+    return (rn + 1, rn), (hi, lo), "float-widening-multiply", astatx
+
+
 # Undocumented in both public sources: PRM Table 17-7 and PGR Table 12-5
 # both list only mrf/mrb=0 (0001 0100/0110) and rnd MOD3 (0001 100x-111x)
 # under the "0001 xxxx" opcode prefix -- neither has a 0001 0000 row.
@@ -556,6 +682,9 @@ def _build_mult_ops() -> dict[int, Handler]:
 
     ops[0x30] = mult_float
     ops[0x10] = mult_undocumented_10
+    ops[0x31] = mult_double_multiply
+    ops[0x32] = mult_double_multiply_single
+    ops[0x33] = mult_float_widening_multiply
     return ops
 
 
