@@ -79,6 +79,47 @@ mechanisms, both always on:
    raising `--force-period` trades frame density for RTOS progress, it
    does not remove the tension.
 
+**Lane I1: forcing is still required from a genuinely running snapshot, not
+just an artifact of never reaching one.** Every measurement above (point 1's
+"did not by itself reach the DSPI2 driver call") was taken on `boot400M.snap`,
+before Lane H1 established that snapshot's RTOS never actually runs (see
+"Lane H1" above) -- leaving open whether the natural SSI0/vector-170 chain
+would complete once a capture started from a snapshot with a genuinely
+running RTOS instead. It does not: from `snapshots/dt2-1.16/running.snap`
+(`tools/dt2_reach_running.py`, MAIN_OS_RUNNING per `tools/bootcheck.py`'s own
+criteria), with the DSPI2 forcing loop *disabled entirely* and only the SSI0
+model wired up (`--ssi0-hz 1000`, `ssi0_legacy_upgrade=True`), `Ssi0Dma`
+delivered vector 170 400 times over 120,000,000 further ColdFire
+instructions (~80 real board-rate periods at the placeholder 1 kHz request
+rate) and `force_asserted` never once went `True` -- zero natural calls to
+the DSPI2 driver (`prof["driver"]`, `FUN_400cd2bc`). So this is not "the
+system was never running" the way `boot400M.snap`'s zero notes turned out to
+be (Lane H1): it is a genuine gap in the vector-170 ISR model, or a real
+firmware precondition for that ISR to force vector 191 that a truly-running
+RTOS still does not by itself satisfy within a bounded run (the real SSI0
+board clock rate is also still unrecovered -- see `emu/ssi.py`'s own
+docstring -- so the *rate* of delivery, not just whether it happens, is a
+further unknown). Forcing vector 191 (point 2) therefore remains the only
+way this tool gets a DSPI2 frame at all, from either kind of snapshot; this
+is recorded as a finding for whichever lane next owns `emu/ssi.py`'s
+vector-170 handler, not fixed here.
+
+**Starting from a snapshot with a genuinely running RTOS.** Pass
+`snapshots/dt2-1.16/running.snap` (or any snapshot `tools/dt2_reach_running.py`
+produced) as `SNAPSHOT` directly -- `run()` now declares
+`deferred_components=('timers',)` on every `build()` call and restores the
+snapshot's own Pits/Dtims cadence via `ev['restore_checkpoint_timers']()`
+when it has one (falling back to a fresh `Timers` for a plain
+`emu.checkpoint` ladder rung with no such component, so `boot400M.snap`
+keeps working exactly as before). `running.snap`'s build manifest was saved
+with `unblock=True`, so a capture resuming it must also pass `--unblock`, or
+`restore_into`'s manifest check refuses the mismatch outright (a real
+safeguard, not friction to route around -- see `emu.snapshot.restore_into`'s
+own docstring on why a resumed run must match the configuration that
+produced the snapshot). No other change is needed: kit/pattern state is
+already real on `running.snap` (`--pre-instrs` is for a plain boot-ladder
+rung where `KIT_LOAD_FN` has not fired yet; skip it here).
+
 **Triggering a note deterministically, with no framebuffer reading.**
 `--kind note` injects a panel "TRIG 1" press+release at ColdFire instruction
 count `--trig-at` (default: a quarter of `--instrs`), via `emu/panelin.py`
@@ -466,6 +507,14 @@ def run(
         dsp=True,
         ssi0_request_hz=ssi0_hz,
         ssi0_legacy_upgrade=True,
+        # A snapshot from tools/dt2_reach_running.py (or any stateful
+        # emu.checkpoint.save_longrun-style save) carries its own Pits/Dtims
+        # cadence as a deferred 'timers' component; a plain emu.checkpoint
+        # ladder rung (e.g. boot400M.snap) has none. Declaring the name here
+        # makes both resumable from the same call -- see the timer
+        # construction below, which reads back whichever case applies via
+        # ev['restore_checkpoint_timers']().
+        deferred_components=("timers",),
     )
     if syx:
         build_kwargs["syx"] = syx
@@ -495,7 +544,18 @@ def run(
     for track, type_ in poke_track_types:
         poke_track_type(m, track, type_)
 
-    pits = Timers(Pits(m), Dtims(m, channels=(3,)))
+    # Reuse the snapshot's own timer cadence when it has one (a
+    # tools/dt2_reach_running.py-style stateful save), instead of always
+    # constructing fresh Pits/Dtims -- restoring fresh ones onto a snapshot
+    # that already carries a 'timers' component both loses its held/fired/
+    # missed state and, since deferred_components=('timers',) is now always
+    # passed above, would leave that component permanently unclaimed
+    # (Machine._checkpoint_deferred_restore.require_claimed() raises the
+    # moment spin() is called). Falls back to a fresh Timers, exactly the
+    # prior behaviour, for a plain ladder rung with no such component.
+    pits = ev["restore_checkpoint_timers"]()
+    if pits is None:
+        pits = Timers(Pits(m), Dtims(m, channels=(3,)))
     ssi0 = ev.get("ssi0_dma")
     if ssi0 is not None:
         ssi0.align(pits.now)

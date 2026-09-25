@@ -2487,3 +2487,156 @@ Reproduced with `tools/sharc_capture_run.py snapshots/dt2-1.16/boot400M.snap
 `intro_running`/`intro_done`/`ready_to_force` checks are library calls
 (`emu.pit.intro_running`, `tools/sharc_capture_run.ready_to_force`), not a
 committed script. Captures not committed (`out/` is gitignored).
+
+## Lane I1: a genuinely running RTOS, reached and snapshotted; PLAY still does not schedule a note via the known chain **[V][O][C]**
+
+Picking up Lane H1's own open item ("start from a post-intro snapshot").
+`tools/dt2_reach_running.py` (new; owned by this lane) resumes
+`boot400M.snap` with the same recipe `emu/gui.py` and `tools/bootcheck.py`
+already use (`unblock=True, softfloat=True, bitmap=True, dsp=True`, real
+`Pits`/`Dtims` held while `emu.pit.intro_running()` and released from a hook
+on `profile.intro_done`), in bounded stages that each save a full stateful
+checkpoint (`emu.snapshot.save` with `components`/`manifest`, so a later
+stage or tool resumes it exactly like any other `emu.longrun.build()`
+snapshot). Verdict is read from task-control state only -- the ready list
+(`emu.tasks.ready_list`) and the same code-address marks/timer-fired checks
+`tools/bootcheck.py`'s `classify()` uses (`mainloop`/`job_pump` entered,
+PIT3/DTIM3 firing, vector 208 handed to the display module) -- never the
+framebuffer. **[V]**
+
+Stages from `boot400M.snap` (2,748 B, `sections/.source-sha256` =
+`278541e4...`, matching `Digitakt_II_OS1.16.syx`): 30M -> 60.04M (`intro_done`
+fires, vector 208 handed, `job_pump` entered) -> 5.02M -> 20.05M (PIT3
+starts firing) -> 300.0M (DTIM3 starts firing, `mainloop` entered, 4 more
+tasks spawn) = 785,113,600 ColdFire instructions total, ~2.5M instr/s,
+~181s wall. `tools/bootcheck.py`'s own five MAIN_OS_RUNNING checks are all
+true at the final stage. Saved as `snapshots/dt2-1.16/running.snap` (never
+committed). **[V]**
+
+**Kit and pattern are real on this snapshot.** The live kit pointer
+`_DAT_80004704` reads `0x426532b8` (non-null) throughout, `FUN_4002D9C4`
+(`KIT_LOAD_FN`) fired once (instrumented hook count), and the per-track
+TX-mirror row (`0x80003cd0 + track*0x9a`, byte 0) shows a real, non-zero
+machine type on track 2 (`2`) with the other 15 tracks at the stock `0`,
+matching Lane A3's "one track already has a real machine type" -- now true
+on a snapshot with a genuinely running RTOS, not only on the raw
+`boot400M.snap` Lane A3 read this from. **[V]**
+
+**A real panel TRIG press reaches the full documented chain end to end, for
+the first time from actual panel delivery on a running system (not a memory
+poke).** Pressing TRIG 1 (`emu.panelin.buttons(m, profile, 3, 1)` then
+`(..., 3, 0)`, the real UART8 wire path) from `running.snap` and hooking
+`FUN_4011fe12`, `FUN_40139878`, `FUN_4013a52a`, `FUN_4013a78a`: all four
+fire (`FUN_4011fe12` x1, `FUN_40139878`/`FUN_4013a52a`/`FUN_4013a78a` x2
+each -- two records per trig, consistent with a note-on and a note-off both
+being scheduled). Lane H3's "poking one guard byte arms a voice through
+firmware code" is now reproduced through real panel input on a real running
+system instead of a hand poke. **[V]**
+
+**Correction: `FUN_40139878` has a second static caller.** Lane H1's own
+"the panel-input immediate path... uses" reading, and this file's "the note-
+event consumer... its only static caller is `vector_191_handler`" (about
+`FUN_40139b78`, not `FUN_40139878` -- these are two different, easily
+confused functions 0x2c0 bytes apart), did not have a full callee-side scan
+of `FUN_40139878` itself. `out/ghidra/dt2-1.16-emac`'s `calls` table shows
+two static callers: `FUN_4011fe12` (the documented panel-immediate path)
+and `FUN_4012020c` (a note-dispatch helper reached only through the
+external-MIDI-note byte parser `FUN_40120664` -> `FUN_40120490` ->
+`FUN_4012038e` -> `FUN_4012020c`, i.e. an incoming 3-byte MIDI note message,
+not the panel or the internal sequencer). Traced the whole chain by
+decompile; not reached by anything in this lane's own PLAY/TRIG runs. **[C]**
+
+**PLAY does not reach the known note-scheduling chain within a bounded,
+genuinely-running run -- open, not decided false.** Pressing PLAY
+(`channel 2, bit 3`, confirmed against the running image's own button-name
+table, `code 20 = "PLAY"`) from `running.snap` and running 200,000,000
+further instructions (~5x the budget that reliably shows TRIG's effect):
+zero hits on `FUN_4011fe12`, `FUN_40139878`, `FUN_40139b78`, `FUN_4013a78a`
+and `FUN_4012020c`. The only pool-allocator (`FUN_4013a52a`) activity in
+that whole window is 5 calls, all from sound-engine/machine-parameter setup
+functions (`FUN_400d5df2`..`FUN_400d6420`'s range) that also happen to draw
+from the same fixed-size pool, and all 5 occur before the 40,000,000-
+instruction mark (i.e. unrelated background activity, not step-paced).
+Unlike Lane H1's "no capture ever reached a running RTOS" (a sufficient
+alternative explanation that is now closed by this lane), this result comes
+from a snapshot that **is** genuinely running, so it narrows the open
+question rather than dissolving it: either PLAY's wire delivery here is
+wrong in some way TRIG's is not (channel/bit confirmed correct; delivery
+mechanism is identical `emu.panelin.feed()`), or the internal sequencer's
+own note-scheduling path is a third, still-unidentified route that neither
+`FUN_4011fe12` nor `FUN_40139b78`/`FUN_40139878` sit on. **[V][O]**
+
+New leads for a future lane, from the image's own RTTI class names
+(`out/ghidra/dt2-1.16-emac`'s `functions` table): a real `SequencerStates`
+class (`StaticSingleton<SequencerStates>` at `0x401cd4b0`) and `TransportView`
+(`0x400784c4`; its `vfunc_2` at `0x400786ae` handles encoder events, not
+obviously the PLAY button) -- neither decompiled beyond a first read here.
+**[D][O]**
+
+**Vector 191 still needs forcing, confirmed from a genuinely running
+snapshot, not only from `boot400M.snap`.** Lane H1's own "SSI0 model...
+did not by itself reach the DSPI2 driver call" was measured on
+`boot400M.snap`, before Lane H1 itself established that snapshot's RTOS
+never really runs -- leaving open whether the natural SSI0/vector-170/
+`INTFRCH1`-force chain (`emu/ssi.py`) would complete once the RTOS
+genuinely does. It does not: from `running.snap`, with DSPI2 forcing
+disabled entirely and only the SSI0 model wired up (`--ssi0-hz 1000`,
+`ssi0_legacy_upgrade=True`), `Ssi0Dma` delivered vector 170 400 times over
+120,000,000 further instructions and `force_asserted` never once went
+`True` -- zero natural DSPI2 driver calls. `tools/sharc_capture_run.py`'s
+forced-vector-191 loop (Lane H1's guarded version) therefore remains the
+only way this tool gets a DSPI2 frame at all; documented as a finding for
+whichever lane next owns `emu/ssi.py`'s vector-170 handler. **[V][C]**
+(corrects the implicit assumption, in Lane H1's own "SSI0 model" bullet,
+that the negative result there might just be an artifact of the RTOS not
+running yet)
+
+**`tools/sharc_capture_run.py` now resumes `running.snap` directly.**
+`run()` declares `deferred_components=('timers',)` on every `build()` call
+and restores the snapshot's own Pits/Dtims cadence via
+`ev['restore_checkpoint_timers']()` when the snapshot has one (a stateful
+save from `tools/dt2_reach_running.py`), falling back to a fresh `Timers`
+for a plain `emu.checkpoint` ladder rung with no such component (so
+`boot400M.snap` keeps working exactly as before -- the whole existing test
+suite for this file passes unchanged). A capture from `running.snap` must
+pass `--unblock` to match the manifest it was saved with, or
+`restore_into`'s manifest check correctly refuses the mismatch. **[V]**
+
+**Idle-vs-PLAY diff of the raw DSPI2 TX frame, from `running.snap`.** Two
+independent idle captures (30,000,000 instructions each, `--unblock`, no
+panel input) are byte-for-byte identical across all 574 frames -- the
+emulation is fully deterministic run to run, so this is a clean baseline,
+not a coincidence. Against that baseline, a PLAY capture (identical
+budget, PLAY pressed at instruction 2,000,000) differs at exactly 29 TX-
+frame byte offsets: `8, 26, 28, 32, 34-41, 58, 76, 78, 82, 518-519, 540-541,
+1518-1519, 2027, 2516-2517, 2578-2579, 2588-2589`. None of these coincide
+with the documented per-track machine-type (`0x94 + 2*track`) or active
+(`0x73c + 2*track`) fields -- so PLAY has a real, measured effect on the
+transfer, but not through either of those two known per-track fields, and
+this lane did not identify what the 29 offsets mean (several -- 2516+ --
+are past the documented `0x802`-byte real-payload length, in the region
+this file's own docstring elsewhere calls "tag-only padding", which this
+result puts in some doubt: something there is not constant while PLAY
+runs). Captures: `out/captures/dt2-1.16-running-{idle,idle2,play}.dt2cap`
+(not committed). **[V][O]**
+
+**Replay of the real PLAY capture reproduces the standing SHARC-side
+blocker exactly, unchanged.** `tools/sharc_replay.py dt2-1.16
+out/captures/dt2-1.16-running-play.dt2cap --frames 4`: real per-track data
+appears from frame 1 onward (track 2 `machine_type=2`, matching the
+snapshot's own live memory), but `any_companding_gate_pointer_nonzero` is
+`false` and `fun_1c60a2_total_hits` is `0` across all 4 frames -- the same
+"`0x254d78` is null, `FUN_1c60a2` unreached" blocker this file and the
+2026-09-26 SHARC handover already document, now confirmed against a real
+capture from a genuinely running ColdFire rather than a forced/synthetic
+one. This does not change the SHARC-side finding; it rules out "the
+capture was never real" as an explanation for it. **[V]**
+
+Reproduced with `tools/dt2_reach_running.py snapshots/dt2-1.16/boot400M.snap
+--out snapshots/dt2-1.16/running --stage 30000000 --stage 60000000 --stage
+5000000 --stage 20000000 --stage 300000000 --syx <the 1.16 .syx>`, then
+`tools/sharc_capture_run.py snapshots/dt2-1.16/running.snap --out
+out/captures/... --kind idle|play --instrs 30000000 --unblock [--trig-at
+2000000]`. `tests/test_dt2_reach_running.py` covers `observe()`'s check
+computation (pure, no firmware) and pins the `timers.fired`-vs-raw-`Pits`/
+`Dtims` key-shape bug this lane found and fixed while writing it.
