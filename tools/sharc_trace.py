@@ -86,6 +86,7 @@ from sharc_core.values import (  # noqa: E402, F401
 )
 from sharc_core.state import (  # noqa: E402, F401
     AFTER_DELAY_SLOTS,
+    MR,
     Loop,
     Pending,
     State,
@@ -94,6 +95,9 @@ from sharc_core.state import (  # noqa: E402, F401
     _cureg_code,
     _event,
     _json_value,
+    _mr_from_signed,
+    _mr_read_word,
+    _mr_write_word,
     _render,
     _simd_active,
     _stop,

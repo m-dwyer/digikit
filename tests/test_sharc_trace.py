@@ -2173,8 +2173,16 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(state.uregs[T.UREG_CODES["R2"]], T.Const(0x1234))
         self.assertEqual(
             (state.trace[-1]["operation"], state.trace[-1]["result_register"]),
-            ("mr-data-move", "MR0F"),
+            ("mr-data-move-mr0f", "MRF"),
         )
+        # A register->MR0F move only defines the accumulator's low 32 bits
+        # (PRM p.3-11): MR1F/MR2F stay unknown until written, so the whole
+        # 80-bit accumulator is not yet fully known. Seed it directly here
+        # (as though MR1F/MR2F had also been written 0, sign-extending
+        # 0x1234's positive integer format) so the multiply-accumulate
+        # chain below still has a concrete accumulator to read.
+        self.assertFalse(state.special["MRF"].known)
+        state.special["MRF"] = T._mr_from_signed(0x1234)
         state.uregs[T.UREG_CODES["R10"]] = T.Const(3)
         state = self.run_one(
             state,
@@ -2188,7 +2196,7 @@ class TraceTest(unittest.TestCase):
                 6,
             ),
         )
-        self.assertEqual(state.special["MRF"], T.Const(0x1234 + 3 * 0x1234))
+        self.assertEqual(state.special["MRF"].signed(), 0x1234 + 3 * 0x1234)
         self.assertEqual(state.trace[-1]["operation"], "multiply-accumulate")
         state.uregs[T.UREG_CODES["R6"]] = T.Const(2)
         state.uregs[T.UREG_CODES["R11"]] = T.Const(4)
@@ -2205,7 +2213,10 @@ class TraceTest(unittest.TestCase):
             ),
         )
         self.assertEqual(state.uregs[T.UREG_CODES["R7"]], T.Const(0x48D8))
-        self.assertEqual(state.trace[-1]["operation"], "multiply-add-mrf")
+        # Same operation name as the mrf-destination accumulate above --
+        # compute_mult.py's _mac_handler now names the whole family by
+        # add/subtract, not by which of RN/mrf/mrb receives the result.
+        self.assertEqual(state.trace[-1]["operation"], "multiply-accumulate")
 
     def test_type2a_increment_unconditional_and_affine(self):
         def full(opcode, rn, rx, ry=0):
@@ -4478,7 +4489,12 @@ class AstatxFlagsTest(unittest.TestCase):
 
     # -- multiplier ops (PRM p.493 for mr-data-move) -------------------------
 
-    def test_multiply_family_forgets_multiplier_flags(self):
+    def test_multiply_family_computes_multiplier_flags_when_concrete(self):
+        # 3 * 4 = 12: with both operands concretely known, MN/MV/MU/MI are
+        # now computed from the real 80-bit result (PRM p.28-5/28-6), not
+        # forgotten -- 12 is positive (MN=0), fits a 32-bit signed integer
+        # (MV=0), integer results never underflow (MU=0), and MI is always
+        # 0 for a fixed-point row.
         old = T.Const(0xFFFFFFFF)
         for opcode, cu in ((0x70, 1),):
             _, _, op, astatx = self.astatx_after(
@@ -4488,12 +4504,27 @@ class AstatxFlagsTest(unittest.TestCase):
                 old,
             )
             self.assertEqual(op, "multiply")
-            self.assertEqual(
-                astatx,
-                T.PartialConst(
-                    0xFFFFFFFF & ~T.MULT_FLAGS_MASK, 0xFFFFFFFF & ~T.MULT_FLAGS_MASK
-                ),
-            )
+            for bit in (T.MN_BIT, T.MV_BIT, T.MU_BIT, T.MI_BIT):
+                self.assertEqual(T._astatx_known_bit(astatx, bit), False)
+
+    def test_multiply_family_forgets_multiplier_flags_when_symbolic(self):
+        _, _, op, astatx = self.astatx_after(
+            full_compute(1, 0x70, 0, 1, 2),
+            False,
+            {1: T.symbol("track_index"), 2: T.Const(4)},
+            T.Const(0xFFFFFFFF),
+        )
+        self.assertEqual(op, "multiply")
+        # MN/MV/MU are data-dependent and forgotten here (no concrete
+        # result); MI stays known=0 even so -- PRM Table 3-7 fixes MI at 0
+        # for every fixed-point row regardless of the operands, unlike
+        # MN/MV/MU.
+        expected_mask = 0xFFFFFFFF & ~(
+            (1 << T.MN_BIT) | (1 << T.MV_BIT) | (1 << T.MU_BIT)
+        )
+        self.assertEqual(
+            astatx, T.PartialConst(expected_mask, expected_mask & ~(1 << T.MI_BIT))
+        )
 
     def test_mr_data_move_clears_multiplier_flags(self):
         field = (0b100000 << 17) | (1 << 16) | (0 << 12) | (3 << 8)
@@ -4501,7 +4532,7 @@ class AstatxFlagsTest(unittest.TestCase):
         _, _, op, astatx = self.astatx_after(
             fields, False, {3: T.Const(5)}, T.Const(0xFFFFFFFF)
         )
-        self.assertEqual(op, "mr-data-move")
+        self.assertEqual(op, "mr-data-move-mr0f")
         self.assertEqual(astatx, T.Const(0xFFFFFFFF & ~T.MULT_FLAGS_MASK))
 
     # -- leftz (PRM p.521) ----------------------------------------------------
@@ -5455,10 +5486,11 @@ class FloatComputeTest(unittest.TestCase):
         )
         self.assertEqual(op, "float-multiply")
         self.assertEqual(value, T.Const(f32(3.0)))
-        # Multiplier result flags (MN/MV/MU/MI) are unmodeled -> forgotten,
-        # same convention the fixed-point multiply already uses.
+        # PRM Table 3-9: MN/MV/MU/MI are all data-dependent for a float
+        # multiply. 1.5*2.0=3.0 is positive, not overflowed, not a
+        # denormal underflow and not NAN-invalid.
         for bit in (T.MN_BIT, T.MV_BIT, T.MU_BIT, T.MI_BIT):
-            self.assertIsNone(T._astatx_known_bit(astatx, bit))
+            self.assertEqual(T._astatx_known_bit(astatx, bit), False)
 
     # -- Dual Add/Subtract: Ra = Rx+Ry, Rs = Rx-Ry (PRM Table 18-10 p.433) --
 

@@ -398,21 +398,30 @@ class ShifterOpcodesTest(ComputeHelperMixin, unittest.TestCase):
 
 
 class MrDataMoveTest(ComputeHelperMixin, unittest.TestCase):
-    def test_write_mr1f_returns_mr1f_key(self):
+    def test_write_mr1f_returns_mrf_key(self):
+        # MR1F/MR0F/MR2F are all words of the same 80-bit MRF accumulator
+        # (PRM p.3-10), so a data move to any of them returns "MRF" -- the
+        # specific word touched is in the operation name instead.
         rn, value, op, _ = T._compute(
             mrdatamove_fields(1, 1, 3), False, {3: T.Const(0x1234)}, None
         )
-        self.assertEqual(rn, "MR1F")
-        self.assertEqual(value, T.Const(0x1234))
-        self.assertEqual(op, "mr-data-move")
+        self.assertEqual(rn, "MRF")
+        self.assertIsInstance(value, T.MR)
+        self.assertEqual(T._mr_read_word(value, 1), T.Const(0x1234))
+        # PRM p.3-11: a write to MR1F also sign-extends into MR2F; 0x1234's
+        # bit 31 is 0, so MR2F becomes 0. MR0F was never written.
+        self.assertEqual(T._mr_read_word(value, 2), T.Const(0))
+        self.assertIsInstance(T._mr_read_word(value, 0), T.Unknown)
+        self.assertEqual(op, "mr-data-move-mr1f")
 
     def test_read_mr2b_from_special_dict(self):
+        mrb = T._mr_write_word(T.Unknown("uninitialized MRB"), 2, T.Const(0x77))
         rn, value, op, _ = T._compute(
-            mrdatamove_fields(0, 6, 5), False, {}, {"MR2B": T.Const(0x77)}
+            mrdatamove_fields(0, 6, 5), False, {}, {"MRB": mrb}
         )
         self.assertEqual(rn, 5)
         self.assertEqual(value, T.Const(0x77))
-        self.assertEqual(op, "mr-data-move")
+        self.assertEqual(op, "mr-data-move-mr2b")
 
     def test_read_uninitialized_register_is_unknown(self):
         rn, value, _, _ = T._compute(mrdatamove_fields(0, 4, 5), False, {}, None)
@@ -428,20 +437,25 @@ class MrDataMoveTest(ComputeHelperMixin, unittest.TestCase):
         )
         self.assertEqual(astatx, T.Const(0xFFFFFFFF & ~T.MULT_FLAGS_MASK))
 
-    def test_mr0f_aliases_to_the_shared_mrf_accumulator_key(self):
+    def test_mr0f_writes_the_shared_mrf_accumulator_key(self):
         # PRM p.3-10: REGF_MRF "is comprised of" MR2F/MR1F/MR0F -- MR0F is
-        # the same physical low-32-bit register the multiply-accumulate
-        # rows call "MRF", so a data move to/from MR0F must land in
-        # state.special["MRF"], not a separate "MR0F" slot.
+        # the low 32 bits of the same 80-bit accumulator the
+        # multiply-accumulate rows call "MRF", so a data move to/from MR0F
+        # must land in state.special["MRF"] (as a partially known MR, since
+        # this alone says nothing about MR1F/MR2F), not a separate "MR0F"
+        # slot.
         state = T.State(0x10, {2: T.Const(0x55)})
         result = T._compute(
             mrdatamove_fields(1, 0, 2), False, dict(state.uregs), state.special
         )
         T._apply_compute(state, insn("2a", {}), result)
-        self.assertEqual(state.special.get("MRF"), T.Const(0x55))
+        mrf = state.special.get("MRF")
+        self.assertIsInstance(mrf, T.MR)
+        self.assertFalse(mrf.known)
+        self.assertEqual(T._mr_read_word(mrf, 0), T.Const(0x55))
         self.assertNotIn("MR0F", state.special)
 
-    def test_other_mr_registers_get_their_own_key(self):
+    def test_mr1f_also_writes_the_shared_mrf_accumulator_key(self):
         state = T.State(0x10, {2: T.Const(0x66)})
         result = T._compute(
             mrdatamove_fields(1, 1, 2),
@@ -450,8 +464,10 @@ class MrDataMoveTest(ComputeHelperMixin, unittest.TestCase):
             state.special,  # MR1F
         )
         T._apply_compute(state, insn("2a", {}), result)
-        self.assertEqual(state.special.get("MR1F"), T.Const(0x66))
-        self.assertNotIn("MRF", state.special)
+        mrf = state.special.get("MRF")
+        self.assertIsInstance(mrf, T.MR)
+        self.assertEqual(T._mr_read_word(mrf, 1), T.Const(0x66))
+        self.assertNotIn("MR1F", state.special)
 
 
 # --- MUL/ALU multifunction categories 0x1c (average) / 0x1d (abs) ----------

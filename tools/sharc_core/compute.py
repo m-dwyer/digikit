@@ -60,10 +60,32 @@ from .compute_multi import (
     multifn_dual_mul_add_subtract,
 )
 from .compute_shift import SHIFT_OPS, _field_deposit_or, _shift_immediate
-from .encoding import ALU_FLAGS_MASK, SHIFT_FLAGS_MASK, UREG_CODES, _field
-from .flags import _astatx_forget
-from .state import State, _event, _json_value, _simd_active, _ureg, _ureg_raw
-from .values import ComputeResult, Operand, Unknown, Value
+from .encoding import (
+    ALU_FLAGS_MASK,
+    MI_BIT,
+    MU_BIT,
+    MV_BIT,
+    SHIFT_FLAGS_MASK,
+    UREG_CODES,
+    _field,
+)
+from .flags import _astatx_define, _astatx_forget
+from .state import MR, State, _event, _json_value, _simd_active, _ureg, _ureg_raw
+from .values import (
+    ComputeDest,
+    ComputeValue,
+    Operand,
+    Unknown,
+    Value,
+    _astatx_known_bit,
+)
+
+# MULT_OPS handlers may return a full 80-bit MR value (state.py, a layer
+# above values.py's Operand/ComputeResult by design -- values.py cannot
+# import MR without an import cycle), so this module's own dispatch/apply
+# functions use this locally widened result type instead of values.py's
+# ComputeResult for every compute unit they handle, not just cu=1.
+Result = tuple[ComputeDest, "ComputeValue | MR", str, "Callable[[Value], Value]"]
 
 __all__ = [
     "MR_DATAMOVE_REGISTERS",
@@ -107,6 +129,62 @@ def _compute_reserved_cu3(
 
 CU3_OPS: dict[int, Callable] = {0xD6: _compute_reserved_cu3}
 
+# REGF_STKYX/REGF_STKYY sticky bit positions this module latches for
+# multiplier ops (SHARC+ PRM p.28-83/28-84, Table 28-46): MOS latches the
+# fixed-point multiplier's overflow (ASTATX.MV) -- PRM Table 3-7's STKY
+# columns are all "-" except MOS, "**" (sets but does not clear), on every
+# multiply/accumulate/subtract/round row. MUS/MVS/MIS instead latch the
+# floating-point multiply's MU/MV/MI (PRM Table 3-9); fixed-point ops never
+# touch those three, and the float row never touches MOS.
+_MOS_BIT, _MVS_BIT, _MUS_BIT, _MIS_BIT = 6, 7, 8, 9
+_MULT_MOS_OPERATIONS = frozenset(
+    {
+        "multiply",
+        "multiply-mrf",
+        "multiply-mrb",
+        "multiply-accumulate",
+        "multiply-subtract",
+        "round-mrf",
+        "round-mrb",
+    }
+)
+
+
+def _sticky_set(old: Value, bit: int, trigger: bool | None) -> Value:
+    """A sticky bit only ever moves 0->1 (PRM p.28-82: "sticky bits do not
+    clear themselves after the condition is no longer true"); an
+    instruction that does not concretely trigger BIT (TRIGGER False or
+    unknown) leaves OLD's bit exactly as it already was."""
+    if trigger is not True:
+        return old
+    return _astatx_define(old, 1 << bit, 1 << bit)
+
+
+def _apply_mult_sticky(
+    state: State, stky_name: str, astatx: Value, operation: str
+) -> None:
+    """Latch REGF_STKYX/REGF_STKYY from the ASTATX/ASTATY this instruction
+    just computed (see ``_MOS_BIT`` group's docstring): a multiplier op's
+    sticky bits are purely a function of its own new ASTATX bits, so no
+    extra threading through the (Dest, Value, operation, astatx_update)
+    ``ComputeResult`` contract every compute handler returns is needed."""
+    if operation == "float-multiply":
+        bits = {
+            _MUS_BIT: _astatx_known_bit(astatx, MU_BIT),
+            _MVS_BIT: _astatx_known_bit(astatx, MV_BIT),
+            _MIS_BIT: _astatx_known_bit(astatx, MI_BIT),
+        }
+    elif operation in _MULT_MOS_OPERATIONS:
+        bits = {_MOS_BIT: _astatx_known_bit(astatx, MV_BIT)}
+    else:
+        return
+    code = UREG_CODES[stky_name]
+    value = _ureg_raw(state.uregs, code)
+    for bit, trigger in bits.items():
+        value = _sticky_set(value, bit, trigger)
+    state.uregs[code] = value
+
+
 # (cu, opcode) -> operation table, one per compute unit; cu itself selects
 # which table (PRM top-level compute selector, tools/sharcspec/
 # compute_table.json's top_level_structure.single_function_selector: 0=ALU,
@@ -123,10 +201,10 @@ def _compute(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Mapping[str, Operand] | None = None,
+    special: Mapping[str, Operand | MR] | None = None,
     *,
     approx_recips: bool = False,
-) -> ComputeResult | None:
+) -> Result | None:
     """Decode the small public-table subset, reading every operand from VALUES.
 
     The 4th element of a non-None result is an ASTATX updater: a function
@@ -155,10 +233,14 @@ def _compute(
     # not masquerade as architectural UREGs.
     if not short and ((field >> 20) & 3) == 1 and ((field >> 12) & 0xFF) == 0xB4:
         rx, ry = (field >> 4) & 0xF, field & 0xF
-        return multiply_accumulate_mrf(rx, ry, values, special)
+        left, right = _ureg(values, rx), _ureg(values, ry)
+        return multiply_accumulate_mrf(
+            0, rx, ry, left, right, values, special, approx_recips
+        )
     if not short and ((field >> 20) & 3) == 1 and ((field >> 12) & 0xFF) == 0xB0:
         rn, rx, ry = (field >> 8) & 0xF, (field >> 4) & 0xF, field & 0xF
-        return multiply_add_mrf(rn, rx, ry, values, special)
+        left, right = _ureg(values, rx), _ureg(values, ry)
+        return multiply_add_mrf(rn, rx, ry, left, right, values, special, approx_recips)
     if short:
         opcode, rn, rx = (field >> 8) & 0xF, (field >> 4) & 0xF, field & 0xF
         left, right = _ureg(values, rn), _ureg(values, rx)
@@ -218,11 +300,13 @@ def _compute(
 def _apply_compute(
     state: State,
     insn: Instruction,
-    result: ComputeResult,
+    result: Result,
 ) -> None:
     rn, value, operation, astatx_update = result
     astatx_code = UREG_CODES["ASTATX"]
-    state.uregs[astatx_code] = astatx_update(_ureg_raw(state.uregs, astatx_code))
+    new_astatx = astatx_update(_ureg_raw(state.uregs, astatx_code))
+    state.uregs[astatx_code] = new_astatx
+    _apply_mult_sticky(state, "STKYX", new_astatx, operation)
     if isinstance(rn, str):
         # A string RN never pairs with a tuple VALUE (see the tuple-RN
         # branch below for the only case that returns more than one
@@ -237,11 +321,9 @@ def _apply_compute(
             result_register=rn,
             value=value,
         )
-        # "MR0F" (PRM Table 18-29 MRDATAMOVE) is the same physical register
-        # the multiply-accumulate rows call "MRF" (PRM p.3-10); every other
-        # string key (other MR registers, "BFFWRP") is its own special-dict
-        # slot, keyed by the name the caller returned.
-        state.special["MRF" if rn == "MR0F" else rn] = value
+        # Every string destination (MRF/MRB, "BFFWRP", ...) is its own
+        # special-dict slot, keyed by the name the caller returned.
+        state.special[rn] = value
         return
     if isinstance(rn, tuple):
         # Dual/triple-result compute (dual add/subtract, MUL/ALU
@@ -262,11 +344,15 @@ def _apply_compute(
         )
         for reg, val in zip(rn, value, strict=True):
             if isinstance(reg, str):
-                state.special["MRF" if reg == "MR0F" else reg] = val
+                state.special[reg] = val
             else:
                 state.uregs[reg] = val
         return
     assert not isinstance(value, tuple), "int RN with tuple value"
+    # Only a string (MRF/MRB/...) or tuple destination ever carries an
+    # MR value (see the two branches above); an int RN is always an
+    # ordinary 32-bit register.
+    assert not isinstance(value, MR), "int RN with MR value"
     if operation in ("compare", "bit-test", "float-compare"):
         _event(state, insn, "compute", operation=operation, status_only=True)
     else:
@@ -305,10 +391,10 @@ def _compute_pey(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Mapping[str, Operand] | None = None,
+    special: Mapping[str, Operand | MR] | None = None,
     *,
     approx_recips: bool = False,
-) -> ComputeResult | None:
+) -> Result | None:
     """PEy's half of a SIMD compute (SHARC+ PRM p.101, "SIMD Mode":
     "Executes the same instruction simultaneously in both processing
     elements"), decoded against the S/SF register file and the PEy
@@ -333,7 +419,7 @@ def _compute_pey(
 def _apply_compute_pey(
     state: State,
     insn: Instruction,
-    result: ComputeResult,
+    result: Result,
 ) -> None:
     """PEy's half of _apply_compute: the identical shape, redirected to the
     S/SF register file, REGF_ASTATY, and the PEy multiplier accumulator
@@ -341,7 +427,9 @@ def _apply_compute_pey(
     per-PE computation-status register pairs)."""
     rn, value, operation, astatx_update = result
     astaty_code = UREG_CODES["ASTATY"]
-    state.uregs[astaty_code] = astatx_update(_ureg_raw(state.uregs, astaty_code))
+    new_astaty = astatx_update(_ureg_raw(state.uregs, astaty_code))
+    state.uregs[astaty_code] = new_astaty
+    _apply_mult_sticky(state, "STKYY", new_astaty, operation)
     if isinstance(rn, str):
         # A string RN never pairs with a tuple VALUE, matching
         # _apply_compute's own invariant (see its comment there).
@@ -379,6 +467,10 @@ def _apply_compute_pey(
             state.uregs[80 + reg] = val
         return
     assert not isinstance(value, tuple), "int RN with tuple value"
+    # Only a string (MRF/MRB/...) or tuple destination ever carries an
+    # MR value (see the two branches above); an int RN is always an
+    # ordinary 32-bit register.
+    assert not isinstance(value, MR), "int RN with MR value"
     if operation in ("compare", "bit-test", "float-compare"):
         _event(state, insn, "compute-pey", operation=operation, status_only=True)
     else:
@@ -401,12 +493,12 @@ def _compute_simd(
     f: Mapping[str, int],
     short: bool,
     values: Mapping[int, Value],
-    special: Mapping[str, Operand] | None = None,
+    special: Mapping[str, Operand | MR] | None = None,
     *,
     approx_recips: bool = False,
 ) -> tuple[
-    ComputeResult | None,
-    ComputeResult | None,
+    Result | None,
+    Result | None,
 ]:
     """Decode a compute for PEx, and for PEy too when MODE1.PEYEN is
     concretely set (SHARC+ PRM p.101, "SIMD Mode": "Dispatches a single
@@ -424,8 +516,8 @@ def _compute_simd(
 def _apply_compute_simd(
     state: State,
     insn: Instruction,
-    result_x: ComputeResult | None,
-    result_y: ComputeResult | None,
+    result_x: Result | None,
+    result_y: Result | None,
 ) -> None:
     if result_x is not None:
         _apply_compute(state, insn, result_x)

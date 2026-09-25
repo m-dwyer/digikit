@@ -91,12 +91,15 @@ class MultiplierComputeOpcodeTest(unittest.TestCase):
         self.assertEqual(value, T.Const(0x80000000))  # low 32 bits of 3*2**31
         self.assertEqual(op, "multiply")
         astatx = astatx_update(T.Const(0xFFFFFFFF))
-        expected_mask = 0xFFFFFFFF & ~(
-            (1 << T.MN_BIT) | (1 << T.MV_BIT) | (1 << T.MU_BIT)
-        )
-        self.assertEqual(
-            astatx, T.PartialConst(expected_mask, expected_mask & ~(1 << T.MI_BIT))
-        )
+        # UUI, unsigned*unsigned integer: the 80-bit accumulator is exactly
+        # 3*2**31 = 0x1_80000000 -- MV set (PRM p.28-6, "Unsigned, integer
+        # with the upper 48 bits of MR not all zeros": bits 79:32 hold
+        # 0x1, not 0), MN clear (bit 79 is 0), MU always 0 for an integer
+        # result, MI always 0 for a fixed-point row.
+        self.assertEqual(T._astatx_known_bit(astatx, T.MN_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.MV_BIT), True)
+        self.assertEqual(T._astatx_known_bit(astatx, T.MU_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.MI_BIT), False)
 
     # -- 0x48: RN = RX*RY MOD1, UUF (PRM p.17-7/17-9) -----------------------
 
@@ -117,7 +120,10 @@ class MultiplierComputeOpcodeTest(unittest.TestCase):
             {1: T.Const(0xFFFFFFFB), 2: T.Const(6)},  # -5 * 6 = -30
         )
         self.assertEqual(rn, "MRF")
-        self.assertEqual(value, T.Const(0xFFFFFFE2))
+        # mrf destinations now hold the real 80-bit accumulator (state.MR),
+        # not just the 32-bit value a register read would extract.
+        self.assertIsInstance(value, T.MR)
+        self.assertEqual(value.signed(), -30)
         self.assertEqual(op, "multiply-mrf")
 
     # -- 0x7C: mrf = RX*RY MOD1, SSF (no accumulate; PRM p.17-7/17-9) -------
@@ -128,7 +134,13 @@ class MultiplierComputeOpcodeTest(unittest.TestCase):
             {1: T.Const(0xC0000000), 2: T.Const(0x40000000)},  # -0.5 * 0.5
         )
         self.assertEqual(rn, "MRF")
-        self.assertEqual(value, T.Const(0xE0000000))
+        self.assertIsInstance(value, T.MR)
+        # -0.5 * 0.5 = -0.25, exactly, in 1.63 fractional format (PRM
+        # Figure 3-2): -0.25 * 2**63 = -2**61. The top 32 bits (what a
+        # plain register read, or an RN-destination row, would extract)
+        # are the previously-asserted 0xE0000000 -- -0.25 in 1.31 format.
+        self.assertEqual(value.signed(), -(1 << 61))
+        self.assertEqual((value.bits >> 32) & 0xFFFFFFFF, 0xE0000000)
         self.assertEqual(op, "multiply-mrf")
 
     # -- 0xBC: mrf = mrf + RX*RY MOD1, SSF (fractional twin of 0xB4) --------
@@ -137,22 +149,37 @@ class MultiplierComputeOpcodeTest(unittest.TestCase):
         rn, value, op, astatx_update = self.compute(
             full_compute(1, 0xBC, 0, 1, 2),
             {1: T.Const(0x40000000), 2: T.Const(0x40000000)},  # 0.5 * 0.5
-            special={"MRF": T.Const(0x10000000)},  # + 0.125
+            # +0.125 in 1.63 format (0.125 * 2**63 = 2**60); previously
+            # written as the 1.31-format Const(0x10000000) back when mrf
+            # was approximated by its would-be 32-bit register extraction.
+            special={"MRF": T._mr_from_signed(1 << 60)},
         )
         self.assertEqual(rn, "MRF")
-        self.assertEqual(value, T.Const(0x30000000))  # 0.375
+        self.assertIsInstance(value, T.MR)
+        self.assertEqual(value.signed(), 3 * (1 << 60))  # 0.375, in 1.63 fmt
+        self.assertEqual((value.bits >> 32) & 0xFFFFFFFF, 0x30000000)
         self.assertEqual(op, "multiply-accumulate")
         astatx = astatx_update(T.Unknown("start"))
-        self.assertEqual(astatx, T.PartialConst(1 << T.MI_BIT, 0))
+        # Accumulator and operands are all concretely known here, so
+        # MN/MV/MU are now computed (PRM p.28-5/28-6), not forgotten: the
+        # 0.375 result is positive (MN=0), fits the fractional format's
+        # usable width (MV=0) and is not a tiny near-zero value (MU=0).
+        self.assertEqual(T._astatx_known_bit(astatx, T.MN_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.MV_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.MU_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.MI_BIT), False)
 
     def test_0xbc_multiply_accumulate_ssf_negative_product(self):
         rn, value, op, _ = self.compute(
             full_compute(1, 0xBC, 0, 1, 2),
             {1: T.Const(0xC0000000), 2: T.Const(0x40000000)},  # -0.5 * 0.5
-            special={"MRF": T.Const(0x40000000)},  # + 0.5
+            # +0.5 in 1.63 format (0.5 * 2**63 = 2**62).
+            special={"MRF": T._mr_from_signed(1 << 62)},
         )
         self.assertEqual(rn, "MRF")
-        self.assertEqual(value, T.Const(0x20000000))  # 0.5 + (-0.25) = 0.25
+        self.assertIsInstance(value, T.MR)
+        self.assertEqual(value.signed(), 1 << 61)  # 0.5 + (-0.25) = 0.25
+        self.assertEqual((value.bits >> 32) & 0xFFFFFFFF, 0x20000000)
         self.assertEqual(op, "multiply-accumulate")
 
     def test_0xbc_uninitialized_mrf_is_unknown(self):
@@ -165,17 +192,40 @@ class MultiplierComputeOpcodeTest(unittest.TestCase):
         self.assertIsInstance(value, T.Unknown)
         self.assertEqual(op, "multiply-accumulate")
 
-    # -- 0x09: RN = sat mrf MOD2, SF (PRM p.17-7/17-9; unmodeled 80-bit) ----
+    # -- 0x09: RN = sat mrf MOD2, SF (PRM p.17-7/17-9) -----------------------
 
     def test_0x09_saturate_mrf_sf_stays_unknown_with_documented_flags(self):
+        # mrf uninitialized: sat still stays Unknown (there is nothing to
+        # clamp), but PRM Table 3-7's sat row fixes MV/MI to 0
+        # unconditionally (saturation removes overflow by definition, and
+        # MI never applies to a fixed-point row) even though MN/MU -- being
+        # data-dependent -- are forgotten.
         rn, value, op, astatx_update = self.compute(full_compute(1, 0x09, 3, 0, 0), {})
         self.assertEqual(rn, 3)
         self.assertIsInstance(value, T.Unknown)
         self.assertEqual(op, "saturate-mrf")
         astatx = astatx_update(T.Const(0xFFFFFFFF))
-        expected_mask = 0xFFFFFFFF & ~((1 << T.MN_BIT) | (1 << T.MV_BIT))
-        expected_bits = expected_mask & ~((1 << T.MU_BIT) | (1 << T.MI_BIT))
+        expected_mask = 0xFFFFFFFF & ~((1 << T.MN_BIT) | (1 << T.MU_BIT))
+        expected_bits = expected_mask & ~((1 << T.MV_BIT) | (1 << T.MI_BIT))
         self.assertEqual(astatx, T.PartialConst(expected_mask, expected_bits))
+
+    def test_0x09_saturate_mrf_sf_clamps_known_overflow(self):
+        # mrf holds a value outside the 1.63 signed-fractional range's own
+        # sub-range that ``sat`` polices here (SF: max 2**63-1, min
+        # -2**63 -- PRM Table 3-5): a value at exactly 2**63 already
+        # overflows a signed 64-bit field, so sat clamps it to the
+        # positive max.
+        rn, value, op, astatx_update = self.compute(
+            full_compute(1, 0x09, 3, 0, 0),
+            {},
+            special={"MRF": T._mr_from_signed(1 << 63)},
+        )
+        self.assertEqual(rn, 3)
+        self.assertEqual(value, T.Const(0x7FFFFFFF))  # top 32 bits of the clamp
+        self.assertEqual(op, "saturate-mrf")
+        astatx = astatx_update(T.Const(0))
+        self.assertEqual(T._astatx_known_bit(astatx, T.MV_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.MI_BIT), False)
 
     # -- 0x10: undocumented in both public sources ---------------------------
 
@@ -226,7 +276,8 @@ class MultiplierComputeIntegrationTest(unittest.TestCase):
                 6,
             ),
         )
-        self.assertEqual(state.special["MRF"], T.Const(0x20000000))  # 0.25
+        # 0.5 * 0.5 = 0.25, in 1.63 fractional format: 0.25 * 2**63 = 2**61.
+        self.assertEqual(state.special["MRF"].signed(), 1 << 61)
         self.assertEqual(state.trace[-1]["operation"], "multiply-mrf")
 
         # mrf = mrf + R1*R2 (SSF), opcode 0xBC.
@@ -243,7 +294,8 @@ class MultiplierComputeIntegrationTest(unittest.TestCase):
                 6,
             ),
         )
-        self.assertEqual(state.special["MRF"], T.Const(0x40000000))  # 0.5
+        # 0.25 + 0.25 = 0.5, in 1.63 fractional format: 0.5 * 2**63 = 2**62.
+        self.assertEqual(state.special["MRF"].signed(), 1 << 62)
         self.assertEqual(state.trace[-1]["operation"], "multiply-accumulate")
 
         # RN = R1*R2 (UUI), opcode 0x40: 2**30 * 2**30 = 2**60, whose low

@@ -31,7 +31,7 @@ from .flags import (
     _astatx_leftz,
     _astatx_shift,
 )
-from .state import _ureg
+from .state import MR, _ureg
 from .values import (
     ComputeResult,
     Const,
@@ -51,7 +51,7 @@ Handler = Callable[
         Operand,
         Operand,
         Mapping[int, Value],
-        Mapping[str, Operand] | None,
+        Mapping[str, Operand | MR] | None,
         bool,
     ],
     ComputeResult,
@@ -89,7 +89,7 @@ def _field_deposit_or(
 def _shift_immediate(
     f: Mapping[str, int],
     values: Mapping[int, Value],
-    special: Mapping[str, Operand] | None = None,
+    special: Mapping[str, Operand | MR] | None = None,
 ) -> ComputeResult:
     """Execute the documented ShiftImm subset seen on qualifying paths.
 

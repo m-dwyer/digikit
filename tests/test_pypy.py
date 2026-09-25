@@ -24,6 +24,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PYPY_TESTS = [
+    "tests/test_sharc_compute_mr.py",
     "tests/test_sharc_compute_table.py",
     "tests/test_sharc_trace.py",
     "tests/test_sharc_trace_mult.py",

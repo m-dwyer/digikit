@@ -26,6 +26,112 @@ from .values import (
     _signed32,
 )
 
+# 80-bit multiplier-result accumulator (SHARC+ PRM p.3-10, Figure 3-2: MR2F
+# is bits 79:64, MR1F is bits 63:32, MR0F is bits 31:0). _MR_MASK is the
+# canonical 80-bit unsigned mask MR uses the same way Const uses 0xFFFFFFFF.
+_MR_BITS = 80
+_MR_MASK = (1 << _MR_BITS) - 1
+_MR_WORD_SLICE = {0: (0, 32), 1: (32, 32), 2: (64, 16)}  # word -> (shift, width)
+
+
+@dataclass(frozen=True)
+class MR:
+    """A fully or partially known 80-bit two's-complement multiplier-result
+    accumulator (REGF_MRF/REGF_MRB, or REGF_MSF/REGF_MSB for PEy).
+
+    Tracks knowledge the same way PartialConst does for ASTATX/ASTATY: MASK
+    has a 1 at every known bit position, BITS holds the known value there
+    and is canonicalized to 0 elsewhere. A program that only ever moved
+    MR0F (PRM Table 18-29 MRDATAMOVE) says nothing about MR1F/MR2F, and this
+    lets that partial knowledge survive instead of collapsing the whole
+    accumulator to Unknown; ``signed()`` is only ever non-None once every
+    bit is known, which is what a multiply/accumulate/round/saturate needs
+    (PRM p.3-10: those instructions read/write the full 80-bit field at
+    once, never a single MR0/MR1/MR2 word)."""
+
+    mask: int
+    bits: int
+
+    def __post_init__(self):
+        object.__setattr__(self, "mask", self.mask & _MR_MASK)
+        object.__setattr__(self, "bits", self.bits & self.mask)
+
+    @property
+    def known(self) -> bool:
+        return self.mask == _MR_MASK
+
+    def signed(self) -> int | None:
+        """The two's-complement integer value of the full 80-bit field, or
+        None unless every bit is known."""
+        if not self.known:
+            return None
+        return (
+            self.bits - (1 << _MR_BITS)
+            if self.bits & (1 << (_MR_BITS - 1))
+            else self.bits
+        )
+
+
+def _mr_from_signed(value: int) -> MR:
+    """A fully known MR from a Python int (any width; reduced mod 2**80,
+    matching Const's mod-2**32 reduction)."""
+    return MR(_MR_MASK, value & _MR_MASK)
+
+
+MR_ZERO = _mr_from_signed(0)
+
+
+def _mr_read_word(mr: MR | Operand, word: int) -> Operand:
+    """UREG-facing 32-bit value of MR0x/MR1x/MR2x (PRM p.3-11): MR0/MR1 are
+    their 32-bit slice verbatim; MR2 sign-extends its 16 stored bits to 32
+    ("When data is read from the REGF_MR2F register (guard bits), it is
+    sign-extended to 32 bits"). Unknown if MR is not an MR, or that word's
+    bits are not all known."""
+    shift, width = _MR_WORD_SLICE[word]
+    if not isinstance(mr, MR):
+        return Unknown("uninitialized MR word %d" % word)
+    word_mask = ((1 << width) - 1) << shift
+    if (mr.mask & word_mask) != word_mask:
+        return Unknown("partially known MR word %d" % word)
+    raw = (mr.bits >> shift) & ((1 << width) - 1)
+    if word == 2 and raw & (1 << 15):
+        raw |= 0xFFFF0000
+    return Const(raw)
+
+
+def _mr_write_word(mr: MR | Operand, word: int, value: Operand) -> MR | Unknown:
+    """Write UREG VALUE into MR0x/MR1x/MR2x, returning the updated MR (PRM
+    p.3-11): "Data written to the REGF_MR0F register is not sign-extended"
+    (word 0, plain 32-bit slice) and "Data written to the REGF_MR1F
+    register is sign-extended to REGF_MR2F, repeating the MSB of REGF_MR1F
+    in the 16 bits of the REGF_MR2F register" (word 1 also overwrites word
+    2); a direct write to MR2F (word 2) only ever touches its own 16 bits.
+    A non-Const VALUE clobbers (forgets) the word(s) it would have written,
+    rather than leaving stale prior knowledge in place."""
+    shift, width = _MR_WORD_SLICE[word]
+    old_mask = mr.mask if isinstance(mr, MR) else 0
+    old_bits = mr.bits if isinstance(mr, MR) else 0
+    word_mask = ((1 << width) - 1) << shift
+    mr2_shift, mr2_width = _MR_WORD_SLICE[2]
+    mr2_mask = ((1 << mr2_width) - 1) << mr2_shift
+    touched_mask = word_mask | (mr2_mask if word == 1 else 0)
+    if not isinstance(value, Const):
+        new_mask = old_mask & ~touched_mask
+        new_bits = old_bits & ~touched_mask
+        return (
+            MR(new_mask, new_bits)
+            if new_mask
+            else Unknown("uninitialized MR after unknown write to word %d" % word)
+        )
+    bits = (value.value & ((1 << width) - 1)) << shift
+    new_mask = (old_mask & ~word_mask) | word_mask
+    new_bits = (old_bits & ~word_mask) | bits
+    if word == 1:
+        sign = 0xFFFF if (value.value >> 31) & 1 else 0x0000
+        new_mask |= mr2_mask
+        new_bits = (new_bits & ~mr2_mask) | (sign << mr2_shift)
+    return MR(new_mask, new_bits)
+
 
 @dataclass(frozen=True)
 class Pending:
@@ -76,7 +182,11 @@ class State:
     core_reset_state: bool = False
     mmrs: dict[int, Value] = field(default_factory=dict)
     data_memory_tainted: bool = False
-    special: dict[str, Operand] = field(default_factory=dict)
+    # MRF/MRB/MSF/MSB (the 80-bit multiplier accumulators -- see MR above)
+    # and other per-instruction-class registers this tracer does not give
+    # their own State field (e.g. BFFWRP) share this one dict, keyed by
+    # name; every other value here is an ordinary Operand.
+    special: dict[str, Operand | MR] = field(default_factory=dict)
     # Forms this run may execute although the table marks them unconfirmed,
     # and the ones it actually did. A state that used any is calibration.
     provisional_forms: tuple[str, ...] = ()
@@ -103,7 +213,12 @@ class State:
     explicit_memory_model: bool = False
 
 
-def _render(value: Value | int) -> str:
+def _render(value: Value | MR | int) -> str:
+    if isinstance(value, MR):
+        signed = value.signed()
+        if signed is not None:
+            return "mr:%#x" % signed
+        return "mr:partial(%#x/%#x)" % (value.mask, value.bits)
     if isinstance(value, Const):
         return _render(value.value)
     if isinstance(value, Affine):
@@ -131,8 +246,14 @@ def _render(value: Value | int) -> str:
     return ("-" if value < 0 else "") + hex(abs(value))
 
 
-def _json_value(value: Value | int) -> int | dict:
+def _json_value(value: Value | MR | int) -> int | dict:
     """Render tracer values without leaking internal dataclasses into CLI JSON."""
+    if isinstance(value, MR):
+        return (
+            {"mr": value.signed()}
+            if value.known
+            else {"mr_partial": {"mask": value.mask, "bits": value.bits}}
+        )
     if isinstance(value, Const):
         return value.value
     if isinstance(value, Affine):
