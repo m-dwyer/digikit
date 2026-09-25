@@ -36,7 +36,9 @@ Library use:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -129,9 +131,15 @@ def load_patch_table(path: str | None) -> PatchTable:
 
 
 def apply_patches(runner: sr.Runner, patch_table: PatchTable) -> list[str]:
-    """Apply every PATCH_TABLE entry for runner.state.pc_sw, if any (in
-    place, before that instruction executes); returns a one-line-per-patch
-    description of what was applied, for the caller to log."""
+    """Apply every "reg"/"mem" PATCH_TABLE entry for runner.state.pc_sw, if
+    any (in place, before that instruction executes); returns a
+    one-line-per-patch description of what was applied, for the caller to
+    log. A "branch" entry (see _BRANCH_PATCH_KIND, run_collect_all()'s own
+    fork-resolution -- checked only once a fork has actually happened, not
+    unconditionally like this function) is silently skipped here rather
+    than applied: it names a successor to pick, not a register/memory value
+    to poke before the instruction runs, and a plain run_with_patches()
+    caller that never forks at that pc still needs this to be a no-op."""
     entries = patch_table.get(runner.state.pc_sw)
     if not entries:
         return []
@@ -153,6 +161,8 @@ def apply_patches(runner: sr.Runner, patch_table: PatchTable) -> list[str]:
             applied.append(
                 "mem[%#x] = %#x%s" % (target, value, "" if ok else " (FAILED)")
             )
+        elif kind == _BRANCH_PATCH_KIND:
+            continue
         else:
             raise ValueError("bad patch kind %r at pc=%#x" % (kind, runner.state.pc_sw))
     return applied
@@ -178,6 +188,474 @@ def run_with_patches(
     return sr.Halt("max-steps", runner.state.pc_sw)
 
 
+# --- collect-all mode --------------------------------------------------------
+#
+# survey()/run_with_patches() stop at the FIRST halt: useful once a patch
+# table already resolves everything upstream of the one new stop being
+# diagnosed, but turning a whole call's worth of unknown forks into a punch
+# list this way is one run per fork, by hand. run_collect_all() instead
+# keeps going through a fork by picking a branch itself -- the one named for
+# that pc by a "branch" patch-table entry (see BranchPatchTable below), else
+# a documented default (not-taken, i.e. the predicate assumed False) -- and
+# records every stop (fork or otherwise) it passes on the way, so one run
+# lists every blocker on a single path through the firmware instead of only
+# the nearest one.
+#
+# Only a fork is something this can drive through on its own: every fork
+# this tracer raises comes from exactly one idiom (SHARC_core's own
+# "taken, not_taken = _copy(state), _copy(state)" / "executed, skipped ="
+# pattern, repeated across sharc_core/forms_flow.py, forms_compute.py,
+# forms_move.py, forms_dag.py and sequencer.py -- see _fork_diagnosis()'s
+# docstring in tools/sharc_run.py for the full call-site count), which
+# always returns the True-predicate outcome(s) first and the False-predicate
+# outcome(s) second. Every call site observed produces exactly one State per
+# side (`out` has length 2); a length other than 2 is a fork shape this
+# tool has not seen and does not know how to split into "taken"/"not-taken",
+# so it is recorded and treated as terminal rather than guessed at. An
+# unmodeled MMR read and a return-target mismatch are also recorded, but
+# never continued past: an MMR has no documented default value to assume,
+# and a return mismatch means this run's own state is already wrong (see
+# SurveyStop.category's docstring) -- stepping further from either would
+# just manufacture more "blockers" downstream of bad state, not real ones.
+
+# A PatchTable entry ("branch", <anything>, 0|1) resolves a fork at that pc
+# to the not-taken (0) or taken (1) successor -- checked only once a fork
+# has actually happened (out has more than one successor), unlike a "reg"/
+# "mem" entry (applied unconditionally before the instruction executes, via
+# apply_patches(), and often enough to avoid the fork in the first place).
+# Both kinds may sit in the same PatchTable under the same pc.
+_BRANCH_PATCH_KIND = "branch"
+
+
+@dataclass
+class CollectStop:
+    """One recorded stop from a run_collect_all() pass: everything
+    report_stop() would print for a single survey() halt, plus how (and
+    whether) this run continued past it."""
+
+    index: int
+    category: str
+    pc: int
+    form: str | None
+    text: str
+    unknowns: tuple[str, ...]
+    last_writer: dict[str, int]
+    slice_summary: str
+    call_stack: list[str]
+    # Only set for category == "fork": how this run picked a successor, e.g.
+    # "taken (patch-table)", "not-taken (default)", or "unresolved (N
+    # successors)" for a non-binary fork this tool refuses to guess through
+    # (see the module note above) -- always terminal when unresolved.
+    resolution: str | None = None
+    # Set iff resolving THIS stop consumed a fresh guess (an unpatched
+    # default, not a patch-table entry) -- its 1-based number.
+    guess_number: int | None = None
+    # Guess numbers made strictly before this stop, oldest first -- empty
+    # until the first unpatched default fork.
+    downstream_of: tuple[int, ...] = ()
+
+    def to_json(self) -> dict:
+        return {
+            "index": self.index,
+            "category": self.category,
+            "pc": self.pc,
+            "form": self.form,
+            "text": self.text,
+            "unknowns": list(self.unknowns),
+            "last_writer": dict(self.last_writer),
+            "slice_summary": self.slice_summary,
+            "call_stack": list(self.call_stack),
+            "resolution": self.resolution,
+            "guess_number": self.guess_number,
+            "downstream_of": list(self.downstream_of),
+        }
+
+
+@dataclass
+class CollectAllResult:
+    """Every stop run_collect_all() passed on a single continuous path
+    through ROOT, oldest first; the last entry is always terminal (a
+    non-fork halt, an unresolved/non-binary fork, or a max-steps budget)."""
+
+    stops: list[CollectStop]
+    instructions: int
+    elapsed: float
+    guesses: int
+
+    @property
+    def terminal(self) -> CollectStop:
+        return self.stops[-1]
+
+
+def _short_slice(
+    img: sharc.Image | None,
+    pc_sw: int,
+    *,
+    reg: str | None = None,
+    depth: int,
+    max_chars: int = 300,
+) -> str:
+    """A one-line (whitespace-collapsed, length-bounded) version of
+    img.print_slice() -- report_stop()'s full multi-line dump is too wide
+    for a table with one row per stop. img.print_slice() also prints its
+    own full text as a side effect (tools/sharc.py, not this lane's own
+    file); every collect-all stop computes this eagerly (not only when a
+    caller prints the report), so that side effect is suppressed here --
+    otherwise --json output would have that raw text spliced into it."""
+    if img is None:
+        return ""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            text = img.print_slice(pc_sw, reg=reg, depth=depth)
+    except Exception as exc:  # noqa: BLE001 -- report and move on, never abort the survey
+        return "(unavailable: %s)" % exc
+    if not text:
+        return "(empty)"
+    flat = " / ".join(line.strip() for line in text.splitlines() if line.strip())
+    if len(flat) > max_chars:
+        flat = flat[: max_chars - 3] + "..."
+    return flat
+
+
+def _finish_step(
+    runner: sr.Runner,
+    pc_sw: int,
+    insn,
+    state,
+    diagnosing: bool,
+    before,
+) -> sr.Halt | None:
+    """The bookkeeping tools/sharc_run.py's Runner.step() does once it has a
+    single successor STATE for the instruction at PC_SW: install it as
+    runner.state, update _last_writer, and either report the Halt
+    state.stopped names or advance the ordinary counters. Mirrors
+    Runner.step() exactly (see its own docstring) so run_collect_all()'s
+    bookkeeping can never drift from a plain survey()/Runner.run() -- this
+    duplicates that block rather than editing sharc_run.py, which this
+    lane does not own."""
+    runner.state = state
+    if diagnosing:
+        astatx_code, astaty_code, mode1_code = runner._diagnose_codes
+        uregs = state.uregs
+        before_astatx, before_astaty, before_mode1 = before
+        if uregs[astatx_code] is not before_astatx:
+            runner._last_writer["ASTATX"] = pc_sw
+        if uregs[astaty_code] is not before_astaty:
+            runner._last_writer["ASTATY"] = pc_sw
+        if uregs[mode1_code] is not before_mode1:
+            runner._last_writer["MODE1"] = pc_sw
+    if state.stopped:
+        return sr.Halt(state.stopped, state.pc_sw, insn.type_name, insn.note)
+    runner.instructions += 1
+    runner.form_counts[insn.type_name] += 1
+    depth = len(state.call_stack)
+    if depth > runner.max_call_depth_reached:
+        runner.max_call_depth_reached = depth
+    return None
+
+
+def run_collect_all(
+    runner: sr.Runner,
+    patch_table: PatchTable,
+    max_steps: int,
+    *,
+    img: sharc.Image | None = None,
+    slice_depth: int = DEFAULT_SLICE_DEPTH,
+    verbose: bool = False,
+) -> CollectAllResult:
+    """Step RUNNER forward like run_with_patches(), but instead of stopping
+    at the first Halt, record every stop (pc, form, unknown bits, last flag
+    writer, a short slice summary, call stack) and keep going whenever the
+    stop is a binary fork -- see the module note above for exactly which
+    stops are continued through and which are terminal. RUNNER must have
+    diagnose_unknown=True (its _last_writer/_fork_diagnosis are what make a
+    fork's unknowns and "last flag writer" meaningful); this is not
+    enforced, since a caller probing a run with no forks at all may not
+    care.
+
+    Returns a CollectAllResult whose last stop is always terminal. Bounded
+    by MAX_STEPS the same way run_with_patches() is -- an exhausted budget
+    is recorded as a "max-steps" stop, not silently dropped."""
+    patch_table = patch_table or {}
+    stops: list[CollectStop] = []
+    guess_numbers: list[int] = []
+    # A fork pc resolved once (guessed or patched) is remembered and, on every
+    # later recurrence -- e.g. each iteration of a loop -- reapplied silently
+    # instead of being recorded and re-guessed again: "one run lists all
+    # blockers" means one row per distinct fork this path depends on, not one
+    # per loop iteration it happens to run (a real loop can recur thousands
+    # of times before this function's own max_steps is reached at all).
+    fork_choice: dict[int, bool] = {}
+
+    def record(category, pc, form, text, unknowns, *, resolution=None) -> CollectStop:
+        stop = CollectStop(
+            index=len(stops),
+            category=category,
+            pc=pc,
+            form=form,
+            text=text,
+            unknowns=tuple(unknowns),
+            last_writer=dict(runner._last_writer),
+            slice_summary=_short_slice(img, pc, depth=slice_depth),
+            call_stack=_call_stack_lines(img, runner)
+            if img is not None
+            else ["%#x" % a for a in runner.state.call_stack],
+            resolution=resolution,
+            downstream_of=tuple(guess_numbers),
+        )
+        stops.append(stop)
+        return stop
+
+    def finish(steps: int) -> CollectAllResult:
+        return CollectAllResult(
+            stops=stops,
+            instructions=runner.instructions,
+            elapsed=0.0,
+            guesses=len(guess_numbers),
+        )
+
+    steps = 0
+    while steps < max_steps:
+        applied = apply_patches(runner, patch_table)
+        if verbose and applied:
+            print("  patched at %#x: %s" % (runner.state.pc_sw, "; ".join(applied)))
+        state = runner.state
+        pc_sw = state.pc_sw
+        if pc_sw in runner.breakpoints:
+            record("breakpoint", pc_sw, None, "", ())
+            return finish(steps)
+        insn = runner._decode(pc_sw)
+        if runner._watch is not None:
+            runner._watch.begin_step(pc_sw, insn.type_name)
+        diagnosing = runner.diagnose_unknown
+        before = None
+        if diagnosing:
+            astatx_code, astaty_code, mode1_code = runner._diagnose_codes
+            uregs = state.uregs
+            before = (uregs[astatx_code], uregs[astaty_code], uregs[mode1_code])
+        try:
+            out = st._execute(state, insn)
+        except sr.UnmodeledMMR as exc:
+            record(
+                "mmr",
+                pc_sw,
+                insn.type_name,
+                "unmodeled MMR %#x (%s)" % (exc.address, exc.name or "unnamed"),
+                (),
+            )
+            return finish(steps)
+        except sr._WatchpointStop as exc:
+            record("watchpoint", pc_sw, insn.type_name, str(exc.event), ())
+            return finish(steps)
+
+        if len(out) == 1:
+            halt = _finish_step(runner, pc_sw, insn, out[0], diagnosing, before)
+            if halt is not None:
+                record(
+                    _categorize_reason(halt.reason),
+                    halt.pc_sw,
+                    halt.form,
+                    halt.text,
+                    halt.unknowns,
+                )
+                return finish(steps)
+            steps += 1
+            continue
+
+        # A fork: len(out) != 1.
+        if pc_sw in fork_choice:
+            # Already diagnosed on an earlier visit to this pc (a loop):
+            # reapply the same choice, but do not re-record or re-guess it.
+            chosen_state = out[0] if fork_choice[pc_sw] else out[1]
+            halt = _finish_step(runner, pc_sw, insn, chosen_state, diagnosing, before)
+            if halt is not None:
+                record(
+                    _categorize_reason(halt.reason),
+                    halt.pc_sw,
+                    halt.form,
+                    halt.text,
+                    halt.unknowns,
+                )
+                return finish(steps)
+            steps += 1
+            continue
+
+        unknowns = (
+            sr._fork_diagnosis(state, insn, runner._last_writer) if diagnosing else ()
+        )
+        if len(out) != 2:
+            record(
+                "fork",
+                pc_sw,
+                insn.type_name,
+                insn.note,
+                unknowns,
+                resolution="unresolved (%d successors)" % len(out),
+            )
+            return finish(steps)
+
+        branch_entries = [
+            e for e in patch_table.get(pc_sw, ()) if e[0] == _BRANCH_PATCH_KIND
+        ]
+        if branch_entries:
+            chosen_true = bool(branch_entries[-1][2])
+            resolution = "%s (patch-table)" % ("taken" if chosen_true else "not-taken")
+            is_guess = False
+        else:
+            chosen_true = False
+            resolution = "not-taken (default)"
+            is_guess = True
+        fork_choice[pc_sw] = chosen_true
+
+        stop = record(
+            "fork", pc_sw, insn.type_name, insn.note, unknowns, resolution=resolution
+        )
+        if is_guess:
+            guess_numbers.append(len(guess_numbers) + 1)
+            stop.guess_number = guess_numbers[-1]
+
+        chosen_state = out[0] if chosen_true else out[1]
+        halt = _finish_step(runner, pc_sw, insn, chosen_state, diagnosing, before)
+        if halt is not None:
+            record(
+                _categorize_reason(halt.reason),
+                halt.pc_sw,
+                halt.form,
+                halt.text,
+                halt.unknowns,
+            )
+            return finish(steps)
+        steps += 1
+
+    record("max-steps", runner.state.pc_sw, None, "", ())
+    return finish(steps)
+
+
+def collect_all(
+    *,
+    image: str,
+    root: int,
+    snapshot: str | None = None,
+    run_init: bool = False,
+    regs: Mapping[str | int, int | str] | None = None,
+    return_address: int | None = None,
+    patch_table: PatchTable | None = None,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    max_call_depth: int = 64,
+    explicit_memory_model: bool = True,
+    approx_recips: bool = True,
+    follow_loaded_calls: bool = True,
+    slice_depth: int = DEFAULT_SLICE_DEPTH,
+    verbose: bool = False,
+) -> CollectAllResult:
+    """The --collect-all counterpart to survey(): same starting points
+    (_start_runner()), but run_collect_all() instead of run_with_patches(),
+    so the result is every stop on one path through ROOT rather than only
+    the first."""
+    runner, img = _start_runner(
+        image=image,
+        root=root,
+        snapshot=snapshot,
+        run_init=run_init,
+        regs=regs,
+        return_address=return_address,
+        max_call_depth=max_call_depth,
+        explicit_memory_model=explicit_memory_model,
+        approx_recips=approx_recips,
+        follow_loaded_calls=follow_loaded_calls,
+    )
+    t0 = time.perf_counter()
+    result = run_collect_all(
+        runner,
+        patch_table or {},
+        max_steps,
+        img=img,
+        slice_depth=slice_depth,
+        verbose=verbose,
+    )
+    result.elapsed = time.perf_counter() - t0
+    return result
+
+
+def report_collect_all(result: CollectAllResult) -> None:
+    """A table, one row per CollectStop, plus a full report_stop()-shaped
+    detail block for the terminal one."""
+    print(
+        "instructions=%d elapsed=%.3fs (%.0f instr/s)"
+        % (
+            result.instructions,
+            result.elapsed,
+            result.instructions / result.elapsed
+            if result.elapsed > 0
+            else float("inf"),
+        )
+    )
+    print("%d stop(s), %d guess(es)" % (len(result.stops), result.guesses))
+    print(
+        "%-4s %-10s %-10s %-10s %-28s %s"
+        % ("#", "category", "pc", "form", "resolution", "downstream-of")
+    )
+    for s in result.stops:
+        downstream = (
+            ",".join("#%d" % g for g in s.downstream_of) if s.downstream_of else "-"
+        )
+        guess = " (guess #%d)" % s.guess_number if s.guess_number is not None else ""
+        print(
+            "%-4d %-10s %-10s %-10s %-28s %s"
+            % (
+                s.index,
+                s.category,
+                "%#x" % s.pc,
+                s.form or "-",
+                (s.resolution or "-") + guess,
+                downstream,
+            )
+        )
+    last = result.terminal
+    print("\nterminal stop detail:")
+    print("  pc=%#x form=%s category=%s" % (last.pc, last.form, last.category))
+    if last.text:
+        print("  text: %s" % last.text)
+    if last.unknowns:
+        print("  unknowns: %s" % ", ".join(last.unknowns))
+    print("  last flag writer:")
+    for name, pc in last.last_writer.items():
+        print("    %-8s 0x%x" % (name, pc))
+    print("  slice: %s" % last.slice_summary)
+    print("  call stack (return addrs, innermost last):")
+    if not last.call_stack:
+        print("    (empty)")
+    for line in last.call_stack:
+        print("    %s" % line)
+
+
+def _categorize_reason(reason: str) -> str:
+    """A short label for a Halt.reason, beyond its own free text:
+    "return-mismatch" gets its own category (see the module docstring and
+    _check_return_target() in sharc_core/sequencer.py) -- a prior poke or an
+    inherited call_stack entry disagreeing with what the sequencer's own
+    I12/M14 computed is a sign that THIS RUN's state is wrong, not a new
+    thing to explain about the firmware. Shared by SurveyStop.category and
+    run_collect_all()'s own per-stop category, so the two never disagree
+    about what a given reason string means."""
+    if (
+        reason.startswith("return target ")
+        and " differs from recorded return " in reason
+    ):
+        return "return-mismatch"
+    if reason.startswith("fork"):
+        return "fork"
+    if reason == "mmr":
+        return "mmr"
+    if reason == "watchpoint":
+        return "watchpoint"
+    if reason == "return without followed call":
+        return "frame-returned"
+    if reason == "max-steps":
+        return "max-steps"
+    return reason
+
+
 @dataclass
 class SurveyStop:
     """One survey run's outcome: the Halt itself, the Runner that produced
@@ -192,29 +670,7 @@ class SurveyStop:
 
     @property
     def category(self) -> str:
-        """A short label for the halt's kind, beyond Halt.reason's own free
-        text: "return-mismatch" gets its own category (see the module
-        docstring and _check_return_target() in sharc_core/sequencer.py) --
-        a prior poke or an inherited call_stack entry disagreeing with what
-        the sequencer's own I12/M14 computed is a sign that THIS RUN's
-        state is wrong, not a new thing to explain about the firmware."""
-        reason = self.halt.reason
-        if (
-            reason.startswith("return target ")
-            and " differs from recorded return " in reason
-        ):
-            return "return-mismatch"
-        if reason.startswith("fork"):
-            return "fork"
-        if reason == "mmr":
-            return "mmr"
-        if reason == "watchpoint":
-            return "watchpoint"
-        if reason == "return without followed call":
-            return "frame-returned"
-        if reason == "max-steps":
-            return "max-steps"
-        return reason
+        return _categorize_reason(self.halt.reason)
 
 
 def _call_stack_lines(img: sharc.Image, runner: sr.Runner) -> list[str]:
@@ -319,7 +775,7 @@ def report_stop(stop: SurveyStop, *, slice_depth: int = DEFAULT_SLICE_DEPTH) -> 
         print("    %s" % line)
 
 
-def survey(
+def _start_runner(
     *,
     image: str,
     root: int,
@@ -327,22 +783,20 @@ def survey(
     run_init: bool = False,
     regs: Mapping[str | int, int | str] | None = None,
     return_address: int | None = None,
-    patch_table: PatchTable | None = None,
-    max_steps: int = DEFAULT_MAX_STEPS,
     max_call_depth: int = 64,
     explicit_memory_model: bool = True,
     approx_recips: bool = True,
     follow_loaded_calls: bool = True,
-    verbose: bool = False,
-) -> SurveyStop:
-    """Run ROOT from SNAPSHOT, a fresh run_init(), or (neither given) a
-    bare Runner started directly at ROOT, applying PATCH_TABLE, and return
-    the resulting SurveyStop. See the module docstring for the two
-    documented starting points and why a snapshot/run_init Runner needs
-    Runner.fresh_call() rather than just overwriting its pc_sw."""
+) -> tuple[sr.Runner, sharc.Image]:
+    """The Runner/Image pair every entry point in this module starts from:
+    ROOT called fresh (Runner.fresh_call()) on top of SNAPSHOT, a fresh
+    run_init(), or (neither given) a bare Runner started directly at ROOT --
+    see survey()'s own docstring for the two documented starting points and
+    why a snapshot/run_init Runner needs fresh_call() rather than just
+    overwriting its pc_sw. Shared by survey() and collect_all() so the two
+    can never disagree about how a root is reached."""
     img = sharc.load(image)
     memory = sr._load_image_memory(image)
-    patch_table = patch_table or {}
 
     if snapshot is not None:
         base = sr.load_snapshot(snapshot, memory)
@@ -371,6 +825,43 @@ def survey(
         )
         if return_address is not None:
             runner.state.call_stack = [return_address]
+    return runner, img
+
+
+def survey(
+    *,
+    image: str,
+    root: int,
+    snapshot: str | None = None,
+    run_init: bool = False,
+    regs: Mapping[str | int, int | str] | None = None,
+    return_address: int | None = None,
+    patch_table: PatchTable | None = None,
+    max_steps: int = DEFAULT_MAX_STEPS,
+    max_call_depth: int = 64,
+    explicit_memory_model: bool = True,
+    approx_recips: bool = True,
+    follow_loaded_calls: bool = True,
+    verbose: bool = False,
+) -> SurveyStop:
+    """Run ROOT from SNAPSHOT, a fresh run_init(), or (neither given) a
+    bare Runner started directly at ROOT, applying PATCH_TABLE, and return
+    the resulting SurveyStop. See _start_runner() for the two documented
+    starting points and why a snapshot/run_init Runner needs
+    Runner.fresh_call() rather than just overwriting its pc_sw."""
+    runner, img = _start_runner(
+        image=image,
+        root=root,
+        snapshot=snapshot,
+        run_init=run_init,
+        regs=regs,
+        return_address=return_address,
+        max_call_depth=max_call_depth,
+        explicit_memory_model=explicit_memory_model,
+        approx_recips=approx_recips,
+        follow_loaded_calls=follow_loaded_calls,
+    )
+    patch_table = patch_table or {}
 
     t0 = time.perf_counter()
     halt = run_with_patches(runner, patch_table, max_steps, verbose=verbose)
@@ -435,6 +926,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     p.add_argument("--verbose", action="store_true", help="log every applied patch")
     p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--collect-all",
+        action="store_true",
+        help="do not stop at the first halt: guess through every binary fork "
+        '(the patch table\'s own "branch" entries, else not-taken) and report '
+        "every stop on the one path this makes, not just the first",
+    )
     a = p.parse_args(argv)
 
     regs: dict[str | int, int | str] = {}
@@ -442,6 +940,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         regs[name] = int(value, 0)
 
     patch_table = load_patch_table(a.patch_table)
+
+    if a.collect_all:
+        result = collect_all(
+            image=a.image,
+            root=a.root,
+            snapshot=a.snapshot,
+            run_init=a.run_init,
+            regs=regs,
+            return_address=a.return_address,
+            patch_table=patch_table,
+            max_steps=a.max_steps,
+            max_call_depth=a.max_call_depth,
+            explicit_memory_model=a.explicit_memory_model,
+            approx_recips=a.approx_recips,
+            slice_depth=a.slice_depth,
+            verbose=a.verbose,
+        )
+        if a.json:
+            print(
+                json.dumps(
+                    {
+                        "stops": [s.to_json() for s in result.stops],
+                        "instructions": result.instructions,
+                        "elapsed_s": result.elapsed,
+                        "guesses": result.guesses,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            report_collect_all(result)
+        return 0
 
     stop = survey(
         image=a.image,

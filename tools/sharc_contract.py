@@ -168,6 +168,32 @@ def _ptr_rows_for(img, funcs, direction):
     ).fetchall()
 
 
+def read_write_addresses(img, root):
+    """(read_addrs, write_addrs): every concrete `ptr`-resolved DM address
+    ROOT's own reach set (reach_functions()) loads from / stores to -- the
+    same rows build() itself groups into known-structure objects, flattened
+    to individual addresses (a base-only hit with no resolved address is
+    dropped, same as build()'s own read_addrs/write_addrs). Used by
+    tools/sharc_inputs.py, which labels one address at a time rather than
+    one known-structure object."""
+    reach = reach_functions(img, root)
+    read_addrs = {
+        address
+        for _sw, _base_reg, _base_value, address, _width in _ptr_rows_for(
+            img, reach, "load"
+        )
+        if address is not None
+    }
+    write_addrs = {
+        address
+        for _sw, _base_reg, _base_value, address, _width in _ptr_rows_for(
+            img, reach, "store"
+        )
+        if address is not None
+    }
+    return read_addrs, write_addrs
+
+
 def _global_ptr_rows(img, direction, lo, hi):
     """Every `ptr` row of `direction` in the WHOLE image (no reach filter)
     whose resolved address lands in [lo, hi)."""

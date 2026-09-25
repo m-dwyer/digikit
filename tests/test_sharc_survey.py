@@ -19,11 +19,14 @@ import tempfile
 import unittest
 from importlib import import_module
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools"))
 sv = import_module("sharc_survey")
 sr = import_module("sharc_run")
 T = import_module("sharc_trace")
 L = import_module("sharcldr")
+sharc = import_module("sharc")
 
 DT2_116_DB = pathlib.Path("out/sharcdb/dt2-1.16.sqlite")
 DT2_116_BLOB = pathlib.Path("out/sections/dt2-1.16/section_7_BLOB.bin")
@@ -107,6 +110,16 @@ class ApplyPatchesTest(unittest.TestCase):
     def test_no_entry_for_this_pc_is_a_noop(self):
         runner = self._runner()
         applied = sv.apply_patches(runner, {0x1000: [("reg", "R0", 9)]})
+        self.assertEqual(applied, [])
+        self.assertEqual(runner.state.uregs[T.UREG_CODES["R0"]], T.Const(1))
+
+    def test_branch_kind_is_a_noop_here(self):
+        # A "branch" entry is only meaningful once run_collect_all() has
+        # actually seen a fork at this pc (see its own module note); a
+        # plain run_with_patches() caller with no fork there must not have
+        # this raise, and must not touch any register.
+        runner = self._runner()
+        applied = sv.apply_patches(runner, {0x10: [("branch", None, 1)]})
         self.assertEqual(applied, [])
         self.assertEqual(runner.state.uregs[T.UREG_CODES["R0"]], T.Const(1))
 
@@ -207,6 +220,41 @@ class SurveyStopCategoryTest(unittest.TestCase):
         self.assertEqual(self._stop("breakpoint").category, "breakpoint")
 
 
+class CollectStopJsonTest(unittest.TestCase):
+    def test_to_json_shape(self):
+        stop = sv.CollectStop(
+            index=1,
+            category="fork",
+            pc=0x10,
+            form="8a_rel",
+            text="note",
+            unknowns=("cond=EQ",),
+            last_writer={"ASTATX": 0x8},
+            slice_summary="0x10 ...",
+            call_stack=["0x20"],
+            resolution="not-taken (default)",
+            guess_number=1,
+            downstream_of=(),
+        )
+        self.assertEqual(
+            stop.to_json(),
+            {
+                "index": 1,
+                "category": "fork",
+                "pc": 0x10,
+                "form": "8a_rel",
+                "text": "note",
+                "unknowns": ["cond=EQ"],
+                "last_writer": {"ASTATX": 0x8},
+                "slice_summary": "0x10 ...",
+                "call_stack": ["0x20"],
+                "resolution": "not-taken (default)",
+                "guess_number": 1,
+                "downstream_of": [],
+            },
+        )
+
+
 @unittest.skipUnless(
     DT2_116_DB.exists() and DT2_116_BLOB.exists(),
     "out/sharcdb/dt2-1.16.sqlite or out/sections/dt2-1.16/section_7_BLOB.bin "
@@ -272,6 +320,185 @@ class SurveyEndToEndTest(unittest.TestCase):
         self.assertEqual(payload["category"], "fork")
         self.assertIn("ASTATX", payload["last_writer"])
         self.assertIsInstance(payload["call_stack"], list)
+
+
+@unittest.skipUnless(
+    DT2_116_DB.exists() and DT2_116_BLOB.exists(),
+    "out/sharcdb/dt2-1.16.sqlite or out/sections/dt2-1.16/section_7_BLOB.bin "
+    "is not available",
+)
+class CollectAllEndToEndTest(unittest.TestCase):
+    """--collect-all against the same bare FUN_1c2b24 root SurveyEndToEndTest
+    uses: it must find the exact same first fork survey() does (same pc,
+    same instruction count -- collect_all() is not a different execution,
+    only a different stopping rule), then keep going with a default
+    not-taken guess rather than stopping there."""
+
+    START = 0x1C2B24
+    FIRST_FORK_PC = 0xB88E4B
+    FIRST_FORK_INSTRUCTIONS = 15675
+    SECOND_FORK_PC = 0x1C35BD
+
+    def test_continues_past_the_first_fork_with_a_default_guess(self):
+        # Just past the first fork: the second known one (0x1c35bd) sits
+        # only a handful of instructions later, so a slightly larger budget
+        # would already find it too -- this only pins the FIRST stop.
+        result = sv.collect_all(
+            image="dt2-1.16",
+            root=self.START,
+            max_steps=self.FIRST_FORK_INSTRUCTIONS + 1,
+        )
+        first = result.stops[0]
+        self.assertEqual(first.category, "fork")
+        self.assertEqual(first.pc, self.FIRST_FORK_PC)
+        self.assertEqual(first.resolution, "not-taken (default)")
+        self.assertEqual(first.guess_number, 1)
+        self.assertEqual(first.downstream_of, ())
+        self.assertIn("cond=EQ", first.unknowns)
+        # The chosen (not-taken) branch keeps running past the fork instead
+        # of stopping the whole survey there.
+        self.assertGreater(result.instructions, self.FIRST_FORK_INSTRUCTIONS)
+
+    def test_finds_a_second_distinct_fork_downstream_of_the_first_guess(self):
+        result = sv.collect_all(image="dt2-1.16", root=self.START, max_steps=60_000)
+        self.assertGreaterEqual(len(result.stops), 2)
+        first, second = result.stops[0], result.stops[1]
+        self.assertEqual(first.pc, self.FIRST_FORK_PC)
+        self.assertEqual(second.pc, self.SECOND_FORK_PC)
+        self.assertEqual(second.category, "fork")
+        self.assertEqual(second.guess_number, 2)
+        self.assertEqual(second.downstream_of, (1,))
+        self.assertEqual(result.guesses, 2)
+
+    def test_a_branch_patch_table_entry_overrides_the_default_and_is_not_a_guess(self):
+        default = sv.collect_all(
+            image="dt2-1.16",
+            root=self.START,
+            max_steps=self.FIRST_FORK_INSTRUCTIONS + 1,
+        )
+        forced = sv.collect_all(
+            image="dt2-1.16",
+            root=self.START,
+            max_steps=self.FIRST_FORK_INSTRUCTIONS + 1,
+            patch_table={self.FIRST_FORK_PC: [("branch", None, 1)]},
+        )
+        self.assertEqual(default.stops[0].pc, forced.stops[0].pc)
+        self.assertEqual(default.stops[0].resolution, "not-taken (default)")
+        self.assertEqual(forced.stops[0].resolution, "taken (patch-table)")
+        self.assertEqual(default.stops[0].guess_number, 1)
+        self.assertIsNone(forced.stops[0].guess_number)
+
+    def test_a_reg_patch_can_still_avoid_a_fork_entirely(self):
+        # The existing "reg"/"mem" PatchTable kind (applied unconditionally
+        # before the instruction runs, via apply_patches()) still works
+        # under collect_all(): a good enough register value means the fork
+        # this lane's docs/findings/06 already explains never happens, so it
+        # is not in the stop list at all.
+        result = sv.collect_all(
+            image="dt2-1.16",
+            root=self.START,
+            max_steps=self.FIRST_FORK_INSTRUCTIONS + 1000,
+            patch_table={0xB88E04: [("reg", "R8", 0x40000000)]},
+        )
+        pcs = [s.pc for s in result.stops]
+        self.assertNotIn(self.FIRST_FORK_PC, pcs)
+
+    def test_max_steps_budget_is_recorded_as_a_terminal_stop(self):
+        result = sv.collect_all(image="dt2-1.16", root=self.START, max_steps=10)
+        self.assertEqual(len(result.stops), 1)
+        self.assertEqual(result.stops[0].category, "max-steps")
+        self.assertEqual(result.instructions, 10)
+
+    def test_report_collect_all_prints_a_row_per_stop(self):
+        result = sv.collect_all(image="dt2-1.16", root=self.START, max_steps=60_000)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sv.report_collect_all(result)
+        text = buf.getvalue()
+        self.assertIn("%#x" % self.FIRST_FORK_PC, text)
+        self.assertIn("%#x" % self.SECOND_FORK_PC, text)
+        self.assertIn("guess #1", text)
+        self.assertIn("terminal stop detail:", text)
+
+    def test_json_round_trips_through_main(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            sv.main(
+                [
+                    "dt2-1.16",
+                    "--root",
+                    hex(self.START),
+                    "--max-steps",
+                    str(self.FIRST_FORK_INSTRUCTIONS + 1),
+                    "--collect-all",
+                    "--json",
+                ]
+            )
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["stops"][0]["pc"], self.FIRST_FORK_PC)
+        self.assertEqual(payload["stops"][0]["category"], "fork")
+        self.assertEqual(payload["guesses"], 1)
+
+
+@pytest.mark.slow
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+class CollectAllFrameRunTest(unittest.TestCase):
+    """run_collect_all() against the real block_handler dispatch (setup_frame()
+    + fresh_call(), like tools/sharc_harness.py's own FrameRenderFromInitTest)
+    -- this lane's own validation that --collect-all finds every stop on the
+    frame-render path a single survey()/run_with_patches() run only ever
+    reports one of at a time. run_init() is ~1.24M instructions (several
+    seconds); shared across both methods, like InitStateRenderTest."""
+
+    @classmethod
+    def setUpClass(cls):
+        import sharc_harness as h  # noqa: PLC0415 -- only this slow test needs it
+
+        cls.h = h
+        cls.img = sharc.load("dt2-1.16")
+        memory = h.load_image_memory("dt2-1.16")
+        init = h.run_init(memory, "dt2-1.16")
+        if not init.ran:  # pragma: no cover - defensive, see run_init
+            raise RuntimeError("run_init did not complete: %s" % init.error)
+        cls.base_runner = init.runner
+        h.setup_voice(cls.base_runner.state, "dt2-1.16", 0, sample_len=4096)
+        cls.block_handler = h.setup_frame(cls.base_runner.state, "dt2-1.16")
+
+    def _fresh_call(self):
+        return self.base_runner.fresh_call(self.block_handler, diagnose_unknown=True)
+
+    def test_with_frame_patch_table_is_a_single_stop(self):
+        # FRAME_PATCH_TABLE's two register hypotheses already avoid every
+        # fork on this path (docs/findings/06, this lane's handover): the
+        # only stop collect-all records is the same known return-mismatch
+        # tools/sharc_harness.py's own FrameRenderFromInitTest pins.
+        result = sv.run_collect_all(
+            self._fresh_call(),
+            self.h.FRAME_PATCH_TABLE,
+            max_steps=4_000_000,
+            img=self.img,
+        )
+        self.assertEqual(len(result.stops), 1)
+        self.assertEqual(result.instructions, 191363)
+        last = result.stops[0]
+        self.assertEqual(last.category, "return-mismatch")
+        self.assertEqual(last.pc, 0xB82A30)
+
+    def test_without_patch_table_finds_several_distinct_forks_then_the_same_blocker(
+        self,
+    ):
+        result = sv.run_collect_all(
+            self._fresh_call(), {}, max_steps=4_000_000, img=self.img
+        )
+        # Every fork this lane's own FRAME_PATCH_TABLE hand-resolves, plus a
+        # handful more a bare not-taken default has to guess through, ending
+        # at the same return-mismatch a hand-patched run reaches.
+        self.assertGreater(result.guesses, 5)
+        self.assertEqual(result.stops[-1].category, "return-mismatch")
+        self.assertEqual(result.stops[-1].pc, 0xB82A30)
+        # A recurring fork (a loop) is recorded once, not once per iteration.
+        pcs = [s.pc for s in result.stops]
+        self.assertEqual(len(pcs), len(set(pcs)))
 
 
 if __name__ == "__main__":
