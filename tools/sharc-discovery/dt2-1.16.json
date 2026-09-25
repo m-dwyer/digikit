@@ -208,9 +208,6 @@
     {
       "entry_sw": "0x1c3504",
       "register": "R6",
-      "calibration_forms": [
-        "14d"
-      ],
       "seed_global_constants": true,
       "finite_domain_guard": {
         "register": "R4",

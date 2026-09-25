@@ -52,7 +52,8 @@ class SeedDecodeTest(unittest.TestCase):
             fh.write(b"".join([
                 block(L.sw_to_byte(0x10), bytes.fromhex("0119")),
                 block(L.sw_to_byte(0x20), bytes.fromhex("0119")),
-                block(L.sw_to_byte(0x30), bytes.fromhex("004030000000")),
+                # 22p_undoc48: a 48-bit form the decoder still marks uncertain.
+                block(L.sw_to_byte(0x30), bytes.fromhex("b80000000000")),
                 block(L.sw_to_byte(0x48), bytes.fromhex("000f0000")),
                 block(L.sw_to_byte(0x50), bytes.fromhex("0119")),
                 block(0, b"", 1 << L.BFLAGS["FINAL"]),

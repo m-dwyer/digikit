@@ -114,24 +114,24 @@ class IndexContractTest(unittest.TestCase):
                     {"pc_sw": 0x21, "action": "ureg-write", "destination": "R6"}
                 ]
                 stopped = "return without followed call"
-                provisional_used = ("14d",)
+                provisional_used = ("6a_nomem",)
 
-            query = I.RegisterEffectQuery(0x20, "R6", calibration_forms=("14d",))
+            query = I.RegisterEffectQuery(0x20, "R6", calibration_forms=("6a_nomem",))
             with patch("sharcfn.load_context", return_value=context), patch(
                 "sharc_trace.trace", return_value=[State()]
             ) as trace:
                 effect = index.query(register_effects=[query])["register_effects"][0]
 
-            self.assertEqual(trace.call_args.kwargs["provisional_forms"], ("14d",))
+            self.assertEqual(trace.call_args.kwargs["provisional_forms"], ("6a_nomem",))
             self.assertEqual(effect["status"], "unknown")
             self.assertEqual(effect["writer_pcs"], [])
-            self.assertIn("calibration form used: 14d", effect["reasons"])
+            self.assertIn("calibration form used: 6a_nomem", effect["reasons"])
             self.assertEqual(
                 effect["calibration_forms"],
                 [{
-                    "form": "14d",
+                    "form": "6a_nomem",
                     "evidence": [{
-                        "claim_id": "isa.form.14d.encoding",
+                        "claim_id": "isa.form.6a_nomem.encoding",
                         "source": "prm",
                         "status": "unconfirmed",
                     }],
