@@ -351,6 +351,7 @@ def call_frame_collect_all_with_hits(
     max_steps: int = 4_000_000,
     max_hits: int = 200,
     img=None,
+    sample_fn=None,
 ) -> tuple[sr.Runner, sv.CollectAllResult, list[dict]]:
     """Like `sharc_harness.call_frame_collect_all()`, but also answers "does
     control ever reach any of TRACE_PCS during this one frame call", with a
@@ -390,6 +391,19 @@ def call_frame_collect_all_with_hits(
     (a runaway loop should not build an unbounded list) or `max_steps`
     total instructions, whichever comes first -- either way, `result`
     still reports whatever terminal `run_collect_all()` last reached.
+
+    `sample_fn`, if given, is called as `sample_fn(new_runner, terminal.pc)`
+    right when a hit is recorded -- *before* that pc's own instruction has
+    executed, so it sees exactly the register/memory state the about-to-run
+    instruction (often a conditional jump) will read. Its return value
+    (any JSON-able dict) is merged under the hit's own `"sample"` key.
+    Never called when `sample_fn` is None (the default), which keeps every
+    existing caller's hit-dict shape (and tests/test_sharc_replay.py's own
+    assertions on it) unchanged -- this is a pure opt-in addition, not a
+    behaviour change (lane H3, 2026-09-26, tools/sharc_armpath.py's own
+    caller: reading raw register state at a guard jump this way, rather
+    than re-deriving it from the disassembly's own displacement units,
+    which sharc_core's `modify()` resolves once and correctly already).
     """
     p = h.profile(image)
     new_runner = runner.fresh_call(p.block_handler, diagnose_unknown=True)
@@ -405,9 +419,10 @@ def call_frame_collect_all_with_hits(
         terminal = result.terminal
         if terminal.category != "breakpoint" or terminal.pc not in trace_pcs:
             break
-        hits.append(
-            {"pc": "%#x" % terminal.pc, "instructions": new_runner.instructions}
-        )
+        hit = {"pc": "%#x" % terminal.pc, "instructions": new_runner.instructions}
+        if sample_fn is not None:
+            hit["sample"] = sample_fn(new_runner, terminal.pc)
+        hits.append(hit)
         saved = new_runner.breakpoints
         new_runner.breakpoints = frozenset()
         try:

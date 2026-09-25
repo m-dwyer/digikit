@@ -4698,3 +4698,226 @@ per this file's own `FRAME_MILESTONE` convention. `RealFrameRingAMilestoneTest`
 (lane F2's own pin, unrelated call path -- `render_frames_to_ring_a()` does
 not go through `block_handler`/the real DMA path at all) is unaffected. No
 `sharc_core`/`sharc_symbols.py` changes; no golden hash changed.
+
+## Lane H3: `FUN_1c642a`'s own arm guards read two bytes outside the voice
+record and outside the transfer, and both are always 0 because the writer
+is Lane E2's own null-companding-pointer loop -- confirmed live end to end
+by a diagnostic poke (2026-09-26) **[V][C]**
+
+Branch `work/sharc-emulator`, worktree fast-forwarded onto it
+(`tools/worktree-setup.sh`'s own equivalent steps, since the script did not
+exist yet at this worktree's own starting commit); `sections/.source-sha256`
+matches `shasum -a 256` of the 1.16 `.syx`. Task: decode `FUN_1c642a`'s own
+`0x1c6540`/`0x1c6549` arm guards (Lane E2's own open item), name the exact
+cells and values, say whether they are inside the DSPI2 transfer, and
+either craft a transfer that arms a voice or say why not.
+
+### The guard, decoded by execution, not by re-reading the raw opcode bits
+
+`out/sharcdb`'s own disassembly of `dt2-1.16` gives the instructions; this
+lane's own contribution is running them and reading the real register/ASTATX
+state at each one (`tools/sharc_armpath.py`'s own `_sample()`, a register
+snapshot at a pc-hit breakpoint -- the same technique Lane E2 used, extended
+with a `sample_fn` hook on `tools/sharc_replay.
+call_frame_collect_all_with_hits()`, this lane's own small, backward-
+compatible addition to that function):
+
+    0x1c6530  R2 = DM(I1 - 32)             # field1: a per-iteration byte
+    0x1c6535  R2 = leftz(R2, R0)           # SZ=MSB(old R2); SV=(old R2==0)
+    0x1c6538  JUMP IF SV -> 0x1c6543       # GUARD_SKIP -- see below: TWO
+                                           # delay slots
+    0x1c653b  R6 = DM(I4, M5)              # delay slot 1 (always runs)
+    0x1c653c  IF NOT SV R2 = DM(I6 - 2)    # delay slot 2 (always runs too)
+    0x1c653e  R2 = btgl(R6, R2)            # only reached if GUARD_SKIP's
+                                           # own redirect did not fire
+    0x1c6540  JUMP IF SZ -> 0x1c657b       # GUARD_A: arm iff btgl result==0
+    0x1c6543  M4 = 0xffa0
+    0x1c6545  R2 = DM(I1, M4)              # field2: a second per-iteration
+                                           # byte
+    0x1c6547  R2 = leftz(R2, R0)           # SV = (field2 == 0)
+    0x1c6549  JUMP IF NOT SV -> 0x1c657b   # GUARD_B: arm iff field2 != 0
+    0x1c654c..0x1c6579                     # neither guard taken: the
+                                           # per-slot-type jump table body
+                                           # (0x8055c840) Lane E2/the task
+                                           # already named
+    0x1c657b  I4 = I15; ...; R4 = I4       # shared arm preamble
+    0x1c6582  CALL FUN_1c4eaf              # arm: record+0x1b8/+0x1ba = 1
+
+**A real correction to how this reads, found only by single-stepping
+(`sharc_core.sequencer._transfer`'s own `Pending`):** `GUARD_SKIP`'s own
+jump is *delayed with two delay slots*, not the "compound bundled
+instruction" a first pass at this guessed. A one-off probe (stepped
+instruction by instruction from a breakpoint at 0x1c6538) shows
+`state.pending` go `slots=2 -> slots=1 -> resolved`, over pc_sw `0x1c6538 ->
+0x1c653b -> 0x1c653c -> (redirect)`. So `0x1c653c` ("IF NOT SV R2 = DM(I6 -
+2)") is `GUARD_SKIP`'s *own second delay slot*: it always executes, whether
+or not `GUARD_SKIP` redirects, and `GUARD_A`'s own code (`0x1c653e`'s
+`btgl`, the jump at `0x1c6540`) only becomes reachable at all once
+`GUARD_SKIP`'s redirect does *not* fire (`field1 == 0`, the only case any
+real capture ever produces). `sharc_core.flags._astatx_leftz`/
+`_astatx_bit_field` give the exact flag semantics quoted above (not the
+public PRM's mnemonic names alone): `leftz`'s `SV` is `(result == 32)`, i.e.
+`(source == 0)`; `btgl`'s `SZ` is `(result == 0)`, i.e. GUARD_A fires
+exactly when `R6 == 1 << pos` (`pos` = `DM(I6 - 2)`, a stack-local constant,
+not traced further this lane).
+
+### The two cells, named and located
+
+A wide read/write watchpoint (`sr.Watchpoint(0, 0x400000, ...)`, `stop=False`)
+attached across a real render-frame call gives the *resolved* byte
+addresses directly, sidestepping any doubt about the disassembly's own
+displacement units:
+
+- **field1**: `DM(I1 - 0x14)` (20 bytes, not the printed "-32" at face
+  value -- the printed displacement is not in plain signed bytes for this
+  addressing mode; execution is authoritative). Iteration 0 of a real
+  render call reads `0x24f118`; the address increments by exactly 1 byte
+  per loop iteration (`I1` itself does too, confirmed the same way), so the
+  32-voice loop's own field1 array is `[0x24f118, 0x24f137]`.
+  Always `0x0` on every voice, every frame of
+  `out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap` tried (2 real
+  render frames, 32 voices each = 64 iterations).
+- **field2**: `DM(I1 - 0x54)` (84 bytes), array `[0x24f0d8, 0x24f0f7]`.
+  Also always `0x0` on every voice, every frame tried.
+
+Both arrays sit **just past the voice-record array itself**
+(`profile.voice_records = 0x2412cc`, 32 * `0x1d8` = `0x24cdcc` end -- field1/
+field2 start about `0x2300` bytes after that), **not** inside it, and
+**not** inside the DSPI2 transfer's own landing ring (`0x264220`/`0x265220`,
+2,748 bytes) or `render_frame`'s 2,048-byte working copy at `0x2558dc`
+either: both arrays' addresses (`~0x24f0d8-0x24f137`) are well below
+`0x2558dc`. **Neither guard reads anything the DSPI2 transfer ever
+touches, at any offset.** `transfer_offset` for both is `null`, not "not
+found yet."
+
+### Who writes them, and the connection to Lane E2's own blocker
+
+`tools/sharc.py`'s `img.writers()` over each array finds one statically
+*resolved* single-address writer (`sw 0x1c71a3`, a same-record byte-shift
+copy in a small helper preceding `FUN_1c71ec`, confirmed by execution to
+run 16 times/frame, sweeping `[0x24f0ac, 0x24f0c8)` -- not fully traced to
+a name this lane's budget) and several *base-region* candidates. Two of
+those candidates, confirmed live by execution (a pc-hit trace during a real
+frame call), are the real runtime writers:
+
+    0x1c33ba  DM(I4, M4) u=0 = M13   # I4 = 0x24f0ec (field1's own array)
+    0x1c33ce  DM(I4, M4) u=0 = M14   # I4 = 0x24f0ac (field2's own array)
+
+confirmed by execution to hold `M13 = 0x0` and `M14 = 0x1` at these exact
+pcs (the same constants `FUN_1c4eaf`'s own arm write uses for "clear"/"set"
+-- `DM(record+0x1ba) = M14` at `0x1c4eb9`). **These two sw addresses sit
+inside `FUN_1c2b24`'s own tail dispatch block, `0x1c3289`-`0x1c33fe` --
+Lane E2's own "the compared value is exactly 0.0 ... so the GT branch is
+taken every time" loop**, gated by `I5 = DM(0x254d78)` reading a null
+pointer (Lane E2's own finding, unchanged by this lane). By execution, this
+write runs 6 times per real frame (a sparse subset of the 32 voice-record
+slots, not all 32 -- `R4` walks the voice-record array in `0x1d8` strides
+across these 6 hits), always writing the same constant (`M13 = 0`)
+regardless of which of the 6 slots it lands on, because the loop's own
+branch selection is itself driven by the same always-0.0 value Lane E2
+traced to the null pointer. **This is the same root cause Lane E2 already
+named** (`0x254d78`/the companding record at `0x266220`, still unwritten
+here too -- `companding_fields` reads `['0x0', '0x0', '0x0', '0x0']` on
+every frame this lane replayed): a non-null companding record would very
+plausibly let this loop write something *other* than a fixed 0/1 pair here,
+which is the one lever this lane's own trace connects to `FUN_1c642a`'s arm
+guards concretely, on top of Lane E2's own next-steps list.
+
+Two small helper functions this project has not named (`0x1c6048`-`0x1c6055`,
+`0x1c6056`-`0x1c6072`, both taking a record pointer in R4/an M4 modifier in
+R8 and writing `M13`/`M14` to raw-byte record offsets) are *candidate*
+writers by static base-register match, but **never run during any real
+frame this lane replayed** (zero pc-hits) -- ruled out as the active
+runtime writer, not merely unconfirmed.
+
+`FUN_1c2ac9`'s own two `CALL FUN_1c4eaf` sites (`0x1c2b0a`/`0x1c2b14`, fixed
+targets `0x252730`/`0x252908`) never run either (0 hits, both real render
+frames) -- consistent with Lane E2's own static reading that these arm
+something in the master-bus/dynamics scratch tables, not a voice, and this
+lane adds that the whole caller is simply unreached on real traffic.
+
+### The causal chain, confirmed live end to end by a diagnostic poke
+
+Since neither guard byte is reachable via the DSPI2 transfer, "craft a
+transfer that arms a voice" is not answerable honestly with a transfer (see
+next section) -- but the guard's own *mechanism*, once its input is
+nonzero, is directly testable with a controlled internal poke, the same
+convention Lane E2's own "diagnostic-only poke" used. Setting field2's own
+iteration-0 byte (`DM(0x24f0d8) = 1`) before a real render-frame call, with
+no other change:
+
+- `FUN_1c642a`'s own `GUARD_B` (`0x1c6549`) is taken on the 13th of 32
+  `GUARD_B` hits this frame (loop-iteration order is not voice-index
+  order -- this one data point maps iteration 0 to **voice 12**, record
+  `0x2428ec`; the general mapping is not resolved this lane's budget, `[O]`).
+- `0x1c657b` (arm preamble) -> `0x1c6582` (`CALL FUN_1c4eaf`) ->
+  `0x1c4eaf` (the arm function's own entry) all fire, immediately after
+  that one `GUARD_B` hit -- a real pc-hit, not an inferred one.
+- Voice 12's own record (`0x2428ec + 0x1b8`) reads back `1` (ACTIVE) right
+  after, where it read `0` before the poke.
+- Voice 12's own work buffer (`h.read_voice_work_buffer_decimated`) is
+  **nonzero** by the end of the same frame call (`[0.024, 0.0242, ...]` --
+  not silence): the firmware both arms *and renders* the voice this same
+  frame, from a single one-byte internal poke.
+
+This closes the loop this lane's task opened with: the guard's own
+semantics, decoded from the disassembly, exactly predict what execution
+does once its input changes. `tests/test_sharc_armpath.py`'s
+`test_forcing_the_second_guard_byte_arms_and_renders_a_voice` pins this.
+
+### No trigger encoding found -- consistent with Lane E2's own conclusion, for the same reason
+
+Per this lane's own task instructions ("If a trigger encoding is found ...
+craft one frame ... If [not] ... report"): **no crafted DSPI2 transfer was
+built**, because neither guard byte is reachable from the transfer at all
+(previous section) -- the DMA-delivered bytes never reach `0x24f0d8`/
+`0x24f118` by any offset. Building a "crafted transfer" here would mean
+writing to a DM address the transfer cannot reach and calling that a
+transfer, which is not what the task asked for. The one concrete lever this
+lane found that *could* make a real transfer reach these cells is the same
+one Lane E2 already flagged: find or allocate whatever `0x254d78`/`0x266220`
+should point at (`FUN_1c2b24`'s own `command_dispatch_fn`-supplied "second
+output"), so `FUN_1c2b24`'s own tail loop stops always taking its 0.0
+branch and can write something DMA-transfer-derived into field1/field2
+instead of a fixed 0/1 pair.
+
+### Owned-file changes
+
+- `tools/sharc_replay.py`: `call_frame_collect_all_with_hits()` gained an
+  optional `sample_fn` parameter (called with `(runner, pc)` right when a
+  hit is recorded, before that pc's own instruction executes; merged under
+  the hit's own `"sample"` key). `None` by default -- every existing
+  caller's hit-dict shape, and `tests/test_sharc_replay.py`'s own
+  assertions on it, are unchanged. No other change to this file.
+- `tools/sharc_armpath.py` (new): `trace_arm_path()` (the per-frame,
+  per-voice-iteration trace this section reports), `analyze_iterations()`
+  (groups a raw `hits` list by `LOOP_TOP`, reading `GUARD_A`/`GUARD_B`/
+  `GUARD_SKIP`'s own taken-vs-not-taken off the pc that follows each --
+  see its own docstring for the delay-slot correction above), and the named
+  pc constants this section cites. On the lint `CLEAN` list; not on the
+  mypy `TYPED` list (same as `tools/sharc_replay.py`).
+- `tests/test_sharc_armpath.py` (new): `AnalyzeIterationsTest` (4 tests,
+  pure grouping logic, no firmware needed) and `TraceArmPathTest` (2 tests,
+  `@pytest.mark.slow`, gated on the real image/capture: the real-capture
+  "never arms" pin, and the diagnostic-poke "arms and renders" proof above).
+- `docs/findings/06-sharc-engine-and-startup.md`: this section.
+
+### Tests / lint / types
+
+`uv run python -m pytest tests/test_sharc_armpath.py tests/test_sharc_replay.py
+tests/test_lint.py tests/test_types.py tests/test_sharc_golden.py -q --slow`:
+24 passed (6 new + 18 existing `sharc_replay` tests, unaffected). No
+`sharc_core` change; no golden hash touched.
+
+### Open
+
+- `GUARD_A`'s own bitmask (`R6 = DM(I4, M5)`) and bit-position local
+  (`DM(I6 - 2)`) are decoded (arms iff `R6 == 1 << pos`) but not traced to
+  their own writers or exercised live (field1 is always 0 in every real
+  capture, so `GUARD_A`'s own code never runs to test).
+- The loop-iteration-to-voice-index mapping for field1/field2 (iteration 0
+  -> voice 12, one data point) is not resolved to a general rule.
+- `sw 0x1c71a3`'s own containing function (a 16-byte-per-frame sweep over
+  part of this same region) is not named.
+- The root fix both this lane and Lane E2 now point at is the same:
+  `0x254d78`/the companding record at `0x266220`.
