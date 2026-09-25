@@ -365,7 +365,7 @@ def _apply_compute(
             value=value,
         )
         state.uregs[rn] = value
-    if operation == "float-recips-seed-approx":
+    if operation in ("float-recips-seed-approx", "float-rsqrts-seed-approx"):
         # --approx-recips produced a numeric value with no ROM table behind
         # it (see _approx_recips); mark this path and this instant so any
         # report can find and discount it, matching how "predicate-assumption"
@@ -483,7 +483,7 @@ def _apply_compute_pey(
             value=value,
         )
         state.uregs[80 + rn] = value
-    if operation == "float-recips-seed-approx":
+    if operation in ("float-recips-seed-approx", "float-rsqrts-seed-approx"):
         state.approx_recips_used = True
         _event(state, insn, "approximate-recips-pey", value=value)
 

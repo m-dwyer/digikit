@@ -179,22 +179,19 @@ class InitResult:
     error: str | None
 
 
-def run_init(memory, image: str, *, max_steps: int = 200_000) -> InitResult:
+def run_init(memory, image: str, *, max_steps: int = 2_000_000) -> InitResult:
     """Attempt FUN_1c15e3 (docs/findings/06: no arguments) to its return.
 
-    Best-effort: on the 1.16 image it runs 1,320 instructions and stops at
-    sw 0x1c128a, a Type9a jump with a control modifier the tracer does not
-    model yet. A caller does not have to
-    treat this failing as fatal: every voice-record field
-    ``setup_voice()`` writes is set directly from docs/findings/06's own
-    contract, not read back from what FUN_1c15e3 would have written.
+    On the 1.16 image it returns after about 1.24 million instructions.
+    ``ran`` is true only when the function returned; reaching MAX_STEPS
+    first is a failure, not a partial success.
     """
     runner = _make_runner(memory, image, profile(image).init, {"I6": 0x300000})
     try:
         result = runner.run(max_steps=max_steps)
     except Exception as exc:  # pragma: no cover - defensive, see docstring
         return InitResult(False, None, str(exc))
-    ok = result.halt.reason in ("return without followed call", "max-steps")
+    ok = result.halt.reason == "return without followed call"
     return InitResult(
         ok,
         result,
