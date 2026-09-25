@@ -246,6 +246,41 @@ class BitextOpcodeTest(unittest.TestCase):
         self.assertEqual(T._astatx_known_bit(astatx, T.SV_BIT), True)
         self.assertEqual(T._astatx_known_bit(astatx, T.SF_BIT), False)  # 24 < 32
 
+    def test_bitext_over_32_forces_unknown_even_when_fifo_is_known(self):
+        # Lane H2 (2026-09-26): docs/findings/06's real-firmware BITEXT
+        # sightings (BITLEN12 in {95, 384, 192, 256, 535}, at 0xb88fa4,
+        # 0xb89a60, 0xb8c8ec, 0xb8c92a and one more) all hit this same
+        # over_32 branch, whose "prohibited" wording (PGR p.11-91 and the
+        # byte-identical SC58x/2158x PRM p.24-18) never documents a numeric
+        # result. This lane checked, live, whether a smaller-than-BITLEN12
+        # interpretation (mod 64, low 6 bits, clamp to 32, or a full 64-bit
+        # extract-then-truncate) could recover one anyway; it cannot,
+        # because this branch (the caller's own OVER_32 check) discards
+        # EXTRACTED unconditionally BEFORE any length-dependent value would
+        # ever reach RN -- proven here with a FULLY KNOWN FIFO (unlike this
+        # file's own dt2-1.16 trace, where BFF_HI/BFF_LO are never known at
+        # all: no BITDEP instruction executes anywhere in that image, so
+        # _bff_words() always returns Unknown regardless of length there
+        # too). RN stays Unknown even though the FIFO itself is fully
+        # concrete and BITLEN12=40's own FEXT-based extraction would
+        # otherwise be well defined (bits 63:56 of 0xFFFFFFFF00000000 are
+        # all 1s -- see the sibling underflow tests above for the same
+        # FIFO's arithmetic in the *legal* bitlen range). A future fix
+        # needs a citable PRM/PGR value for this case, not a length
+        # reinterpretation: this test pins today's behaviour so such a
+        # change is a deliberate, visible edit.
+        special = {
+            "BFFWRP": T.Const(64),
+            "BFF_HI": T.Const(0xFFFFFFFF),
+            "BFF_LO": T.Const(0),
+        }
+        rn, value, op, update = T._shift_immediate(
+            bitext_fields(0x14, 40, rn=6), {}, special
+        )
+        self.assertEqual(value[0], T.Unknown("bitext: undefined (bitlen 40 > 32)"))
+        astatx = update(T.Unknown("start"))
+        self.assertEqual(T._astatx_known_bit(astatx, T.SV_BIT), True)
+
     def test_bitext_underflow_sets_sv_when_pointer_known(self):
         # PGR p.11-91: "Attempts to get more bits than those in the bit
         # FIFO results in undefined pointer and bit FIFO. SV is set in

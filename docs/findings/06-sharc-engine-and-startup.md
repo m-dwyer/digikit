@@ -4401,6 +4401,97 @@ render (freq=1000 Hz, `0x1C4965` present, `0x1C2FEC` now removed): still
 the fix above did not touch this bug (it lives entirely behind the
 remaining patch).
 
+### Lane H2 (2026-09-26): `BITLEN12>32` is correctly decoded; the frame-path pitch bug is not caused by it **[V][C]**
+
+Task: use the frame-path pitch as the oracle to determine what real
+BITEXT(NU) hardware does with `BITLEN12>32`, and remove `0x1C4965` from
+`FRAME_PATCH_TABLE` if resolved.
+
+**Encoding check: `BITLEN12` is a genuine, correctly-decoded 12-bit
+immediate, not a mis-extracted field.** Both manuals this project cites
+for the shifter -- PGR `adsp-2136x_2137x_214xx` rev2.4 p.11-91
+(pgr.txt:19044-19046) and the newer SHARC+ Core PRM `sc58x-2158x` p.24-18,
+byte-for-byte identical wording -- say: "the DATAEX field adds 4 MSBs to
+the DATA field, creating a 12-bit immediate value." `tools/sharc_core/
+compute_shift.py`'s `bitlen12 = (dataex[3:0] << 8) | data8` is exactly
+that. Cross-checked against the already-implemented FEXT opcode (0x10),
+which splits the SAME combined 12-bit field into `position = X & 0x3F` /
+`length = (X >> 6) & 0x3F` -- bit-for-bit the formula this file's own
+`_shift_immediate` already uses -- confirming the field boundaries (which
+bits come from `dataex` vs. `data8`) are right, not swapped or
+misaligned. So this section's five sightings (`BITLEN12` = 95, 384, 192,
+256, 535) are genuinely-encoded values over 32, not a decode bug; neither
+manual documents a numeric BITEXT result for that range, only that SV is
+set ("prohibited").
+
+**The actual blocker is not the length interpretation -- it is that the
+bit FIFO is never seeded anywhere in this image.** `state.special["BFF_HI"
+/"BFF_LO"]` is written ONLY by BITEXT/BITDEP's own handlers in
+`compute_shift.py` (grepped across every other `tools/sharc_core` file:
+no other writer exists), and no BITDEP instruction -- the only other
+documented writer -- ever decodes anywhere in dt2-1.16 (confirmed again by
+this lane, consistent with lanes F2/G2's own claim). So `_bff_words()`
+returns Unknown at every one of the five BITEXT sightings, and
+`_bff_extract()`'s `isinstance(hi, Const)` guard discards ANY length
+argument once the FIFO is Unknown -- the length-interpretation question
+this task posed cannot even be tested under the FIFO's real (never-known)
+state.
+
+**Live check of the task's four candidates (length mod 64, low 6 bits,
+clamp to 32, truncate a full 64-bit extract).** Without also assuming a
+known FIFO, monkeypatching in each of the four reproduces today's exact
+halt and instruction count, indistinguishable from each other and from
+"stays Unknown" -- expected, since `_bff_extract`'s Unknown-FIFO
+short-circuit runs before the length argument is ever used. The ONLY
+assumption under which BITEXT produces a concrete value here at all is
+that the FIFO's reset/uninitialized state is a known `Const(0)` (the sole
+state consistent with "never deposited into" -- not documented by either
+manual either) -- and under THAT assumption, all four candidates are
+identical to each other too, since a 64-bit all-zero register reads 0 at
+any length. So this task's own candidate list cannot be discriminated
+between by any oracle test.
+
+Implemented that one combined candidate as a throwaway, uncommitted
+monkeypatch (BITEXT(NU) with `BITLEN12>32` returns `Const(0)`), removed
+`0x1C4965`, and ran the harness's real-frame render
+(`tools/sharc_harness.py`'s `render_frames_to_ring_a`, called via its
+`--frame --ring-a` CLI option) at `freq=1000` Hz, `pitch_step` in
+`{1.0, 0.5}`:
+
+- The render completes with no new stop both times (~95.8k-96.8k
+  instructions/frame, the same milestone class as the patched baseline) --
+  so a concrete BITEXT result does let `FUN_1c4afe`'s own `fcomp` chain
+  run unforced, instead of needing `0x1C4965`'s hand-forced `1.0f`/`1.0f`.
+- But the measured tone is UNCHANGED from the patched baseline: a coarse
+  frequency scan of ring A (5 Hz steps, 20-8,000 Hz) finds the dominant
+  tone at ~630 Hz (`power_ratio` 0.9925) at BOTH pitch steps -- essentially
+  the same **631.7191123962402 Hz** lanes E1/F2/G2 already measured with
+  the patch in place, not `freq * pitch_step` (1000/500 Hz; direct
+  correlation at those frequencies measures negligible power, ratio
+  0.0064/0.0388).
+
+**Conclusion: resolving `BITEXT` here is necessary for the frame to
+complete on its own, but is NOT the frame-path pitch bug's cause.**
+`0x1C4965` stays in `FRAME_PATCH_TABLE` (no candidate resolves it, and the
+candidates cannot even be told apart); no `tools/sharc_core` change was
+made (no citable PRM/PGR value exists for `BITLEN12>32`, and the one
+testable candidate would not have fixed the actual bug regardless). One
+regression test added, `tests/test_sharc_compute_shift.py`'s
+`test_bitext_over_32_forces_unknown_even_when_fifo_is_known`, pinning that
+`over_32` forces `Unknown` unconditionally even with a fully concrete
+FIFO -- the exact behaviour this lane had to bypass live to run the one
+testable candidate above.
+
+**Retargeting the frame-path pitch bug's own next step.** The real
+suspect is `FUN_1c4afe`'s own undocumented voice-record input pair
+`DM(I4+0x62)`/`DM(I4+0x63)` (an `[O]` gap noted under lane F2's own Task
+1): this harness's `setup_voice()` has no documented writer for it, so it
+never reflects the caller's own `pitch_step` argument regardless of what
+`BITEXT` computes. A future lane should trace what a real firmware trigger
+path writes there (or whether `FUN_1c4afe` derives it from `FIELD_STEP`
+some other way this project has not yet found) before spending further
+effort on `BITEXT`.
+
 ### Task 2: the companding record's real address, and confirmation it is unwritten everywhere reachable **[V][O]**
 
 Traced `command_dispatch_fn`'s (`0x1c778a`) own raw bytes end to end

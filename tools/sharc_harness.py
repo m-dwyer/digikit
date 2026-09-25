@@ -1492,6 +1492,64 @@ FRAME_PATCH_TABLE: sv.PatchTable = {
     # Forces both fcomp operands to a finite 1.0f -- still a discard of the
     # real, buggy Positions computation (see the frame-path pitch bug note
     # above), not a fix.
+    #
+    # **[C] Lane H2 (2026-09-26): BITLEN12>32 is confirmed correctly decoded
+    # (not a mis-extracted field) and cannot be resolved by reinterpreting
+    # its length -- and doing so would not fix the frame-path pitch bug
+    # anyway.** Task: use the frame-path pitch as the oracle for
+    # `BITLEN12>32`'s undefined result. Checked against BOTH manuals this
+    # project cites for the shifter (PGR `adsp-2136x_2137x_214xx` rev2.4
+    # p.11-91 and the SHARC+ Core PRM `sc58x-2158x` p.24-18 -- byte-for-byte
+    # identical wording): "the DATAEX field adds 4 MSBs to the DATA field,
+    # creating a 12-bit immediate value" (PGR all.txt:19044-19046) is
+    # exactly `tools/sharc_core/compute_shift.py`'s own
+    # `(dataex[3:0] << 8) | data8` -- the SAME combined 12-bit field the
+    # already-implemented, presumably-correct FEXT opcode (0x10) splits
+    # into `position = X & 0x3F` / `length = (X >> 6) & 0x3F` bit-for-bit.
+    # So `BITLEN12` genuinely is a 12-bit immediate as encoded, and this
+    # image's five sightings (95, 384, 192, 256, 535) are not a decode bug;
+    # neither manual defines a numeric BITEXT result for a value over 32,
+    # only that SV is set ("prohibited").
+    #
+    # More importantly, length is not even the blocking variable here: `grep
+    # -rn 'special\['` across `tools/sharc_core` shows `"BFF_HI"`/`"BFF_LO"`
+    # are written ONLY by BITEXT/BITDEP's own handlers in
+    # `compute_shift.py`, and no BITDEP instruction (the only other writer
+    # the PRM/PGR document) ever decodes anywhere in dt2-1.16 -- so
+    # `_bff_words()` returns Unknown at every BITEXT site in this image, and
+    # `_bff_extract()`'s `isinstance(hi, Const)` guard discards ANY length
+    # argument once the FIFO itself is Unknown. Checked live: monkeypatching
+    # in each of the four length candidates the task named (mod 64, low 6
+    # bits, clamp to 32, truncate a full 64-bit extract) without also
+    # assuming a known FIFO reproduces today's exact halt/instruction count
+    # for all four -- they cannot be distinguished from "stays Unknown" or
+    # from each other this way. The ONLY assumption under which BITEXT
+    # produces a concrete value at all here (the FIFO reset to Const(0), the
+    # sole state consistent with "never deposited into") makes the four
+    # candidates identical to EACH OTHER too (a 64-bit all-zero register
+    # reads 0 at any length) -- so this task's own candidate list cannot be
+    # discriminated between by any oracle test, only by an unrelated claim
+    # about the FIFO's own reset value, which no manual documents either.
+    # Implemented that one combined candidate as a throwaway (uncommitted)
+    # opt-in anyway, removed this entry, and ran the harness's real-frame
+    # render (`render_frames_to_ring_a`, freq=1000 Hz, `pitch_step` in
+    # {1.0, 0.5}): the render completes with no new stop both times (so a
+    # concrete BITEXT result does let `FUN_1c4afe`'s own fcomp chain run
+    # unforced) -- but a coarse frequency scan of ring A finds the SAME
+    # dominant tone, ~630 Hz (power_ratio 0.99), at BOTH pitch steps,
+    # essentially unchanged from lanes E1/F2/G2's own 631.7191123962402 Hz
+    # figure measured with this entry in place; direct correlation at the
+    # REQUESTED 1000/500 Hz finds negligible power (ratio 0.006/0.039). So
+    # resolving `BITEXT` here (however it is resolved) is necessary for the
+    # frame to complete on its own but is NOT the frame-path pitch bug's
+    # cause: retarget that bug's own next step at `FUN_1c4afe`'s
+    # undocumented voice-record input pair `DM(I4+0x62)`/`DM(I4+0x63)` (an
+    # `[O]` gap noted under lane F2's own Task 1) -- this harness's
+    # `setup_voice()` has no documented writer for it, so it never reflects
+    # the caller's own `pitch_step` argument regardless of what `BITEXT`
+    # does. `0x1C4965` stays; no `tools/sharc_core` change was made (no
+    # citable manual value exists, and the one testable candidate would not
+    # have fixed the actual bug).
     0x1C4965: [("reg", "R6", 0x3F800000), ("reg", "R4", 0x3F800000)],
 }
 
