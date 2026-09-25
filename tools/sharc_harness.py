@@ -2361,6 +2361,7 @@ def call_frame_with_track_injection(
     write_master_mix: bool = True,
     inject_track: bool = True,
     frame_bytes: bytes | None = None,
+    watchpoints: Sequence[sr.Watchpoint] = (),
 ) -> tuple[sr.Runner, sr.RunResult, list[float]]:
     """Like `call_frame()`, but (when INJECT_TRACK, the default) calls
     `inject_track_buffer()` the instant `MASTER_STAGE_CALL_PC` is about to
@@ -2406,11 +2407,22 @@ def call_frame_with_track_injection(
     track-buffer-only behaviour, or both False to run with no injection
     hack at all (real frame data, real gate, real dispatch only).
 
+    `WATCHPOINTS` (lane K1, 2026-09-26), if given, is attached to the
+    `fresh_call()` Runner this makes internally (`Runner.attach_watchpoints()`
+    -- `fresh_call()` itself never carries watchpoints over, see its own
+    docstring), the same way `tools/sharc_replay.py`'s
+    `call_frame_collect_all_with_hits()` already does for its own
+    `target_watch` -- so a caller driving several frames through this
+    function on one continuous Runner can log writes (e.g. a voice
+    record's own fields) across the whole run without a second pass.
+
     Returns `(new_runner, RunResult, injected)` where `injected` is the 32
     decimated floats (written or not, depending on the flags above), or
     `[]` if `MASTER_STAGE_CALL_PC` was never reached (an earlier stop)."""
     p = profile(image)
     new_runner = runner.fresh_call(p.block_handler, diagnose_unknown=True)
+    if watchpoints:
+        new_runner.attach_watchpoints(list(watchpoints))
     if frame_bytes is not None:
         write_capture_frame(new_runner.state, frame_bytes)
     start_pc_sw = new_runner.state.pc_sw

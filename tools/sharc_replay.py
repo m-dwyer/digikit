@@ -649,6 +649,296 @@ def replay(
     }
 
 
+# --- Lane K1 (2026-09-26): a voice record's own word+0 across a real,
+# continuous replay, and a demo render of whichever voice the firmware
+# itself arms ------------------------------------------------------------
+#
+# Lane J1 replayed `out/captures/dt2-1.16-running-trig.dt2cap` from a
+# `--start-frame 300` shortcut (skipping frames 0-299 without executing
+# them) and found voice 4's own FIELD_SAMPLE_PTR (word+0,
+# `sharc_harness.FIELD_SAMPLE_PTR`) already null (`0x0`) from the very
+# first frame that shortcut fed -- on BOTH the TRIG and the idle capture --
+# even though voice 4's record reads a real SDRAM address (`0x8045a6c8`)
+# right after `run_init()`. J1's own report flagged this as possibly a
+# cold-start artifact of the shortcut itself, not a genuine frame-300
+# event, and left it open. This section answers that with a real,
+# continuous replay from frame 0 (no `start_frame` shortcut) -- see
+# `replay_armed_voice()`.
+
+# One log-only (`stop=False`), write-only 4-byte Watchpoint per voice
+# record's own word+0, for every `sharc_harness.VOICE_RECORD_COUNT` voice
+# record (`sharc_harness.profile(image).voice_records`,
+# `sharc_harness.VOICE_RECORD_STRIDE` apart). Labelled so a WatchEvent's own
+# `label` (carried through unchanged by `sharc_run._WatchTracker`, never
+# re-derived from its address) identifies which voice wrote, without
+# re-deriving the voice index from `(address - base) // stride` -- exact
+# even if a canonicalized range ever shifted the reported address.
+VOICE_WORD0_LABEL_PREFIX = "voice-word0-"
+VOICE_ACTIVE_LABEL_PREFIX = "voice-active-"
+
+
+def _voice_word0_watchpoints(image: str) -> list[sr.Watchpoint]:
+    base = h.profile(image).voice_records
+    return [
+        sr.Watchpoint(
+            base + i * h.VOICE_RECORD_STRIDE + h.FIELD_SAMPLE_PTR,
+            base + i * h.VOICE_RECORD_STRIDE + h.FIELD_SAMPLE_PTR + 4,
+            on_read=False,
+            on_write=True,
+            stop=False,
+            label="%s%d" % (VOICE_WORD0_LABEL_PREFIX, i),
+        )
+        for i in range(h.VOICE_RECORD_COUNT)
+    ]
+
+
+def _voice_active_watchpoint(image: str, voice: int) -> sr.Watchpoint:
+    """Log-only, 1-byte Watchpoint on VOICE's own FIELD_ACTIVE
+    (`+0x1b8`) -- separate from the word+0 watches above so this lane can
+    name the exact pc of a deactivating write (docs/findings/06's
+    `0x1c5008` past-limit / `0x1c50fe` wrap candidates), not just infer a
+    frame-level transition from re-reading the byte after each call."""
+    record = h.voice_record_address(image, voice)
+    return sr.Watchpoint(
+        record + h.FIELD_ACTIVE,
+        record + h.FIELD_ACTIVE + 1,
+        on_read=False,
+        on_write=True,
+        stop=False,
+        label="%s%d" % (VOICE_ACTIVE_LABEL_PREFIX, voice),
+    )
+
+
+def _voice_index_from_label(label: str, prefix: str) -> int | None:
+    if not label.startswith(prefix):
+        return None
+    return int(label[len(prefix) :])
+
+
+def _hex_or_none(value: int | None) -> str | None:
+    return None if value is None else "%#x" % value
+
+
+def replay_armed_voice(
+    image: str,
+    capture_path: str,
+    *,
+    voice: int = 4,
+    extra_frames: int = 20,
+    n_frames: int | None = None,
+    start_frame: int = 0,
+) -> dict:
+    """Replay CAPTURE_PATH continuously from frame 0 by default (no
+    `start_frame` shortcut -- lane J1's own open question, see this
+    section's module note; the report this lane wrote used `start_frame=0`
+    throughout) on ONE Runner, through `sharc_harness.call_frame_with_track_
+    injection()` every frame (real DMA delivery via `sharc_harness.
+    write_dma_transfer()`/`drive_dma_completion()`, the same as `replay()`
+    above -- NOT the older `write_capture_frame()`/`CAPTURE_FRAME_BASE`
+    path `render_frames_to_ring_a()` uses, which lane G1 already found does
+    not reach the real arming code), with two things attached to every
+    frame's own `fresh_call()`:
+
+    `START_FRAME` (default 0), if given, skips that many of CAPTURE's own
+    leading frames without executing them at all -- lane J1's own
+    `tools/sharc_armpath.py` shortcut, `per_frame`'s own real capture index
+    preserved (every reported frame number below is `start_frame +
+    local_idx`, never a re-based 0). Only safe once whatever it skips is
+    known not to matter: this lane's own from-frame-0 run (see the module
+    note) found VOICE's own word+0 already null by frame ~2, independent
+    of the capture's own TRIG byte, so `start_frame=300` (well past that)
+    reproduces this same run's own `arm_frame`/`active_frames`/
+    `deactivate_pc`/`sample_pointer_at_arm` for THIS capture exactly --
+    used by this lane's own slow test to pin the demo WAV without a ~3
+    minute full replay on every run. Do not assume this for a different
+    capture or a different voice without checking word+0's own null-timing
+    there first.
+
+    1. A log-only write Watchpoint on word+0 (`FIELD_SAMPLE_PTR`) of all
+       32 voice records (`_voice_word0_watchpoints()`) plus one on VOICE's
+       own FIELD_ACTIVE (`_voice_active_watchpoint()`) -- every hit is
+       collected into `word0_writes`/`active_writes` (frame, pc, old/new),
+       oldest first, across the WHOLE replay, not just a bracketed window.
+
+    2. VOICE's own decimated render output injected straight into the
+       master mix (`inject_track=False, write_master_mix=True` --
+       `sharc_harness.inject_master_mix()`, the SAME "existing harness
+       path" `sharc_harness.render_frames_to_ring_a()`'s `--ring-a` CLI
+       already uses, just pointed at VOICE's record instead of a
+       hand-driven one) on every frame -- harmless before VOICE is ever
+       armed (its own work buffer reads as silence), and the one thing
+       that lets a firmware-armed voice's real output reach ring A without
+       a second, separate render pass, since master mix
+       (`sharc_dac.MASTER_MIX_BASE`) is a disjoint memory range from every
+       voice record and every byte this lane's own watchpoints track --
+       this injection cannot perturb the arming logic itself. **This
+       injection is the one hand step in this replay** (see `main()`'s own
+       `--armed-voice-wav` help text).
+
+    VOICE's own FIELD_ACTIVE is re-read (not just watched) after every
+    frame's call, into `active_by_frame` (`bool`, oldest first): the
+    firmware's own `+0x1b8` state right after that frame finished, the
+    same convention lane J1 used ("ACTIVE is 1 at frame 304"). `arm_frame`
+    is the first frame index where this is True (`None` if VOICE is never
+    armed in this replay); `active_frames` counts how many CONSECUTIVE
+    frames from `arm_frame` stay True; `deactivate_pc` is the first
+    `active_writes` entry at or after `arm_frame` whose new value is 0 (the
+    exact pc of the `+0x1b8` clear -- docs/findings/06's `0x1c5008`
+    past-limit or `0x1c50fe` wrap), or `None` if the run ends first.
+    `sample_pointer_at_arm` is VOICE's own word+0 value from JUST BEFORE
+    `arm_frame`'s own frame was delivered (`sample_ptr_before_frame[arm_frame]`
+    -- matching lane J1's own "just before this lane's first fed frame"
+    phrasing) -- not the value after that frame's own render, which may
+    already have changed it.
+
+    Ring A (`sharc_harness.read_ring_a()`, deinterleaved L/R -- NOT this
+    module's own `_read_ring_a()`/`_mono()`, whose plain `0.5*(L+R)`
+    downmix cancels to silence for a coherent signal identically written
+    to both channels, per `sharc_harness.py`'s own "ring A's own L channel
+    is deliberately negated" module note) is read every frame and kept
+    per-frame; `render_left`/`render_right` are the concatenation of frames
+    `[arm_frame, arm_frame + active_frames + EXTRA_FRAMES)` -- the demo
+    window the task brief asks for -- or `[]` if VOICE was never armed.
+
+    Returns a dict with `capture`, `frames_replayed`, `voice`,
+    `word0_writes`, `active_writes`, `active_by_frame`, `arm_frame`,
+    `active_frames`, `deactivate_pc`, `sample_pointer_at_arm`,
+    `render_left`, `render_right`, `sample_rate_hz`
+    (`sharc_dac`'s own ring-A rate, `int(sharc_harness.SOURCE_SAMPLE_RATE //
+    2)` = 48000), and `error` (only present, and everything else absent,
+    if `run_init()` itself failed)."""
+    cap = sharc_capture.load(capture_path)
+    end = None if n_frames is None else start_frame + n_frames
+    frames = cap.dspi2_frames[start_frame:end]
+
+    memory = h.load_image_memory(image)
+    init = h.run_init(memory, image)
+    if not init.ran:
+        return {
+            "capture": capture_path,
+            "frames_in_capture": len(cap.dspi2_frames),
+            "frames_replayed": 0,
+            "error": "run_init failed: %s" % init.error,
+        }
+
+    runner = h.new_runner(memory, image, init=init)
+    state = runner.state
+    h.setup_frame_dma(state, image, ring_flag=0)
+
+    record = h.voice_record_address(image, voice)
+    watchpoints = [
+        *_voice_word0_watchpoints(image),
+        _voice_active_watchpoint(image, voice),
+    ]
+    active_label = "%s%d" % (VOICE_ACTIVE_LABEL_PREFIX, voice)
+
+    word0_writes: list[dict] = []
+    active_writes: list[dict] = []
+    active_by_frame: list[bool] = []
+    sample_ptr_before_frame: list[int | None] = []
+    ring_left_by_frame: list[list[float]] = []
+    ring_right_by_frame: list[list[float]] = []
+
+    for local_idx, frame in enumerate(frames):
+        idx = start_frame + local_idx
+        ptr_before = st._dm_read(state, record + h.FIELD_SAMPLE_PTR, 4)
+        sample_ptr_before_frame.append(
+            ptr_before.value & 0xFFFFFFFF if ptr_before is not None else None
+        )
+
+        h.write_dma_transfer(state, image, frame.tx)
+        runner = h.drive_dma_completion(runner, image)
+        state = runner.state
+
+        runner, _result, _injected = h.call_frame_with_track_injection(
+            runner,
+            image,
+            record,
+            track=0,
+            patch_table=h.FRAME_PATCH_TABLE,
+            write_master_mix=True,
+            inject_track=False,
+            watchpoints=watchpoints,
+        )
+        state = runner.state
+
+        for event in runner.watch_log:
+            if event.access != "write":
+                continue
+            vi = _voice_index_from_label(event.label, VOICE_WORD0_LABEL_PREFIX)
+            if vi is not None:
+                word0_writes.append(
+                    {
+                        "frame": idx,
+                        "pc": "%#x" % event.pc_sw,
+                        "voice": vi,
+                        "old": _hex_or_none(event.old_value),
+                        "new": _hex_or_none(event.new_value),
+                    }
+                )
+            elif event.label == active_label:
+                active_writes.append(
+                    {
+                        "frame": idx,
+                        "pc": "%#x" % event.pc_sw,
+                        "old": event.old_value,
+                        "new": event.new_value,
+                    }
+                )
+
+        active_raw = st._dm_read(state, record + h.FIELD_ACTIVE, 1)
+        active_by_frame.append(bool(active_raw is not None and active_raw.value))
+
+        ring = h.read_ring_a(memory, image, runner)
+        ring_left_by_frame.append([v or 0.0 for v in ring["left"]])
+        ring_right_by_frame.append([v or 0.0 for v in ring["right"]])
+
+    local_arm_idx = next((i for i, a in enumerate(active_by_frame) if a), None)
+    arm_frame = None if local_arm_idx is None else start_frame + local_arm_idx
+    active_frames = 0
+    deactivate_pc = None
+    if local_arm_idx is not None:
+        i = local_arm_idx
+        while i < len(active_by_frame) and active_by_frame[i]:
+            active_frames += 1
+            i += 1
+        for w in active_writes:
+            if w["frame"] >= arm_frame and w["new"] == 0:
+                deactivate_pc = w["pc"]
+                break
+
+    render_left: list[float] = []
+    render_right: list[float] = []
+    if local_arm_idx is not None:
+        hi = min(len(frames), local_arm_idx + active_frames + extra_frames)
+        for i in range(local_arm_idx, hi):
+            render_left.extend(ring_left_by_frame[i])
+            render_right.extend(ring_right_by_frame[i])
+
+    return {
+        "capture": capture_path,
+        "frames_in_capture": len(cap.dspi2_frames),
+        "frames_replayed": len(frames),
+        "start_frame": start_frame,
+        "voice": voice,
+        "record": "%#x" % record,
+        "word0_writes": word0_writes,
+        "active_writes": active_writes,
+        "active_by_frame": active_by_frame,
+        "arm_frame": arm_frame,
+        "active_frames": active_frames,
+        "deactivate_pc": deactivate_pc,
+        "sample_pointer_at_arm": (
+            _hex_or_none(sample_ptr_before_frame[local_arm_idx])
+            if local_arm_idx is not None
+            else None
+        ),
+        "render_left": render_left,
+        "render_right": render_right,
+        "sample_rate_hz": int(h.SOURCE_SAMPLE_RATE // 2),
+    }
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("image")
@@ -688,6 +978,55 @@ def parse_args(argv=None):
         "be given more than once; any result built with this is provisional "
         "([D], not [V]) -- see replay()'s own docstring",
     )
+    p.add_argument(
+        "--armed-voice-wav",
+        action="store_true",
+        default=False,
+        help="lane K1: instead of the hand-set-up-voice-0 replay() above, "
+        "run replay_armed_voice() -- a continuous, from-frame-0 replay "
+        "(no start_frame shortcut) that watches all 32 voice records' own "
+        "word+0 and --voice's own FIELD_ACTIVE (log-only, never stops the "
+        "run), and writes ring A's own output for whichever voice the "
+        "FIRMWARE ITSELF arms (--voice, default 4) as a stereo WAV to "
+        "--out, from the frame it arms through that many active frames "
+        "plus --extra-frames. HAND STEP: this still calls sharc_harness."
+        "inject_master_mix() every frame (via call_frame_with_track_"
+        "injection(inject_track=False, write_master_mix=True)) to get "
+        "--voice's own decimated render output into the master mix -- no "
+        "SHARC-side code path from the real per-track mix/gate tables to "
+        "the master mix is established yet (see sharc_harness.py's "
+        "MASTER_MIX_INJECT_PC module note), so without this hand step "
+        "ring A stays silent even for a voice the firmware itself armed "
+        "and rendered. --out is a stereo WAV (ring A's own L channel is "
+        "the firmware's own negation of R for an identical signal on both "
+        "channels -- see that same module note -- so an L+R mono downmix "
+        "of this output cancels to silence; play/measure L and R, not "
+        "their average).",
+    )
+    p.add_argument(
+        "--voice",
+        type=int,
+        default=4,
+        help="--armed-voice-wav only: which voice record to watch/render "
+        "(default 4, docs/findings/06 Lane J1's own finding for "
+        "out/captures/dt2-1.16-running-trig.dt2cap)",
+    )
+    p.add_argument(
+        "--extra-frames",
+        type=int,
+        default=20,
+        help="--armed-voice-wav only: frames to render past the voice's "
+        "own active window",
+    )
+    p.add_argument(
+        "--start-frame",
+        type=int,
+        default=0,
+        help="--armed-voice-wav only: skip this many of the capture's own "
+        "leading frames without executing them (see replay_armed_voice()'s "
+        "own docstring for when this is, and is not, safe to use) -- "
+        "default 0, a genuinely continuous replay from frame 0",
+    )
     return p.parse_args(argv)
 
 
@@ -703,6 +1042,40 @@ def _parse_provisional(pairs: list[str]) -> dict[str, str] | None:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.armed_voice_wav:
+        result = replay_armed_voice(
+            args.image,
+            args.capture,
+            voice=args.voice,
+            extra_frames=args.extra_frames,
+            n_frames=args.frames,
+            start_frame=args.start_frame,
+        )
+        if args.out and result.get("render_left"):
+            h.sharc_dac.write_wav_stereo(
+                args.out,
+                result["render_left"],
+                result["render_right"],
+                sample_rate=result["sample_rate_hz"],
+            )
+        if args.report:
+            with open(args.report, "w") as fh:
+                json.dump(result, fh, indent=1)
+        print(
+            "%s: %d/%d frame(s) replayed, voice=%d, arm_frame=%s, "
+            "active_frames=%d, deactivate_pc=%s, sample_pointer_at_arm=%s"
+            % (
+                args.capture,
+                result.get("frames_replayed", 0),
+                result.get("frames_in_capture", 0),
+                args.voice,
+                result.get("arm_frame"),
+                result.get("active_frames", 0),
+                result.get("deactivate_pc"),
+                result.get("sample_pointer_at_arm"),
+            )
+        )
+        return 0 if "error" not in result else 1
     result = replay(
         args.image,
         args.capture,

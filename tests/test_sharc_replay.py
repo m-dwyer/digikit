@@ -8,9 +8,11 @@ also never committed -- tools/sharc_capture_run.py's own output), and is
 skipped without either.
 """
 
+import hashlib
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 
 import pytest
@@ -22,6 +24,7 @@ import sharc_run as sr  # noqa: E402
 
 DT2_116_BLOB = pathlib.Path("out/sections/dt2-1.16/section_7_BLOB.bin")
 IDLE_CAPTURE = pathlib.Path("out/captures/dt2-1.16-idle.dt2cap")
+TRIG_CAPTURE = pathlib.Path("out/captures/dt2-1.16-running-trig.dt2cap")
 
 
 class DescribeFrameTest(unittest.TestCase):
@@ -371,6 +374,75 @@ class CallFrameCollectAllWithHitsTest(unittest.TestCase):
         )
         self.assertEqual(hits, [])
         self.assertEqual(result.terminal.category, "frame-returned")
+
+
+@pytest.mark.slow
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+@unittest.skipUnless(
+    TRIG_CAPTURE.exists(), "dt2-1.16-running-trig.dt2cap capture is not available"
+)
+class ArmedVoiceReplayTest(unittest.TestCase):
+    """Lane K1 (2026-09-26): replay_armed_voice() over
+    out/captures/dt2-1.16-running-trig.dt2cap.
+
+    Uses ``start_frame=300`` -- NOT a full from-frame-0 replay (~3 minutes
+    under PyPy, much longer under plain CPython pytest) -- because this
+    lane's own from-frame-0 run over this exact capture (docs/findings/06's
+    Lane K1 section; see this repo's newest HANDOVER for the full report)
+    found voice 4's own word+0 already null by frame ~2, well before this
+    window, and confirmed byte-for-byte (matching SHA-256 of the rendered
+    WAV) that ``start_frame=300`` reproduces that full run's own
+    arm_frame/active_frames/deactivate_pc/sample_pointer_at_arm and render
+    window exactly, for this specific (capture, voice) pair only -- see
+    replay_armed_voice()'s own docstring for why this is not a
+    general-purpose shortcut.
+
+    Voice 4 arms for exactly one frame (304) with word+0 already null
+    (the documented zero-fill gate), so it renders SILENCE, not a tone --
+    a real firmware result, not a broken injection path: this lane
+    separately verified (report only, not this test) that the same
+    call_frame_with_track_injection(inject_track=False, write_master_mix=
+    True) path produces a real, nonzero, audible signal for a hand-set-up
+    voice with a live sample pointer and a genuine command-3 DMA-delivered
+    frame. Pinning this silent result is still worth doing: a future fix
+    to whatever nulls voice 4's own word+0 this early (pc 0x1c4e86, this
+    lane's own finding) should change it, and this test should then be
+    updated, not quietly left green on stale silence."""
+
+    def test_start_frame_shortcut_matches_full_replay_and_pins_the_wav(self):
+        result = replay_mod.replay_armed_voice(
+            "dt2-1.16",
+            str(TRIG_CAPTURE),
+            voice=4,
+            extra_frames=20,
+            n_frames=26,
+            start_frame=300,
+        )
+        self.assertEqual(result["arm_frame"], 304)
+        self.assertEqual(result["active_frames"], 1)
+        self.assertEqual(result["deactivate_pc"], "0x1c4e8a")
+        self.assertEqual(result["sample_pointer_at_arm"], "0x0")
+        self.assertEqual(len(result["render_left"]), 21 * 32)
+        self.assertEqual(len(result["render_right"]), 21 * 32)
+        # Silent: word+0 was already null when the firmware armed voice 4
+        # (see the class docstring) -- not this test's own bug.
+        self.assertFalse(any(result["render_left"]))
+        self.assertFalse(any(result["render_right"]))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wav_path = os.path.join(tmp_dir, "demo_trig.wav")
+            h.sharc_dac.write_wav_stereo(
+                wav_path,
+                result["render_left"],
+                result["render_right"],
+                sample_rate=result["sample_rate_hz"],
+            )
+            with open(wav_path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+        self.assertEqual(
+            digest,
+            "c0f5cd45c53fb016e540008dd1841249a60d0dee1558e8107e0f8988f7d664ed",
+        )
 
 
 if __name__ == "__main__":
