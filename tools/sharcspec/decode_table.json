@@ -436,9 +436,9 @@
      "lo": 16
     }
    ],
-   "source": "prm",
+   "source": "prm figure and w/cond syntax table (ACCESS/WACCESS, cond=31 vs IFCOND); firmware-confirmed: all 58 dt2-1.16 instances raw-byte-checked, decode inside register-save/loop dataflow, clean successor decode",
    "classic_keys": [],
-   "unconfirmed_bits": 7
+   "unconfirmed_bits": 0
   },
   {
    "name": "Type4a",
@@ -642,9 +642,9 @@
      "lo": 16
     }
    ],
-   "source": "prm",
+   "source": "prm figure and g/d/u BH/BHSE-select encode tables; firmware-confirmed: all 20 dt2-1.16 instances raw-byte-checked, decode inside stack-frame (negative-offset) and loop dataflow, clean successor decode",
    "classic_keys": [],
-   "unconfirmed_bits": 8
+   "unconfirmed_bits": 0
   },
   {
    "name": "Type5a_move",
@@ -1820,9 +1820,9 @@
      "lo": 0
     }
    ],
-   "source": "prm",
+   "source": "prm figure and w/ex/d/l BH/BHSE/BHEX/BHSEEX-select encode tables; firmware-confirmed: all 80 dt2-1.16 instances' (l,x,d) match the manual's mnemonic-suffix table exactly, addr fields repeat as real DM globals read/written elsewhere, clean successor decode",
    "classic_keys": [],
-   "unconfirmed_bits": 7
+   "unconfirmed_bits": 0
   },
   {
    "name": "Type15a",

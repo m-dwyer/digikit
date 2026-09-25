@@ -794,3 +794,156 @@ Every indexed store is now visible to the dataflow queries. A whole-image
 396 functions, where it returned none before. By address root they are led by
 I6 (2,021), addresses that come through a load (1,338), I4 (135) and I5 (73).
 None is resolved to `0x252658` yet. **[D][O]**
+
+## Type3d, Type4d and Type14d promoted to confident; Type15a's mem_access/dataref address bug fixed **[V]**
+
+- Types 3d, 4d and 14d were on `tools/sharcspec/README.md`'s "SHARC+-only
+  encodings with no second source" list: the PRM (`sc58x-2158x-prm.pdf`) is
+  the only manual that documents them at all, so `decode_table.json` carried
+  `unconfirmed_bits` equal to every one of their fixed bits (3d 7, 4d 8, 14d
+  7) and `tools/sharc_coverage.py`'s tracer/runner refused every instance as
+  "decode confidence uncertain". On the render path from `0x1c2b24`: 14d 56,
+  4d 16, 3d 15 instances (`tools/sharc_coverage.py dt2-1.16 --root
+  0x1c2b24`); whole-image dt2-1.16: 14d 80, 4d 20, 3d 58.
+- Checked two ways, independently, then re-checked by a second agent with no
+  access to this session's own numbers:
+  - **From the manual's bit layout, against the raw bytes.** The PRM prints
+    each form's fixed bits as gray-filled cells in its opcode figure (Type3d
+    Figure 14-9 p.326, Type4d Figure 14-12 p.337, Type14d Figure 16-2 p.388,
+    `out/refs/sc58x-2158x-prm/`). Converting each figure's fixed-bit pattern
+    to a mask/value by hand reproduces `decode_table.json`'s `mask`/`value`
+    exactly (3d `0xe00000780000`/`0x400000300000`, 4d
+    `0xf00000780000`/`0x600000300000`, 14d `0xfe0000000000`/`0x1a0000000000`).
+    Reading the raw 48-bit word directly from `section_7_BLOB.bin` (3
+    little-endian 16-bit parcels) for one instance of each form and
+    extracting every field by the manual's bit positions alone (not through
+    `sharc_isa.py`) reproduces the database's decoded `fields` and mnemonic
+    exactly, e.g. sw `0x1c8119`: word `0x1b4200269454` ->
+    d=1,ex=0,l=1,w=0,x=0,dreg=2,addr=`0x269454`, matching `DM(0x269454) = R2
+    (sw)`. The PRM's own syntax tables for each form give a direct mnemonic
+    rule (Type3d: `w=0,cond=31` -> `ACCESS`, else `IFCOND ACCESS`; Type4d:
+    same by `cond` alone; Type14d: `(l,x,d)` -> the BH/BHSE/BHEX/BHSEEX
+    suffix tables), and every real dt2-1.16 instance's rendered mnemonic
+    matches that table with no exceptions (all 80 Type14d instances'
+    `bw`/`sw`/`bwse`/`swse` suffixes checked). A second agent independently
+    re-extracted the same three figures from rendered PDF pages and 18
+    firmware instances (its own read of `section_7_BLOB.bin`, not this
+    session's), and reported every field position and every decoded value
+    matching `decode_table.json` and the database exactly, with one caveat:
+    the PRM prints Type3d/Type4d's low 16 bits as an unlabelled all-zero row
+    that `decode_table.json`'s mask leaves unconstrained rather than
+    fixed-zero. That is the same 16 bits `tools/sharcspec/audit_bits.py`
+    already found and the "Type22a is idle" section above already resolved:
+    restoring them as fixed changes nothing measurable on real code, so the
+    merge rule (ignore a PRM figure's stale template defaults) correctly
+    leaves them unconstrained. **[V]**
+  - **From dataflow, against neighbouring code.** `0x269454` is a genuine
+    counter: `R2=0x40; DM(0x269454)=R2` initialises it, later code
+    `R2=DM(0x269454); ...; R2=sub(R2,R4); DM(0x269454)=R2` is a
+    read-decrement-store loop (`img.listing`, function `0x1c80f2`).
+    `0x82a001b8` (Type14d loads at `0x1c4720`/`0x1c4855`) sits inside the
+    `0x82a00000`-`0x82a001ff` SoC command block already independently
+    verified above; a Type17a at `0x1c47e5` loads the same address into an I
+    register right beside them (`img.refs`). The Type3d cluster at function
+    `0x1c42b8` is a textbook prologue: `I7=modify(I7,-10)` then `DM(I6-N) =`
+    M2/M3/I3/I5/R9..R15 -- the same I7-as-SP register-save idiom the call
+    convention above documents. The Type4d cluster at `0x1c5615` reads
+    `DM(I1-8)`, `DM(I1-9)`, `DM(I1-14)`, `DM(I1-15)` -- small negative
+    stack-relative offsets, the shape a compiler's spilled-argument reads
+    take. Every one of the 158 whole-image instances (87 on the render path)
+    has a clean, aligned, non-gap successor instruction starting exactly 3
+    short words later (`tools/sharc.py`'s `insn` table, `aligned=1`); none
+    lands on a form the decoder had to guess at. **[V]**
+  - Both checks agree for all three forms, so `decode_table.json` now sets
+    `unconfirmed_bits` to 0 for Type3d/Type4d/Type14d (`source` records the
+    manual pages and the corroboration). `sharc_coverage.py`'s "provisional
+    14d/4d/3d: decode confidence uncertain" gaps are gone (see counts below).
+- **Database bug, form 15a: `mem_access.abs_address` was the I-register
+  offset, not an address.** `extract_mem_access()`'s `DIRECT_MEM_FORMS`
+  branch (`tools/sharcdb.py`) treated Type15a the same as the genuinely
+  absolute Type14a/14d, storing its raw `addr` field straight into
+  `abs_address`. The PRM is explicit that Type15a is `DM(<data32>,Ia) =
+  Ureg` / `PM(<data32>,Ic) = Ureg` (pp.387-390, Figure 16-3, worked example
+  `DM(24,I5)=TCOUNT;`): an I-register-relative access the core never updates
+  I for, not a direct address -- `tools/sharcfn.py`'s `render_mem_direct`
+  already documents this correction for the disassembler's own mnemonic
+  rendering and `_ptr_mem_form` already models it correctly for the `ptr`
+  table; only `extract_mem_access` (mem_access) and the `extract_literal`
+  caller's role classification (dataref) still had the old assumption. A
+  second agent's independent read of the same PRM pages confirmed the
+  citation. **[V]**
+  - Before the fix, all 892 dt2-1.16 Type15a `mem_access` rows carried a
+    bogus `abs_address` (429 of them a small negative offset stored as
+    `0xfffexxxx`-`0xffffxxxx`, indistinguishable from a real top-of-space
+    address; the rest small positive offsets indistinguishable from a real
+    low DM/PM address), and the matching `dataref` rows carried role
+    `abs_load`/`abs_store` (446/446) as if the raw offset were a resolved
+    address.
+  - Fixed: Type15a now gets its own branch in `extract_mem_access`, folding
+    the DAG bank into the I-register number exactly as `render_mem_direct`
+    does (`g=1` -> `+8`, e.g. `i=4,g=1` -> `I12`, matching the mnemonic
+    `PM(I12 - 0x54) = L0, long`) and putting the sign-extended offset in
+    `modifier` (the same column `INDEXED_MEM_FORMS`/`IMMOFF_MEM_FORMS` use
+    for their own register-relative accesses); `abs_address` is now NULL for
+    every Type15a row. The `extract_literal`/`dataref` caller now only
+    assigns `abs_load`/`abs_store` for Type14a; Type15a's literal falls
+    through to role `literal` (a modify delta, like 16a/18a/19a*), matching
+    892 rows. After the fix: 0 `mem_access` rows anywhere in the image carry
+    an `abs_address` in the `0xffff0000`-`0xffffffff` range; the only forms
+    with `abs_address` set at all are 14a (1,610 rows) and 14d (80 rows),
+    both genuinely absolute.
+  - `INDEXED_MEM_FORMS` (3a/3b/3d/6a_mem) and `IMMOFF_MEM_FORMS`
+    (4a/4b/4d/15b) were checked and never set `abs_address` in the first
+    place -- their branches in `extract_mem_access` hard-code it `None`;
+    only Type15a's presence in the `DIRECT_MEM_FORMS` grouping (alongside
+    the genuinely-absolute 14a/14d) caused this bug, and it was isolated to
+    that one form. **[V]**
+- `DB_VERSION` 11 -> 12 (`tools/sharcdb.py`, both changes as one bump).
+  Rebuilt `out/sharcdb/dt2-1.16.sqlite` (private per-lane copy) before/after,
+  same `section_7_BLOB.bin` (image sha256 unchanged):
+
+  | | before | after |
+  |---|---|---|
+  | `sharc_coverage.py --root 0x1c2b24`: gap instructions | 90 | 3 |
+  | ... of which `provisional 14d/4d/3d: ... uncertain` | 87 | 0 |
+  | `sharc_coverage.py --all-roots`: gap instructions | 166 | 11 |
+  | ... of which `provisional 14d/4d/3d: ... uncertain` | 155 | 0 |
+  | `mem_access` rows with `abs_address` in `0xfffe0000..0xffffffff` | 429 | 0 |
+  | Type15a `mem_access` rows with any `abs_address` set (all bogus) | 892 | 0 |
+  | Type15a `dataref` rows with role `abs_load`/`abs_store` (bogus) | 892 | 0 |
+  | Type15a `dataref` rows with role `literal` (correct) | 0 | 892 |
+
+  The remaining `sharc_coverage.py` gaps (26a `decode confidence uncertain`,
+  a handful of unsupported full-compute opcodes, `21p_undoc16`/`8p_undoc48`)
+  are untouched -- they are separate, already-open items.
+- `tests/test_sharc_golden.py`'s six cases were compared output-for-output
+  (`output(name)`), not just by hash, both before (original code, original
+  database) and after: `run_voice`/`trace_voice` (root `0x1c4ecf`, a
+  different function) are byte-identical, since that path never touches
+  3d/4d/14d/15a. `cov_render`/`cov_all` differ only by the removal of the
+  14d/4d/3d gap rows above; every other gap entry (`1a`/`2a_short`/
+  `5a_move` full-compute, `26a`, `21p_undoc16`, `8p_undoc48`) is
+  byte-identical before and after. `run_frame`/`trace_frame` (root
+  `0x1c2b24`) now run past the point the confidence gate used to stop them:
+  the concrete runner (`tools/sharc_run.py dt2-1.16 --start 0x1c2b24
+  --json`) went from halting after 130 instructions on a refused Type14d at
+  sw `0x1c2c41` to running 13,895 instructions (touching 14d x97, 4d
+  x1,024, and every other form along the way -- deeper execution reaches
+  more of everything, not just the newly-confident forms) before halting on
+  an unrelated cause, an `8a_rel` branch whose predicate depends on an
+  unseeded/unknown register value ("fork (2 successors): a predicate or
+  address went Unknown despite concrete input"); the symbolic tracer
+  (`--allow-provisional-form 14d`, now a no-op since 14d is no longer
+  provisional) still ends in exactly 2 states, both an `external-call` stop
+  at the same site (sw `0x1c2ca0`): one unchanged at 158 steps (the branch
+  that never reached the Type4d instruction), the other -- which used to
+  stop early at 155 steps on the refused Type4d loop-setup at sw `0x1c2c7c`
+  ("uncertain or undecodable form: source: prm") -- now runs the Type4d
+  instruction and continues 1,037 more steps to the same external-call site
+  the other branch already reached, landing at 1,192 steps. No `15a` bug fix
+  effect
+  appears in any of the six golden cases: `mem_access`/`dataref`/`ptr` are
+  read only by `tools/sharc.py`'s `Image.refs`/`writers`/`readers`, not by
+  the live tracer/runner, so that fix is silent here and only changes
+  `tools/sharc.py` query results. Updated with `uv run python
+  tests/test_sharc_golden.py --update`. **[V]**

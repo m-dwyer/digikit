@@ -28,8 +28,18 @@ class InstructionSetTest(unittest.TestCase):
         self.assertEqual(form.evidence[0].claim_id, "isa.form.6b_shiftimm.encoding")
         self.assertEqual(form.evidence[0].status, sharc_isa.EvidenceStatus.DOCUMENTED)
 
+        # Type3d/4d/14d were promoted from UNCONFIRMED to DOCUMENTED once
+        # checked against real firmware (docs/findings/05-sharc-isa-and-
+        # decoding.md): manual bit layout against raw bytes and mnemonic
+        # syntax tables, and dataflow against neighbouring code, both agree
+        # for every dt2-1.16 instance. Type6a (nomem) still has no second
+        # source and stays UNCONFIRMED.
         self.assertEqual(
             self.isa.form("3d").evidence[0].status,
+            sharc_isa.EvidenceStatus.DOCUMENTED,
+        )
+        self.assertEqual(
+            self.isa.form("6a_nomem").evidence[0].status,
             sharc_isa.EvidenceStatus.UNCONFIRMED,
         )
         self.assertEqual(
@@ -79,7 +89,12 @@ class InstructionSetTest(unittest.TestCase):
         result = self.isa.decode_bytes(struct.pack("<HHH", 0x023E, 0x3810, 0x8022))
         self.assertEqual(result.instruction.form.id, "6b_shiftimm")  # type: ignore[union-attr]
 
-    def test_prm_blocker_bytes_retain_unconfirmed_type14d_evidence(self):
+    def test_prm_blocker_bytes_now_decode_with_documented_type14d_evidence(self):
+        # Same bytes as before Type14d's promotion (docs/findings/05-sharc-
+        # isa-and-decoding.md): the decode itself never depended on the
+        # confidence status, only sharc_coverage.py's tracer/runner gate
+        # did. What changed is evidence[0].status, DOCUMENTED now instead
+        # of UNCONFIRMED.
         result = self.isa.decode_bytes(bytes.fromhex("421a2500486a"))
         self.assertIsNotNone(result.instruction)
         insn = result.instruction
@@ -101,7 +116,7 @@ class InstructionSetTest(unittest.TestCase):
         )
         self.assertEqual(
             insn.form.evidence[0].status,
-            sharc_isa.EvidenceStatus.UNCONFIRMED,
+            sharc_isa.EvidenceStatus.DOCUMENTED,
         )
 
 

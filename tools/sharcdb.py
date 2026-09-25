@@ -81,11 +81,56 @@ import sharcinv  # noqa: E402
 import sharcldr  # noqa: E402
 from sharc_trace import ACCESS_WIDTHS  # noqa: E402
 
-DB_VERSION = 11
+DB_VERSION = 12
 
 # Bump DB_VERSION whenever the schema or the semantics of an existing column
 # change, so build_database()'s skip-rebuild check (sha256 + DB_VERSION) does
 # the right thing on the next run.
+#
+# --- v12: Type3d/4d/14d confident decode; Type15a mem_access/dataref fix ----
+#
+# Two independent changes:
+#
+# 1. decode_table.json promotes Type3d, Type4d and Type14d from
+#    unconfirmed_bits>0 ("uncertain" -- no second source beyond the single
+#    PRM figure, docs/findings/05's "SHARC+-only encodings with no second
+#    source" list) to unconfirmed_bits=0 ("confident"). Checked two ways,
+#    independently, and recorded in docs/findings/05-sharc-isa-and-decoding.md:
+#    (a) raw bytes of individual dt2-1.16 instances, re-extracted bit-by-bit
+#    from the manual's own figure geometry (not through sharc_isa.py),
+#    reproduce the database's decoded fields exactly, and the mnemonic
+#    suffix the existing renderer already picks for every real Type14d
+#    instance matches the PRM's own (l,x,d) -> BH/BHSE-family syntax table
+#    with no exceptions; (b) the addresses/registers each instance touches
+#    (repeated DM globals, a function-prologue register-save idiom, the
+#    already-[V] 0x82a00000 SoC command block) are the dataflow a compiler
+#    would actually emit, and every one of the 158 whole-image instances
+#    (87 on the sharc_coverage.py render path from 0x1c2b24) decodes a
+#    clean, aligned successor instruction. This removes the
+#    "provisional 14d/4d/3d: decode confidence uncertain" sharc_coverage.py
+#    gaps and lets sharc_trace.py/sharc_run.py execute these forms without
+#    passing them as provisional.
+#
+# 2. extract_mem_access()'s DIRECT_MEM_FORMS branch treated Type15a's
+#    32-bit "addr" field as an absolute address (mem_access.abs_address),
+#    the same wrong assumption the v6 `ptr`-table comment already flagged
+#    and _ptr_mem_form() already avoids: sharc-plus-prm pp.387-390 (Figure
+#    15-3, "DM(24,I5)=TCOUNT") gives Type15a as DM(<data32>,Ia)/PM(<data32>,
+#    Ic) -- an I-register-relative access, not absolute, unlike 14a/14d
+#    (which this branch also handles and which genuinely are absolute).
+#    429 dt2-1.16 rows carried a negative offset such as -0x87 (I7-relative)
+#    as abs_address 0xffffff79 -- indistinguishable from a real address near
+#    the top of the 32-bit space. Fixed: Type15a now gets its own branch in
+#    extract_mem_access, setting base_reg/modifier (the same columns
+#    INDEXED_MEM_FORMS/IMMOFF_MEM_FORMS use for their own register-relative
+#    accesses) from the manual's g/i-bank and sign-extended offset, and
+#    leaving abs_address NULL. The parallel dataref bug -- extract_literal's
+#    caller tagged Type15a's literal role='abs_load'/'abs_store' the same
+#    way as Type14a's -- is fixed the same way: Type15a's literal now falls
+#    through to role='literal' (a modify delta, like 16a/18a/19a*), not an
+#    address. INDEXED_MEM_FORMS/IMMOFF_MEM_FORMS (3a/3b/3d/6a_mem/4a/4b/4d/
+#    15b) were checked and never set abs_address in the first place: only
+#    Type15a's presence in the DIRECT_MEM_FORMS grouping caused this.
 #
 # --- v11: Type14d/3b/3d/3d(ptr) mem_access/ptr width -------------------------
 #
@@ -336,16 +381,19 @@ CREATE TABLE succ (
 
 -- Every constant an instruction materialises as an address: a 17a/17b/16a/
 -- 16b/18a/19a*/15a/14a literal (tools/sharcdb.py's own `literals` table,
--- given a role here) plus any 15a/14a/14d absolute mem_access address (kept
+-- given a role here) plus any 14a/14d absolute mem_access address (kept
 -- separate from `literals` since 14d isn't a LITERAL_FORMS entry). role:
 -- i_reg_base (a literal loaded directly into an I register -- a PM/DM table
 -- base), abs_load/abs_store (a direct absolute address, from mem_access's
 -- own direction so this never inherits a mnemonic-only bug -- see
--- tools/sharcfn.py's Type3c note), literal (any other literal-carrying
--- form: 16a/16b, 18a, 17a/17b into a non-I register, 19a* -- a modify
--- delta, not an address), resolved_offset (an IMMOFF form's I+immediate
--- address, resolved when the I register was just given a literal by a
--- 17a/17b in the SAME basic block -- see bblocks/succ above).
+-- tools/sharcfn.py's Type3c note; 14a only -- see extract_mem_access's
+-- module note on why 15a is not a direct-address form despite looking like
+-- one), literal (any other literal-carrying form: 16a/16b, 18a, 17a/17b
+-- into a non-I register, 19a* -- a modify delta, not an address; also 15a,
+-- an I-register-relative offset -- see extract_mem_access), resolved_offset
+-- (an IMMOFF form's I+immediate address, resolved when the I register was
+-- just given a literal by a 17a/17b in the SAME basic block -- see
+-- bblocks/succ above).
 CREATE TABLE dataref (
     image TEXT, value INTEGER, sw INTEGER, form TEXT, role TEXT);
 
@@ -499,9 +547,12 @@ def extract_literal(insn_type: str, f: dict):
     LITERAL_FORMS), sign-extended per that table's bit width; None for any
     other form. dest_reg is the register the literal loads into for
     17a/17b (a ureg, e.g. an M-register) and 19a/19a_scaled/19a_bitrev (the
-    modified I-register); None for the direct-address forms 15a/14a (the
-    literal there is a memory address, not a register's contents) and for
-    16a (which stores the literal to memory rather than a register)."""
+    modified I-register); None for the direct-address form 14a (the literal
+    there is a memory address, not a register's contents), for 15a (the
+    literal is a signed offset added to an I register the decoder never
+    updates -- register-relative, not a register's contents either; see
+    extract_mem_access's module note), and for 16a (which stores the
+    literal to memory rather than a register)."""
     spec = sharcinv.LITERAL_FORMS.get(insn_type)
     if spec is None:
         return None
@@ -608,9 +659,31 @@ def extract_mem_access(insn_type: str, f: dict):
     for a memory-referencing form; [] for any other form. form is
     tools/sharcinv.py's MEM_FORMS label ('direct'/'i,m-mod'/'i+imm'/
     'i,m-mod+shift') or 'dual' for the simultaneous DM+PM forms, so it stays
-    in step with that table rather than reinventing addressing-mode names."""
+    in step with that table rather than reinventing addressing-mode names.
+
+    abs_address is only ever set for a form with no I-register component at
+    all (14a/14d: sharc-plus-prm pp.373-383, "DM(<addr32>)" / "PM(<addr32>)"
+    direct addressing, no base register). Despite sharing DIRECT_MEM_FORMS'
+    grouping with those two, Type15a is register-relative, not absolute --
+    see tools/sharcfn.py's render_mem_direct docstring for the manual
+    citation (pp.387-390, Figure 15-3, worked example "DM(24,I5)=TCOUNT"):
+    "addr" there is a signed 32-bit offset from an I register the decoder
+    never updates, not a memory address. Before this fix abs_address held
+    that raw 32-bit field unsigned, so a small negative offset such as -0x87
+    (I7-0x87) stored as 0xffffff79 -- 429 rows in dt2-1.16, all indented
+    from the true short-word addresses of any real DM/PM global. The
+    base register and signed offset now go in base_reg/modifier, the same
+    columns INDEXED_MEM_FORMS/IMMOFF_MEM_FORMS already use for their own
+    register-relative accesses, and abs_address is left NULL."""
     rows = []
-    if insn_type in sharcfn.DIRECT_MEM_FORMS:
+    if insn_type == "15a":
+        space, direction = sharcfn._space_dir(f)
+        index = (f.get("i", 0) & 0x7) + (8 if f.get("g") else 0)
+        off = sharcfn.sign_extend(f.get("addr", 0) & 0xFFFFFFFF, 32)
+        width = "long" if f.get("l") else "word"
+        rows.append((space, direction, "I%d" % index, str(off), None,
+                     sharcinv.MEM_FORMS.get(insn_type, insn_type), width, None))
+    elif insn_type in sharcfn.DIRECT_MEM_FORMS:
         space, direction = sharcfn._space_dir(f)
         width = (
             _type14d_width(f) if insn_type == "14d"
@@ -1424,12 +1497,17 @@ def _fill_database(db, name, sha, blob_path, code_blocks, min_depth, ctx):
                 in_code, in_data = classify_literal_range(value, code_spans_sw, code_spans_byte, mem)
                 literal_rows.append((name, sw, value, t, dest, int(in_code), int(in_data)))
 
-                if t in ("15a", "14a"):
+                if t == "14a":
                     # The literal IS the memory address here; use the same
                     # d-field direction extract_mem_access does, not a
                     # separate guess, so this never disagrees with
                     # mem_access's own abs_load/abs_store rows for the
-                    # same instruction.
+                    # same instruction. 15a used to be listed alongside 14a
+                    # here, on the same wrong assumption extract_mem_access
+                    # made about its "addr" field -- see that function's
+                    # module note. It is register-relative, not absolute,
+                    # so it falls through to the plain 'literal' role below,
+                    # like any other modify delta (16a/18a/19a*).
                     _space, direction = sharcfn._space_dir(f)
                     role = "abs_store" if direction == "store" else "abs_load"
                 elif t in ("17a", "17b") and dest is not None and dest.startswith("I") \
@@ -1452,9 +1530,15 @@ def _fill_database(db, name, sha, blob_path, code_blocks, min_depth, ctx):
             for row in mem_access_rows:
                 mem_rows.append((name, sw) + row)
                 abs_address = row[7]
-                if abs_address is not None and t not in ("15a", "14a"):
-                    # 14d: a direct absolute address that extract_literal
-                    # doesn't cover (not a LITERAL_FORMS entry).
+                if abs_address is not None and t != "14a":
+                    # 14a is excluded: its abs_load/abs_store dataref row
+                    # already came from the extract_literal branch above
+                    # (14a IS a LITERAL_FORMS entry; 14d and 15a are not --
+                    # 14d has no compute-independent literal to sign-extend,
+                    # and 15a's "addr" is a register-relative offset, not an
+                    # address, so extract_mem_access now always returns
+                    # abs_address=None for it and this branch never fires
+                    # for 15a at all).
                     direction = row[1]
                     role = "abs_store" if direction == "store" else "abs_load"
                     dataref_rows.append((name, abs_address, sw, t, role))

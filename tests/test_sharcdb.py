@@ -131,13 +131,43 @@ class ExtractMemAccessTest(unittest.TestCase):
         self.assertIsNone(abs_addr)
 
     def test_direct_load_records_the_absolute_address(self):
-        insn = insn_at(field_insn("15a", addr=0x252658, ureg=0, g=0, d=0, l=0))
+        # Type14a/14d have no I-register component at all (sharc-plus-prm
+        # pp.373-383, "DM(<addr32>)"): their "addr" field really is a plain
+        # absolute address.
+        insn = insn_at(field_insn("14a", addr=0x252658, ureg=0, g=0, d=0, l=0))
         f = sharcinv.merge_fields(insn.fields)
-        rows = sharcdb.extract_mem_access("15a", f)
+        rows = sharcdb.extract_mem_access("14a", f)
         self.assertEqual(len(rows), 1)
         space, direction, base_reg, modifier, u, form, width, abs_addr = rows[0]
         self.assertEqual((space, direction, base_reg, modifier), ("DM", "load", None, None))
         self.assertEqual(abs_addr, 0x252658)
+
+    def test_indirect_15a_offset_is_signed_and_not_an_absolute_address(self):
+        # Unlike 14a/14d, Type15a is DM(<data32>,Ia)/PM(<data32>,Ic)
+        # (sharc-plus-prm pp.387-390, Figure 16-3, worked example
+        # "DM(24,I5)=TCOUNT;"): an I-register-relative access the core
+        # never updates I for, despite sharing 14a/14d's DIRECT_MEM_FORMS
+        # grouping. -0x2a8 as a raw 32-bit two's-complement field is
+        # 0xfffffd58 -- before the fix this was stored unchanged as
+        # abs_address, indistinguishable from a real address near the top
+        # of the 32-bit space (docs/findings/05, "form 15a" bug).
+        insn = insn_at(field_insn("15a", addr=0xFFFFFD58, ureg=0, g=0, d=0, i=3, l=0))
+        f = sharcinv.merge_fields(insn.fields)
+        rows = sharcdb.extract_mem_access("15a", f)
+        self.assertEqual(len(rows), 1)
+        space, direction, base_reg, modifier, u, form, width, abs_addr = rows[0]
+        self.assertEqual((space, direction, base_reg, modifier), ("DM", "load", "I3", "-680"))
+        self.assertIsNone(abs_addr)
+
+    def test_indirect_15a_folds_the_dag2_bank_into_the_i_register(self):
+        # g=1 selects PM/DAG2 (I8-I15), the same +8 fold
+        # tools/sharcfn.py's render_mem_direct() applies for display, so a
+        # Type15a mem_access row names the register the mnemonic actually
+        # uses (e.g. i=4,g=1 -> I12, not I4).
+        insn = insn_at(field_insn("15a", addr=8, ureg=0, g=1, d=0, i=4, l=0))
+        f = sharcinv.merge_fields(insn.fields)
+        rows = sharcdb.extract_mem_access("15a", f)
+        self.assertEqual(rows[0][0:4], ("PM", "load", "I12", "8"))
 
     def test_immoff_offset_is_signed(self):
         # 6-bit field, 40 -> -24 (sign_extend(40, 6)).
@@ -397,6 +427,61 @@ class SyntheticDatarefResolvedOffsetTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(self._resolved_offset(tmp, u=0), [0x3008])
+
+
+class SyntheticType15aMemAccessTest(unittest.TestCase):
+    """End-to-end (build_database, not just extract_mem_access/
+    extract_literal in isolation): a Type15a access must never reach the
+    database as an absolute address, in either mem_access.abs_address or
+    dataref's abs_load/abs_store role, while a neighbouring Type14a access
+    (genuinely absolute -- no I-register component at all) still does. See
+    docs/findings/05-sharc-isa-and-decoding.md's "form 15a" bug."""
+
+    def _stream(self, base_sw):
+        target = sharcldr.sw_to_byte(base_sw)
+        # -0x2a8 as a raw 32-bit two's-complement field: the exact shape of
+        # the bug (a small negative I-relative offset stored unchanged as
+        # abs_address, indistinguishable from a real address near the top
+        # of the 32-bit space).
+        access_15a = field_insn(
+            "15a", i=3, g=0, d=0, l=0, ureg=0, addr=0xFFFFFD58)
+        access_14a = field_insn(
+            "14a", g=0, d=1, l=0, ureg=0, addr=0x252658)
+        code = access_15a + access_14a + ret() + load(0, 0) + rframe()
+        return boot_block(0, target, len(code), payload=code)
+
+    def test_15a_has_no_abs_address_and_14a_still_does(self):
+        import tempfile
+
+        base_sw = 0x1C1338
+        with tempfile.TemporaryDirectory() as tmp:
+            stream_path = os.path.join(tmp, "stream.bin")
+            with open(stream_path, "wb") as fh:
+                fh.write(self._stream(base_sw))
+            out_path = os.path.join(tmp, "out.sqlite")
+            sharcdb.build_database(
+                stream_path, out_path, name="synthetic", min_depth=1, blocks=(0,), force=True)
+            db = sqlite3.connect(out_path)
+            sw_15a, sw_14a = base_sw, base_sw + 3
+
+            space, direction, base_reg, modifier, abs_addr, form = db.execute(
+                "SELECT space, direction, base_reg, modifier, abs_address, form "
+                "FROM mem_access WHERE sw = ?", (sw_15a,)).fetchone()
+            self.assertEqual((space, direction, base_reg, modifier), ("DM", "load", "I3", "-680"))
+            self.assertIsNone(abs_addr)
+
+            abs_addr_14a, = db.execute(
+                "SELECT abs_address FROM mem_access WHERE sw = ?", (sw_14a,)).fetchone()
+            self.assertEqual(abs_addr_14a, 0x252658)
+
+            role_15a, = db.execute(
+                "SELECT role FROM dataref WHERE sw = ? AND form = '15a'", (sw_15a,)).fetchone()
+            self.assertEqual(role_15a, "literal")
+
+            role_14a, = db.execute(
+                "SELECT role FROM dataref WHERE sw = ? AND form = '14a'", (sw_14a,)).fetchone()
+            self.assertEqual(role_14a, "abs_store")
+            db.close()
 
 
 class SyntheticJumpEdgeTest(unittest.TestCase):
