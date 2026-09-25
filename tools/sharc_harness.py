@@ -903,6 +903,58 @@ def call_frame(
     return new_runner, result
 
 
+def call_frame_collect_all(
+    runner: sr.Runner,
+    image: str,
+    *,
+    patch_table: sv.PatchTable | None = None,
+    max_steps: int = 4_000_000,
+    img: sharcmod.Image | None = None,
+) -> tuple[sr.Runner, sv.CollectAllResult]:
+    """Like `call_frame()`, but drives the call with
+    `tools/sharc_survey.py`'s `run_collect_all()` instead of
+    `run_with_patches()`: every stop this frame call passes is recorded
+    (category, pc, form, unknowns), not only the first -- the same "collect
+    every blocker on one path" behaviour `sharc_survey`'s own CLI gives a
+    bare root, applied to a real frame call through `block_handler` instead.
+    `patch_table` still resolves a fork the same way (a `"reg"`/`"mem"`
+    entry unconditionally, before the instruction executes); a fork with no
+    matching entry is continued through with the documented default
+    (not-taken) rather than stopping the whole replay, so one frame's own
+    report is a full list of what it depended on instead of only the
+    nearest one.
+
+    Returns (the fresh_call Runner, positioned at the terminal stop, its
+    `sv.CollectAllResult`) -- `result.terminal` is the same kind of Halt
+    information `call_frame()`'s own `RunResult.halt` would have stopped
+    at first.
+    """
+    p = profile(image)
+    new_runner = runner.fresh_call(p.block_handler, diagnose_unknown=True)
+    result = sv.run_collect_all(new_runner, patch_table or {}, max_steps, img=img)
+    return new_runner, result
+
+
+def scan_voice_active(
+    state, image: str, *, exclude: Sequence[int] = ()
+) -> dict[int, int]:
+    """The ACTIVE byte (`FIELD_ACTIVE`, record `+0x1b8`) of every voice
+    record except `exclude`, keyed by voice index -- for telling a
+    hand-set-up voice (this harness's own `setup_voice()`) apart from one
+    the firmware itself activated while a replay ran. Returns only entries
+    that read non-zero; an empty dict means no *other* voice was ever
+    marked ACTIVE."""
+    active = {}
+    for voice in range(VOICE_RECORD_COUNT):
+        if voice in exclude:
+            continue
+        record = voice_record_address(image, voice)
+        value = _read_byte(state, record + FIELD_ACTIVE)
+        if value:
+            active[voice] = value
+    return active
+
+
 # This lane's own hypotheses for the stops render_frame hits when called
 # (via setup_frame()/call_frame() above) from a run_init() state with one
 # voice set up and no other per-track frame data at all (an almost-empty

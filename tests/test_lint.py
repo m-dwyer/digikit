@@ -34,6 +34,7 @@ CLEAN = [
     "tests/test_sharc_inputs.py",
     "tests/test_sharc_peer.py",
     "tests/test_sharc_proc.py",
+    "tests/test_sharc_replay.py",
     "tests/test_sharc_run.py",
     "tests/test_sharc_survey.py",
     "tests/test_sharc_symbols.py",

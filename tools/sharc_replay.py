@@ -2,7 +2,8 @@
 task, from a post-init state.
 
     uv run python tools/sharc_replay.py dt2-1.16 CAPTURE.dt2cap \
-        [--frames N] [--out OUT.wav] [--report OUT.json] [--no-candidates]
+        [--frames N] [--out OUT.wav] [--report OUT.json] [--freq HZ] \
+        [--sample-len N] [--poke-candidates]
 
 For each captured DSPI2 frame, in capture order:
 
@@ -28,24 +29,44 @@ For each captured DSPI2 frame, in capture order:
    measurably changed anything (it does not gate the render on it either
    way), not a claim that it found the real buffer.
 
-3. **Drives the real audio-task call chain**, the same one
+3. **Writes the captured payload to the confirmed SHARC receive buffer**
+   (`RX_BASE = 0x2558dc`, docs/findings/06's "The ColdFire frame is mapped
+   into SHARC DM at 0x2558dc" -- a whole-frame mapped range
+   `[0x2558dc, 0x2560de]`, 0x802 bytes, exactly this tool's own captured
+   `tx` length): byte 0 of the payload to byte 0 of that DM range, the same
+   1:1 mapping the finding's own literal-subtraction table establishes.
+   This supersedes the two `CANDIDATE_RX_BUFFERS` an earlier version of
+   this tool poked (`0x261bac`/`0x261aa4`, docs/findings/04's "still not
+   aliased to I5" candidates from before `0x2558dc` was confirmed by
+   execution) -- kept below only as an additional, off-by-default,
+   diagnostic poke (`--poke-candidates`), not the transport this tool now
+   relies on.
+
+4. **Drives the real audio-task call chain**, the same one
    tools/sharc_harness.py's `render_frames()`/`call_frame()` already proved
    reaches render_frame (block_handler -> command_dispatch_fn ->
    cmd_handler_3 -> render_frame -- docs/findings/06's "Frame call path"),
    with `FRAME_PATCH_TABLE` (that module's own hypotheses for the stops an
-   almost-empty synthetic frame hits). ONE voice is set up via
-   `sharc_harness.setup_voice()` -- **not** from the captured frame,
-   because the SHARC-side code path that would turn a received DSPI2 frame
-   into an active voice record (a written record word +0 / ACTIVE) is not
-   yet found: docs/findings/06's "Init writes" leaves "the firmware writer
-   of word +0 for a playing voice" open, and docs/findings/04's own
-   candidate-buffer investigation could not alias either candidate to the
-   frame reader's runtime `I5` ("No static path establishes either frame
-   value"). This tool's own `voice_activated_by_firmware` is therefore
-   always `False` -- it names the missing link instead of quietly working
-   around it with a hand-set-up voice and calling that "firmware-driven".
+   almost-empty synthetic frame hits) via
+   `sharc_harness.call_frame_collect_all()` -- every stop the frame call
+   passes is recorded (`per_frame[i]["stops"]`), not only the first, so a
+   replay's own report is a full list of what each frame depended on.
 
-4. **Collects ring A** (DAC output, `0x261cc8 + (flag<<8)`,
+   ONE voice is set up via `sharc_harness.setup_voice()`, with a `--freq`
+   Hz sine (default 1000 Hz, at `sharc_harness.SOURCE_SAMPLE_RATE`) written
+   to its sample buffer -- **not** from the captured frame, because the
+   SHARC-side code path that would turn a received DSPI2 frame into an
+   active voice record (a written record word +0 / ACTIVE) is not yet
+   found: docs/findings/06's "Init writes" leaves "the firmware writer of
+   word +0 for a playing voice" open. This tool's own
+   `voice_activated_by_firmware` is therefore always `False` -- it names
+   the missing link instead of quietly working around it with a
+   hand-set-up voice and calling that "firmware-driven". `scan_voice_active`
+   reports whether the firmware itself ever marked any *other* voice record
+   ACTIVE (`+0x1b8`) while this replay ran, independent of the one this
+   tool sets up by hand.
+
+5. **Collects ring A** (DAC output, `0x261cc8 + (flag<<8)`,
    docs/findings/06's "Rings": already Q31, L/R-interleaved, at the final
    output rate -- unlike the single-voice work buffer, this is NOT run
    through `sharc_harness.decimate()`) after each call, and writes an
@@ -55,17 +76,18 @@ For each captured DSPI2 frame, in capture order:
    to 2748 after the call is not known... No write to an SPI or DMA
    register has been found yet"); this tool does not invent one.
 
-Stops are reported exactly as `tools/sharc_run.py`'s `Halt` gives them
-(reason, pc, form, instruction count), via `FRAME_PATCH_TABLE` the same way
-`sharc_harness.render_frames()` applies it. This tool never patches past a
-stop on its own -- a new patch hypothesis belongs in `FRAME_PATCH_TABLE`
-(tools/sharc_harness.py, a different lane's file), not here.
+Stops are reported exactly as `tools/sharc_survey.py`'s `CollectStop`s give
+them (category, pc, form, unknowns), via `FRAME_PATCH_TABLE` the same way
+`sharc_harness.render_frames()` applies it. This tool never adds a new
+patch-table hypothesis of its own -- one belongs in `FRAME_PATCH_TABLE`
+(tools/sharc_harness.py, this lane's own file), not here.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -88,6 +110,14 @@ CANDIDATE_RX_BUFFERS = {
     "selector_2_0x261a10": 0x261AA4,
 }
 
+# docs/findings/06's "The ColdFire frame is mapped into SHARC DM at
+# 0x2558dc": the confirmed (by execution) whole-frame mapped range
+# [0x2558dc, 0x2560de], 0x802 bytes -- exactly this tool's own captured `tx`
+# length (tools/sharc_capture_run.py hooks the firmware's own driver call,
+# whose own argument length is 0x802). Byte i of the payload maps to DM byte
+# RX_BASE + i, one-to-one.
+RX_BASE = 0x2558DC
+
 # docs/findings/04's per-track TX frame map: offsets into the ColdFire's own
 # 0x802-byte payload, which is also this tool's captured `tx` bytes (see
 # tools/sharc_capture_run.py: the driver-call hook captures the argument
@@ -101,8 +131,6 @@ TRACK_COUNT = 16
 # docs/findings/06's "Rings": ring A holds 32 L/R-interleaved Q31 sample
 # pairs (64 words) at the final output rate.
 RING_A_WORDS = 64
-
-NOT_A_RETURN = "return without followed call"
 
 VOICE_ACTIVATED_REASON = (
     "No SHARC-side code path from a received DSPI2 frame to a voice "
@@ -173,10 +201,21 @@ def replay(
     capture_path: str,
     *,
     n_frames: int | None = None,
-    poke_candidates: bool = True,
+    poke_candidates: bool = False,
     command: int = 3,
     ring_flag: int = 0,
+    tone_freq: float = 1000.0,
+    sample_len: int = 4096,
 ) -> dict:
+    """Replay CAPTURE_PATH's DSPI2 frames from a `run_init()` state, one
+    voice set up with a `tone_freq` Hz sine (`sharc_harness.SOURCE_SAMPLE_RATE`
+    -- matching `sharc_harness.render_frames()`'s own CLI convention) so the
+    voice actually has audible input, not the all-zero (unwritten,
+    `explicit_memory_model`) PCM an earlier version of this function left at
+    `sample_base`. `poke_candidates` defaults to False now that `RX_BASE` is
+    the confirmed transport (see the module docstring); the two stale
+    candidates stay available for an explicit diagnostic comparison.
+    """
     cap = sharc_capture.load(capture_path)
     frames = cap.dspi2_frames if n_frames is None else cap.dspi2_frames[:n_frames]
 
@@ -193,41 +232,53 @@ def replay(
 
     runner = h.new_runner(memory, image, init=init)
     state = runner.state
-    h.setup_voice(state, image, voice=0, sample_len=4096)
+    sample_base = 0x310000
+    tone = [
+        math.sin(2 * math.pi * (tone_freq / h.SOURCE_SAMPLE_RATE) * i)
+        for i in range(sample_len)
+    ]
+    h._write_samples(state, sample_base, tone, "int16")
+    h.setup_voice(state, image, voice=0, sample_len=sample_len, sample_base=sample_base)
     h.setup_frame(state, image, command=command, ring_flag=ring_flag)
 
     per_frame = []
     ring_a_blocks = []
     first_stop = None
+    other_voices_active: dict[int, int] = {}
 
     for idx, frame in enumerate(frames):
         info = describe_frame(frame.tx)
         info["index"] = idx
         info["instr_count"] = frame.instr_count
 
+        _write_bytes(state, RX_BASE, frame.tx)
         if poke_candidates:
             for addr in CANDIDATE_RX_BUFFERS.values():
                 _write_bytes(state, addr, frame.tx)
 
-        runner, result = h.call_frame(runner, image, patch_table=h.FRAME_PATCH_TABLE)
+        runner, result = h.call_frame_collect_all(
+            runner, image, patch_table=h.FRAME_PATCH_TABLE
+        )
         state = runner.state
         ring_a_blocks.append(_read_ring_a(state, image))
+        other_voices_active.update(h.scan_voice_active(state, image, exclude=(0,)))
 
-        halt = result.halt
+        terminal = result.terminal
         info["handler"] = (
             "block_handler -> command_dispatch_fn -> cmd_handler_%d" % command
         )
-        info["stop_reason"] = halt.reason
-        info["stop_pc"] = "%#x" % halt.pc_sw
+        info["stops"] = ["%s@%#x" % (s.category, s.pc) for s in result.stops]
+        info["stop_reason"] = terminal.category
+        info["stop_pc"] = "%#x" % terminal.pc
         info["instructions"] = result.instructions
         per_frame.append(info)
 
-        if first_stop is None and halt.reason != NOT_A_RETURN:
+        if first_stop is None and terminal.category != "frame-returned":
             first_stop = {
                 "frame": idx,
-                "pc": "%#x" % halt.pc_sw,
-                "reason": halt.reason,
-                "form": halt.form,
+                "pc": "%#x" % terminal.pc,
+                "category": terminal.category,
+                "form": terminal.form,
                 "instructions": result.instructions,
             }
 
@@ -238,10 +289,13 @@ def replay(
         "source_sha256": cap.source_sha256,
         "frames_in_capture": len(cap.dspi2_frames),
         "frames_replayed": len(frames),
+        "rx_base": "%#x" % RX_BASE,
         "candidate_rx_buffers": {k: "%#x" % v for k, v in CANDIDATE_RX_BUFFERS.items()},
         "poked_candidates": poke_candidates,
+        "tone_freq_hz": tone_freq,
         "voice_activated_by_firmware": False,
         "voice_activated_by_firmware_reason": VOICE_ACTIVATED_REASON,
+        "other_voices_active_by_firmware": other_voices_active,
         "per_frame": per_frame,
         "first_stop": first_stop,
         "ring_a_mono": _mono(ring_a_blocks),
@@ -256,9 +310,23 @@ def parse_args(argv=None):
     p.add_argument("--out", help="write ring A (L+R averaged) as a mono WAV")
     p.add_argument("--report", help="write the full replay report as JSON")
     p.add_argument(
-        "--no-candidates",
+        "--freq",
+        type=float,
+        default=1000.0,
+        help="the hand-set-up voice's own sine source frequency, in Hz, at "
+        "sharc_harness.SOURCE_SAMPLE_RATE (default 1000 Hz)",
+    )
+    p.add_argument(
+        "--sample-len",
+        type=int,
+        default=4096,
+        help="the hand-set-up voice's source buffer length, in samples",
+    )
+    p.add_argument(
+        "--poke-candidates",
         action="store_true",
-        help="skip poking the two candidate RX buffers (see the module docstring)",
+        help="also poke the two stale candidate RX buffers (see the module "
+        "docstring) alongside the confirmed RX_BASE -- diagnostic only",
     )
     return p.parse_args(argv)
 
@@ -269,7 +337,9 @@ def main(argv=None) -> int:
         args.image,
         args.capture,
         n_frames=args.frames,
-        poke_candidates=not args.no_candidates,
+        poke_candidates=args.poke_candidates,
+        tone_freq=args.freq,
+        sample_len=args.sample_len,
     )
     if args.out and "ring_a_mono" in result:
         h.write_wav(args.out, result["ring_a_mono"], sample_rate=48000)
@@ -277,12 +347,13 @@ def main(argv=None) -> int:
         with open(args.report, "w") as fh:
             json.dump(result, fh, indent=1)
     print(
-        "%s: %d/%d frame(s) replayed, first_stop=%s"
+        "%s: %d/%d frame(s) replayed, first_stop=%s, other_voices_active=%s"
         % (
             args.capture,
             result.get("frames_replayed", 0),
             result.get("frames_in_capture", 0),
             result.get("first_stop"),
+            result.get("other_voices_active_by_firmware"),
         )
     )
     return 0 if "error" not in result else 1

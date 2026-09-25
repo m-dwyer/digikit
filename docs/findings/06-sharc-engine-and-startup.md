@@ -3553,6 +3553,71 @@ second agent. By execution, the value selects which code path clears ACTIVE
 (the `0x1c5008` look-ahead vs the `0x1c50fe` in-loop path) but did not
 change the outcome with generous bounds.
 
+**[C] Post-`run_init()`, `DM(0x252d3c)` reads 0, not 32.** The `[D]` note
+above only read `0x1c1643`'s own write statically. A write-watchpoint over
+the whole `run_init()` run (`tools/sharc_harness.run_init()`, `FUN_1c15e3`
+to its own return) shows `0x1c1643` write 32, then, later in the *same*
+run, a second write resets it to 0: `pc=0x1cb33a`, inside `FUN_1cb336`
+(`I4=R4; I12=0; DM(I4,M6)=I12; RETURN` -- a generic "zero one DM cell at the
+address its caller passes in R4" leaf, six call sites total, none named
+after this cell specifically), reached from somewhere in `FUN_1c15e3`'s own
+call tree with `R4=0x252d3c`. So a `run_init()` Runner's `DM(0x252d3c)`
+concretely reads 0, and every render this harness drives from that state
+(`render_frames()`/`sharc_replay.py`) sees 0 here, not the literal 32 the
+`0x1c1643` write alone suggests.
+
+**[V] The same `R15` also gates `FUN_1c642a`'s own per-track accumulate
+block.** A few hundred instructions after the `0x1c6501` read above (same
+`R15`, never reassigned in between), `0x1c6b36` computes
+`R0 = comp(R15, R2)` where `R2 = DM(I6-2)` is `FUN_1c642a`'s own
+compile-time-constant 0 local (`sw 0x1c6493`: `DM(I6-2) = R2` with
+`R2 = I4` and `I4 = 0x0` set at the function's own prologue, `sw 0x1c6481`
+-- not per-frame data). `JUMP IF EQ` at `0x1c6b39` skips straight to
+`0x1c6b8d` when `R15 == 0`, bypassing the whole block at
+`0x1c6b3c`-`0x1c6b8a` -- a `DO 32` loop over `btst(R15, R8)` per voice/track
+index `R8` and `R12 = lshift(R15, -1)` as a per-iteration count, storing
+through `I2 = modify(I1, M6)` when taken. Confirmed by execution
+(`tools/sharc_harness.call_frame()` + `setup_voice()`/`setup_frame()` from a
+`run_init()` state, one voice hand-set ACTIVE with real sample data, a
+write-watchpoint over `0x252df8`-`0x253df8` -- the "Master stage" per-track
+buffer, `0x252df8 + t*0x100`): with `DM(0x252d3c) == 0` (the post-init
+value above), every write into that whole 0x1000-byte range comes from
+`FUN_1c14e7` alone (its own documented zero-clear pass, already-zero
+values), never from `FUN_1c642a` -- i.e. **from a `run_init()` state, no
+voice's rendered output ever reaches a track buffer, regardless of that
+voice's own ACTIVE/sample fields**, because this shared-context word reads
+0. This is the mix gate: with it 0, `blk93@0x1c207b`'s master-mix sum
+(`0x25f180`/`0x25f200`) still runs every frame (confirmed by the same
+watchpoint technique: many writes, pc's inside `0x1c207b`-`0x1c238a`) but
+sums 16 already-zero track buffers, so the mix and both DAC rings stay
+zero -- not because the master stage itself is broken, but because nothing
+upstream of it ever wrote a track buffer.
+
+**[O] This cell's real post-boot value/timing, and the accumulate loop's
+own bit/count convention, are still open.** Forcing `DM(0x252d3c)` to 32
+(matching the `0x1c1643` literal) unblocks the `0x1c6b39` skip but hits a
+new, previously-unseen stop inside `FUN_1c4ecf`'s own R12-doubling
+zero-fill path for the other (inactive) voices ("nonconcrete Type12a UREG
+loop count" at `0x1c4f42`) -- the doubled value feeds a DO loop trip count
+there for every voice whose word+0/ACTIVE takes the zero-fill branch, and a
+value this harness never exercised at that pc before now makes it
+non-concrete. Forcing it to 1 instead (treating it as a per-voice/track
+bitmask, since `0x1c6b49`'s `btst(R15, R8)` clearly tests it bit-by-bit per
+loop iteration `R8`) avoids that stop but still produces zero track-buffer
+writes -- `R12 = lshift(R15, -1)` and the per-iteration `comp(R12, R8)`/
+`dec(R12)` chain around `0x1c6b5b`-`0x1c6b81` look like a population-count-
+style "how many bits are set" quantity, not a plain shift, so `R15=1` may
+not be the right encoding for "voice/track 0 alone is enabled" either.
+Getting a real signal into the master mix from a `run_init()` state needs
+either this cell's real value (not found: no writer other than the two
+above is reached from `run_init()`'s own call graph) or a correctly-encoded
+override for both the gate compare and the loop's own per-iteration
+convention -- reported here rather than guessed further. A register-only
+override at the `0x1c6b36` compare alone (`R15` forced non-zero only at
+that one pc, not in memory) is the least invasive way to reach the
+accumulate block without perturbing `FUN_1c4ecf`'s unrelated zero-fill
+path, but by itself is not sufficient (see above).
+
 **Wrap copies +0x1bc [D].** The wrap stores `DM(I1-3) = R2` (`0x1c50fe`,
 forward) and `DM(I2-3) = R2` (`0x1c5325`, reverse) are Type4d byte stores to
 +0x1b8. `R2` comes from the Type3d load at `0x1c50fb`/`0x1c5322`
