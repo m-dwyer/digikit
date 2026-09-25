@@ -3618,6 +3618,82 @@ that one pc, not in memory) is the least invasive way to reach the
 accumulate block without perturbing `FUN_1c4ecf`'s unrelated zero-fill
 path, but by itself is not sufficient (see above).
 
+**[O] A whole-image writer/reader scan (not just run_init()'s own reach)
+finds one more writer and two more readers of `DM(0x252d3c)` (lane A2,
+2026-09-25, `tools/sharc.py`'s `writers()`/`readers()`).** A store at
+`0x1cdc23` (`DM(I3, M6) = R11`, I3 = the passed-in `0x252d3c` pointer)
+inside `FUN_1cdbb2` (`0x1cdbb2`-`0x1cdcab`, an IIR/all-pole recursion not
+otherwise characterized here) -- reached only dynamically, through
+`FUN_1c642a`'s own out-of-line dispatch `FUN_1c71ec` and two nested jump
+tables (`0x8055c840` -> `0x8055c858` -> `0x8055c874`, whose index 1 selects
+`FUN_1cdbb2` -- see "`FUN_1c71ec` [C][V]" above), for whatever per-track
+"slot type" selects that stage. `img.callers()` reports none for
+`FUN_1cdbb2` (an indirect-call gap, per this repo's CLAUDE.md, not evidence
+of dead code). Every capture this project has (idle and play) reads every
+track's own machine-type/selector fields as 0 (see the "ColdFire captures"
+note above this section), so this path was never exercised by execution,
+and this lane could not reach it from a synthetic frame either. Two
+previously-undocumented readers: `0xb82696` (`FUN_b82680`, block 69) and
+`0xb82d54` (`FUN_b82d41`, the thin wrapper `0x1c207b` calls as
+`0xb82d41 -> 0xb82cba`, this section's own "dynamics [D]" stage --
+confirmed by disassembly: `R0 = DM(I4, M5)` at `0xb82d54`, I4 = the
+caller's R12 = the same `0x252d3c` pointer, pushed as one of `FUN_b82cba`'s
+own stack arguments). So this cell feeds the dynamics/compressor stage as
+well as the accumulate gate. Lane A2's own experiment (patching only the
+`0xb82d54` read to 1, leaving the accumulate gate's own read at `0x1c6501`
+untouched at 0) desynced the call stack ("return target 0x1 differs from
+recorded return 0x1c7725") -- `FUN_b82cba` branches on this input in a way
+this lane did not characterize further; not adopted.
+
+**[O][C] Lane A2 also corrects one specific claim about the accumulate
+loop's own `R8`.** A concrete, register-level single-step of
+`0x1c6b3c`-`0x1c6b8a` (patched so `DM(0x252d3c)` reads 1, avoiding the
+skip) shows `R8` -- described above as "per voice/track index R8" -- held
+at the SAME constant (0) for all 32 hardware DO-loop iterations; nothing in
+the loop body increments it. The per-iteration axis is instead `I4`, which
+walks the 32-entry workspace *pointer table* at `0x24ef2c` (matching this
+section's own "`I5 = DM(I6-4) + 0xdc64 = 0x24ef2c`" workspace
+confirmation), and the writes this lane observed through it land in
+per-voice SDRAM addresses (e.g. `0x8045b3c0` for voice 0 -- the same
+`0x8045....` range as the documented voice sample pointer), not in
+`0x252df8 + t*0x100` (the master-stage per-track buffer this section's
+"Confirmed by execution" paragraph above names). This may mean the loop
+walks *voices*, writing each one's own decimator-state scratch (record
+`+0x104`'s target), rather than the master-stage per-track sum -- or it may
+mean `DM(0x252d3c)=1` takes a different path through the loop than whatever
+value the original confirmatory run used. Needs a second agent's check
+against the image bytes before correcting the "Confirmed by execution"
+paragraph above; reported here, not adopted.
+
+**Downstream path confirmed working, given real per-track input
+(lane A2).** Bypassing the unresolved accumulate stage entirely --
+injecting a voice's own already-firmware-rendered decimated output
+(FIELD_WORK_BUFFER, populated every frame by the firmware's own
+`FUN_1c4ecf`/`FUN_1c4f81` call regardless of the mix gate) directly into
+one track's `0x252df8 + t*0x100` input, immediately before `FUN_1c2b24`'s
+own `CALL 0x1c207b` (`0x1c3099`) -- reaches a genuine non-zero
+`0x25f180`/`0x25f200` master mix and non-zero ring A output the same
+frame, with no other perturbation: `0x1c207b`'s own per-track sum, bus
+routing, dynamics call and gain stage, and `0x1c74a1`'s Q31 ring-A
+conversion, all run unmodified and correctly propagate real content once
+they have it. `tools/sharc_harness.py`'s `inject_track_buffer()`/
+`render_frames_to_ring_a()` implement this (see their own docstrings for
+the full evidence and the "Master stage" call-site citation). **[O]** A
+single continuous multi-frame render (one Runner, not re-initialized per
+frame) loses this signal after exactly one frame -- master mix and ring A
+both read back all-zero from frame 1 onward even though the injected track
+buffer itself still carries real content -- while `FUN_1c14e7`'s own
+end-of-frame zero-clear of the track buffers is confirmed (by watchpoint)
+to run *after* `0x1c207b`, not before, ruling out a simple ordering bug.
+Lane A2's own leading hypothesis, not confirmed: `FUN_b82cba`'s dynamics
+envelope, fed `DM(0x252d3c)=0` every frame (see above), computes a
+gain-reduction state on the first frame's real transient that never
+recovers. `render_frames_to_ring_a()` works around this by rendering every
+frame independently from a fresh `run_init()` clone (see that function's
+own docstring) rather than resolving it -- audible as a per-frame
+declick/attenuation artifact (measured `power_ratio` well below a clean
+tone's), not a fix.
+
 **Wrap copies +0x1bc [D].** The wrap stores `DM(I1-3) = R2` (`0x1c50fe`,
 forward) and `DM(I2-3) = R2` (`0x1c5325`, reverse) are Type4d byte stores to
 +0x1b8. `R2` comes from the Type3d load at `0x1c50fb`/`0x1c5322`

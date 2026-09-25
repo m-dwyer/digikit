@@ -1170,6 +1170,362 @@ def read_ring_a(memory, image: str, runner: sr.Runner, count: int = 64) -> dict:
     }
 
 
+# --- Voice -> track -> master mix -> ring A (lane A2, 2026-09-25) ---------
+#
+# render_frames()/call_frame() above reach a genuine RETURN (FRAME_MILESTONE)
+# from a run_init() state with one voice set up, but the master mix
+# (0x25f180) and both DAC rings stay zero: docs/findings/06's "the mix
+# gate" -- FUN_1c642a's own per-track accumulate block (0x1c6b3c-0x1c6b8a)
+# is skipped whenever the "shared context" word DM(0x252d3c) reads 0, which
+# it does from any run_init() state (init writes the literal 32 at
+# 0x1c1643, then FUN_1cb336 resets it to 0 later in the same init run,
+# before FUN_1c15e3 returns -- confirmed by execution, see that function's
+# own docstring).
+#
+# **This lane's own whole-image writer/reader scan (tools/sharc.py's
+# writers()/readers(), not just run_init()'s own reach) finds one more
+# writer and two more readers of DM(0x252d3c), none reported before:**
+#
+#   - A writer at 0x1cdc23 (``DM(I3, M6) = R11``, I3 = the passed-in
+#     0x252d3c pointer), inside FUN_1cdbb2 (0x1cdbb2-0x1cdcab) -- an
+#     IIR/all-pole recursion this lane did not fully characterize. It is
+#     reached only dynamically, through FUN_1c642a's own out-of-line
+#     dispatch FUN_1c71ec and two nested jump tables (0x8055c840 ->
+#     0x8055c858 -> 0x8055c874, whose index 1 selects FUN_1cdbb2 --
+#     docs/findings/06's "Table 0x8055c874 picks one stage per slot type"),
+#     for whatever per-track "slot type" selects that stage -- which is why
+#     ``img.callers()`` reports none (a real indirect-call gap, not
+#     evidence this path is dead: see this repo's CLAUDE.md). Every capture
+#     this project has (idle and play) reads every track's own machine
+#     type/selector fields as 0, so this path was never exercised by
+#     execution here, and this lane could not reach it from a synthetic
+#     frame either (see the report). Reported as [O], not adopted.
+#   - Two readers, previously undocumented: 0xb82696 (FUN_b82680, an
+#     "orchestrator/dispatcher" in the same block group as the dynamics
+#     stage) and 0xb82d54 (FUN_b82d41, the thin wrapper `0x1c207b` calls
+#     as `0xb82d41 -> 0xb82cba`, docs/findings/06's "dynamics [D]" stage --
+#     confirmed by disassembly: ``R0 = DM(I4, M5)`` at 0xb82d54, I4 = the
+#     caller's R12 = the same 0x252d3c pointer, pushed as one of
+#     FUN_b82cba's own stack arguments). So this word is not read only by
+#     FUN_1c642a's accumulate gate: the dynamics/compressor stage consumes
+#     it too. This lane's own experiment (see the report) is consistent
+#     with FUN_b82cba's envelope math going degenerate when this input is
+#     0 -- a hand-set-nonzero gate reached a NEW, unresolved fork
+#     (FUN_b8037f, blk69) instead of restoring multi-frame signal, so this
+#     is reported as a plausible explanation, not a fix.
+#
+# **This lane's own execution trace also corrects one specific claim in
+# docs/findings/06's own "[V]" description of the accumulate loop.** A
+# concrete, register-level single-step of 0x1c6b3c-0x1c6b8a (patched so
+# DM(0x252d3c) reads 1, avoiding the skip) shows R8 -- the operand
+# docs/findings/06 calls "per voice/track index R8" -- staying the SAME
+# constant (0) for all 32 hardware DO-loop iterations; nothing in the loop
+# body ever increments it. The per-iteration axis is instead I4, which
+# walks a 32-entry workspace *pointer table* at 0x24ef2c (matching
+# docs/findings/06's own "I5 = DM(I6-4) + 0xdc64 = 0x24ef2c" workspace
+# confirmation), and the writes this lane observed through it land in
+# per-voice SDRAM addresses (e.g. 0x8045b3c0 for voice 0 -- in the same
+# 0x8045.... range as the documented voice sample pointer), not in
+# 0x252df8 + t*0x100 (the master-stage per-track buffer). This needs a
+# second agent's check before correcting docs/findings/06 -- it may mean
+# the loop is walking *voices*, writing each one's own decimator-state
+# scratch (record +0x104's target), rather than the master-stage per-track
+# sum this lane initially assumed from the doc's own framing; reported
+# here, not adopted as a doc correction, since this lane's own DM(0x252d3c)
+# value (1) may not be the real one the doc's own confirmatory run used.
+#
+# **Given the above, this lane could not establish a real runtime path
+# that sets DM(0x252d3c) to a value that both (a) avoids a new fork and
+# (b) makes FUN_1c642a's own accumulate loop deposit a voice's decimated
+# output at 0x252df8 + t*0x100.** Per this lane's own task brief ("record
+# any remaining hand-set value in FRAME_PATCH_TABLE / a documented setup
+# function with its evidence"), the functions below instead inject a
+# voice's own ALREADY-FIRMWARE-RENDERED decimated buffer (FIELD_WORK_BUFFER,
+# populated every frame by the firmware's own FUN_1c4ecf/FUN_1c4f81 call
+# inside FUN_1c642a's per-voice dispatch loop -- this part needs no hand-
+# set value at all) directly into one track's master-mix input, bypassing
+# only the not-yet-resolved accumulate stage -- confirming, by execution,
+# that the DOWNSTREAM path (track buffer -> master stage 0x1c207b -> ring
+# A) is intact and unconditional once that one buffer has real content.
+
+# docs/findings/06's "Master stage": `0x1c207b` sums 16 tracks at
+# `0x252df8 + t*0x100` bytes each (32 L floats then 32 R floats, plain
+# IEEE float32 words -- the same format `read_master_mix()` already reads
+# back at `0x25f180`).
+TRACK_MIX_BASE = 0x252DF8
+TRACK_MIX_STRIDE = 0x100
+TRACK_MIX_CHANNEL_WORDS = 32
+
+# The call site `CALL 0x1c207b` inside `FUN_1c2b24` (render_frame): disasm
+# `0x1c3099 CALL (linked, delayed) target=0x1c207b`, immediately after
+# `CALL 0x1c642a` (`0x1c3083`, the per-voice/accumulate stage) and
+# `CALL 0x1c18a6` (`0x1c3090`), and *before* `CALL 0x1c14e7` (`0x1c30a0`,
+# the end-of-frame zero-clear of the same 0x252df8 range -- confirmed by
+# execution to run *after* this point, so a poke placed here survives into
+# this frame's own master-stage read and is only cleared in preparation
+# for the *next* frame, the same way a real accumulate would be). Not a
+# resolved symbol in tools/sharc_symbols.py's Profile (this call site, not
+# a function entry), so kept as a literal here like the voice record
+# offsets above.
+MASTER_STAGE_CALL_PC = 0x1C3099
+
+
+def track_mix_address(track: int, *, channel: str = "L") -> int:
+    """The DM address of TRACK's own 32-word L or R half of the master
+    stage's per-track input buffer (see TRACK_MIX_BASE's docstring)."""
+    if channel not in ("L", "R"):
+        raise ValueError("channel must be 'L' or 'R', got %r" % (channel,))
+    base = TRACK_MIX_BASE + track * TRACK_MIX_STRIDE
+    return base if channel == "L" else base + TRACK_MIX_CHANNEL_WORDS * 4
+
+
+def _float_to_word(value: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def inject_track_buffer(state, record: int, *, track: int = 0) -> list[float]:
+    """Read RECORD's own work buffer (FIELD_WORK_BUFFER, 64 floats -- this
+    frame's real interpolated render, already produced by the firmware's
+    own per-voice dispatch call, whether or not FUN_1c642a's own
+    accumulate stage ever sums it into a track buffer -- see this
+    section's own module note), decimate it exactly the way `decimate()`
+    does, and write the 32-sample result as float32 words into both the L
+    and R halves of TRACK's master-stage input buffer
+    (`track_mix_address()`). Mono only (both channels get the same
+    samples) -- there is no evidence yet for a real per-channel pan value
+    to set instead. Returns the 32 decimated floats written, for a caller
+    to inspect or assemble into a WAV alongside ring A."""
+    work = []
+    for i in range(64):
+        raw = st._dm_read(state, record + FIELD_WORK_BUFFER + i * 4, 4)
+        work.append(
+            struct.unpack("<f", struct.pack("<I", raw.value & 0xFFFFFFFF))[0]
+            if raw is not None
+            else 0.0
+        )
+    decimated = decimate(work)
+    for i, value in enumerate(decimated):
+        word = _float_to_word(value)
+        _poke(state, track_mix_address(track, channel="L") + i * 4, word)
+        _poke(state, track_mix_address(track, channel="R") + i * 4, word)
+    return decimated
+
+
+def call_frame_with_track_injection(
+    runner: sr.Runner,
+    image: str,
+    record: int,
+    *,
+    track: int = 0,
+    patch_table: sv.PatchTable | None = FRAME_PATCH_TABLE,
+    max_steps: int = 4_000_000,
+) -> tuple[sr.Runner, sr.RunResult, list[float]]:
+    """Like `call_frame()`, but calls `inject_track_buffer()` the instant
+    `MASTER_STAGE_CALL_PC` is about to execute -- see this section's own
+    module note for why (the accumulate stage's real enable value is not
+    established). Steps one instruction at a time (not
+    `sharc_survey.run_with_patches()`/`run_collect_all()`) applying
+    `patch_table` the same way `call_frame()` does; a fork this halts on is
+    a genuinely new, unresolved gap (report it, do not add a guess here),
+    not something to drive through with a default branch pick, since this
+    function's whole point is to observe the master stage's own,
+    unperturbed behaviour once it has real per-track input.
+
+    Returns `(new_runner, RunResult, injected)` where `injected` is
+    `inject_track_buffer()`'s own 32-float return, or `[]` if
+    `MASTER_STAGE_CALL_PC` was never reached (an earlier stop)."""
+    p = profile(image)
+    new_runner = runner.fresh_call(p.block_handler, diagnose_unknown=True)
+    start_pc_sw = new_runner.state.pc_sw
+    injected: list[float] = []
+    steps = 0
+    halt: sr.Halt | None = None
+    t0 = time.perf_counter()
+    while steps < max_steps:
+        if new_runner.state.pc_sw == MASTER_STAGE_CALL_PC:
+            injected = inject_track_buffer(new_runner.state, record, track=track)
+        if patch_table:
+            sv.apply_patches(new_runner, patch_table)
+        try:
+            new_runner.step()
+        except sr.Halt as exc:
+            halt = exc
+            break
+        steps += 1
+    else:
+        halt = sr.Halt("max-steps", new_runner.state.pc_sw)
+    result = sr.RunResult(
+        halt=halt,
+        instructions=new_runner.instructions,
+        elapsed=time.perf_counter() - t0,
+        form_counts=new_runner.form_counts,
+        start_pc_sw=start_pc_sw,
+        final_pc_sw=new_runner.state.pc_sw,
+        max_call_depth_reached=new_runner.max_call_depth_reached,
+        watch_log=new_runner.watch_log,
+    )
+    return new_runner, result, injected
+
+
+def render_frames_to_ring_a(
+    memory,
+    image: str,
+    *,
+    n_frames: int = 32,
+    voice: int = 0,
+    freq: float = 1000.0,
+    pitch_step: float = 1.0,
+    track: int = 0,
+    sample_format: str = "int16",
+    patch_table: sv.PatchTable | None = FRAME_PATCH_TABLE,
+    max_steps: int = 4_000_000,
+) -> dict:
+    """Render N frames of one voice's own `freq` Hz sine, injecting each
+    frame's real decimated output into `track`'s master-mix input (see
+    `inject_track_buffer()`), and return ring A's own output -- the actual
+    DAC-facing buffer, one stage past the master mix -- concatenated across
+    frames as mono (L+R averaged) floats at the firmware's own decimated
+    output rate (`SOURCE_SAMPLE_RATE / 2` = 48 kHz).
+
+    **One independent post-init render per frame, not N calls on one
+    Runner (this lane, 2026-09-25).** Repeatedly calling `call_frame()`/
+    `call_frame_collect_all()` on the SAME Runner hits two blockers this
+    lane must not fix itself: `sharc_run.State.trace` is never trimmed
+    across calls, so a long run's resident memory grows unbounded (Lane
+    Z2's report: "grew past 8 GB after ~4 minutes" replaying 15 frames this
+    way); and the second call onward hits "unsupported Type14a odd UREG
+    pair" at 0x1c32ad, a genuine `tools/sharc_core` gap lane A1 owns. This
+    project's own rule for exactly this situation ("for multi-frame runs
+    before that lands, run single frames from saved snapshots between
+    frames") is followed here via `new_runner(..., init=init)`'s cheap
+    in-memory clone of one shared `run_init()` result (see that function's
+    own docstring), which is equivalent to a snapshot round-trip but
+    avoids the file I/O: each frame gets its own fresh Runner cloned from
+    the SAME post-init State, so neither the growing trace nor whatever
+    state the Type14a stop needs ever carries forward between frames. This
+    sidesteps both blockers by construction rather than working around
+    them.
+
+    **Phase continuity across frames comes from the source tone, not from
+    carried voice-record state.** Since every frame's voice record starts
+    fresh (`setup_voice()` on a fresh clone, `start=0`), this generates
+    each frame's own short source buffer as a slice of the SAME continuous
+    `freq` Hz tone starting at sample index `frame_index * 64` (64 raw
+    samples/frame at `pitch_step=1` -- the interpolator's own per-block
+    consumption; see `check_correctness()`'s "phase advances by
+    pitch_step*64 per block"), so consecutive frames render consecutive,
+    non-overlapping windows of one continuous tone -- audibly identical to
+    a single long render, without needing the record's own FIELD_PHASE to
+    survive across the Runner resets above.
+
+    Returns `{"ring_a_mono": [...], "per_frame": [...], "any_new_stop":
+    bool}`; `per_frame[i]` is `{"frame", "instructions", "halt",
+    "injected_max_abs", "ring_a_nonzero"}`.
+    """
+    init = run_init(memory, image)
+    if not init.ran:
+        raise ValueError("render_frames_to_ring_a: run_init failed: %s" % init.error)
+
+    raw_per_frame = 64  # FUN_1c4f81's DO-64 loop: 64 raw input samples/block
+    sample_len = _default_sample_len(1, pitch_step)
+    sample_base = 0x310000
+
+    ring_a_mono: list[float] = []
+    per_frame: list[dict] = []
+    for frame_index in range(n_frames):
+        runner = new_runner(memory, image, init=init)
+        state = runner.state
+        start_index = frame_index * int(round(raw_per_frame * pitch_step))
+        tone = [
+            math.sin(2 * math.pi * (freq / SOURCE_SAMPLE_RATE) * (start_index + i))
+            for i in range(sample_len)
+        ]
+        _write_samples(state, sample_base, tone, sample_format)
+        record = setup_voice(
+            state,
+            image,
+            voice,
+            sample_len=sample_len,
+            pitch_step=pitch_step,
+            sample_base=sample_base,
+        )
+        setup_frame(state, image, command=3, ring_flag=0)
+        new_runner_, result, injected = call_frame_with_track_injection(
+            runner,
+            image,
+            record,
+            track=track,
+            patch_table=patch_table,
+            max_steps=max_steps,
+        )
+        ring = read_ring_a(memory, image, new_runner_)
+        floats = ring["float"]
+        mono = [
+            0.5 * ((left or 0.0) + (right or 0.0))
+            for left, right in zip(floats[0::2], floats[1::2], strict=True)
+        ]
+        ring_a_mono.extend(mono)
+        per_frame.append(
+            {
+                "frame": frame_index,
+                "instructions": result.instructions,
+                "halt": result.halt.reason,
+                "injected_max_abs": max((abs(v) for v in injected), default=0.0),
+                "ring_a_nonzero": sum(1 for v in mono if v),
+            }
+        )
+    return {
+        "ring_a_mono": ring_a_mono,
+        "per_frame": per_frame,
+        "any_new_stop": any(
+            f["halt"] != "return without followed call" for f in per_frame
+        ),
+    }
+
+
+def measure_tone(
+    samples: Sequence[float], freq_hz: float, sample_rate: int, *, discard: int = 0
+) -> dict:
+    """This module's own direct-correlation tone measurement (the same
+    technique `tests/test_sharc_harness.py`'s `CliFrequencyTest` uses):
+    correlating SAMPLES against cos/sin at exactly `freq_hz` reconstructs
+    that frequency's power with no spectral leakage regardless of whether
+    the window holds a whole number of cycles (unlike an FFT bin readout),
+    so this works on a short, non-coherently-sampled render.
+
+    Returns `{"freq_hz", "power_ratio" (fundamental / total power, 1.0 =
+    pure tone), "rms_dbfs", "peak_dbfs"}` -- both dBFS figures are relative
+    to `1.0` (this module's own float/Q31 full-scale convention), `-inf`
+    reported as `None` for a silent input."""
+    values = list(samples[discard:])
+    n = len(values)
+    if n == 0:
+        return {
+            "freq_hz": freq_hz,
+            "power_ratio": 0.0,
+            "rms_dbfs": None,
+            "peak_dbfs": None,
+        }
+    mean = sum(values) / n
+    total_power = sum((v - mean) ** 2 for v in values) / n
+    a_cos = sum(
+        values[i] * math.cos(2 * math.pi * freq_hz * i / sample_rate) for i in range(n)
+    ) * (2.0 / n)
+    a_sin = sum(
+        values[i] * math.sin(2 * math.pi * freq_hz * i / sample_rate) for i in range(n)
+    ) * (2.0 / n)
+    amplitude = math.hypot(a_cos, a_sin)
+    fund_power = amplitude * amplitude / 2.0
+    rms = math.sqrt(sum(v * v for v in values) / n)
+    peak = max((abs(v) for v in values), default=0.0)
+    return {
+        "freq_hz": freq_hz,
+        "power_ratio": fund_power / total_power if total_power else 0.0,
+        "rms_dbfs": 20 * math.log10(rms) if rms > 0 else None,
+        "peak_dbfs": 20 * math.log10(peak) if peak > 0 else None,
+    }
+
+
 def flatten(blocks: Sequence[Sequence[float]]) -> list[float]:
     return [sample for block in blocks for sample in block]
 
@@ -1603,10 +1959,88 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=True,
         help="--frame only: run without FRAME_PATCH_TABLE (stop at the first fork)",
     )
+    p.add_argument(
+        "--ring-a",
+        action="store_true",
+        default=False,
+        help="--frame only: render --frames frames of one voice, injecting "
+        "each frame's real decimated output into --track's master-mix "
+        "input (see inject_track_buffer()'s own module note for why this "
+        "is needed, and render_frames_to_ring_a() for the technique), and "
+        "write ring A (the DAC-facing buffer) to --out as a WAV instead of "
+        "reporting the master mix",
+    )
+    p.add_argument(
+        "--track",
+        type=int,
+        default=0,
+        help="--ring-a only: which of the 16 master-mix track inputs to "
+        "inject the voice's rendered output into",
+    )
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
 
     memory = load_image_memory(a.image)
+
+    if a.frame and a.ring_a:
+        result = render_frames_to_ring_a(
+            memory,
+            a.image,
+            n_frames=a.frames,
+            voice=a.voice,
+            freq=a.freq,
+            pitch_step=a.pitch_step,
+            track=a.track,
+            patch_table=FRAME_PATCH_TABLE if a.frame_patches else None,
+        )
+        sample_rate = int(SOURCE_SAMPLE_RATE // 2)
+        output_frequency_hz = a.freq * a.pitch_step
+        # Discard the first frame's worth of decimated samples: this
+        # lane's own experiments (see the report) found the master stage's
+        # own gain/declick ramp attenuates the very first frame or two
+        # before a steady level settles, so measuring frequency/level from
+        # frame 0 alone would be measuring the ramp, not the tone.
+        measurement = measure_tone(
+            result["ring_a_mono"], output_frequency_hz, sample_rate, discard=32
+        )
+        if a.out:
+            write_wav(a.out, result["ring_a_mono"], sample_rate=sample_rate)
+        report = {
+            "image": a.image,
+            "voice": a.voice,
+            "track": a.track,
+            "frames": a.frames,
+            "freq_hz": a.freq,
+            "output_frequency_hz": output_frequency_hz,
+            "any_new_stop": result["any_new_stop"],
+            "per_frame": result["per_frame"],
+            "measurement": measurement,
+            "out": a.out,
+        }
+        if a.json:
+            print(json.dumps(report, indent=2, default=str))
+        else:
+            print(
+                "image: %s  voice: %d  track: %d  frames: %d  output: %.2f Hz"
+                % (a.image, a.voice, a.track, a.frames, output_frequency_hz)
+            )
+            print("any_new_stop:", result["any_new_stop"])
+            print(
+                "measured: freq=%.2f Hz power_ratio=%.4f rms_dbfs=%s peak_dbfs=%s"
+                % (
+                    measurement["freq_hz"],
+                    measurement["power_ratio"],
+                    "%.2f" % measurement["rms_dbfs"]
+                    if measurement["rms_dbfs"] is not None
+                    else "-inf",
+                    "%.2f" % measurement["peak_dbfs"]
+                    if measurement["peak_dbfs"] is not None
+                    else "-inf",
+                )
+            )
+            if a.out:
+                print("wrote", a.out)
+        return 0
 
     if a.frame:
         frame_sample_len = a.sample_len if a.sample_len is not None else 4096

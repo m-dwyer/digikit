@@ -8,6 +8,7 @@ real DT2 1.16 SHARC+ image bytes (out/sections/dt2-1.16/section_7_BLOB.bin
 the same convention tests/test_sharc_contract.py uses.
 """
 
+import hashlib
 import math
 import os
 import pathlib
@@ -787,6 +788,54 @@ class FrameRenderFromInitTest(unittest.TestCase):
         self.assertEqual(halt.reason, h.FRAME_MILESTONE["reason"])
         self.assertEqual(halt.pc_sw, h.FRAME_MILESTONE["pc_sw"])
         self.assertEqual(results[0].instructions, h.FRAME_MILESTONE["instructions"])
+
+
+@pytest.mark.slow
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+class RingAMilestoneTest(unittest.TestCase):
+    """render_frames_to_ring_a()'s own milestone (lane A2, 2026-09-25): the
+    first real, non-silent ring A output this project has produced from a
+    synthetic voice, pinned the same way FRAME_MILESTONE/ReplayIdleCaptureTest
+    pin theirs. This is signal reached by INJECTING a voice's own
+    already-firmware-rendered decimated buffer into one track's master-mix
+    input (see inject_track_buffer()'s module note for why: the real
+    per-track accumulate gate, DM(0x252d3c), has no known runtime writer
+    that both avoids a new stop and produces this write the ordinary way),
+    not evidence that the whole per-track accumulate path is understood --
+    a fix to the mix gate (or to why signal only survives one frame per
+    independent post-init render -- see this module's own module-level
+    note and the lane's report) changes this pin, and the commit that does
+    so should say why, exactly like FRAME_MILESTONE's own docstring asks.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.memory = h.load_image_memory("dt2-1.16")
+
+    def test_four_frame_ring_a_milestone(self):
+        result = h.render_frames_to_ring_a(
+            self.memory, "dt2-1.16", n_frames=4, freq=1000.0
+        )
+        self.assertFalse(result["any_new_stop"])
+        for frame in result["per_frame"]:
+            self.assertEqual(frame["halt"], "return without followed call")
+            self.assertGreater(frame["injected_max_abs"], 0.0)
+
+        ring = result["ring_a_mono"]
+        self.assertEqual(len(ring), 4 * 32)
+        # Real, non-silent signal reached ring A (the DAC-facing buffer) --
+        # this is the core claim this milestone pins.
+        self.assertGreater(max(abs(v) for v in ring), 0.0)
+
+        # Deterministic output: pin it, rounded to 6 decimal places (float
+        # repr noise only) by hash, the same convention
+        # tests/test_sharc_golden.py uses for its own outputs.
+        rounded = [round(v, 6) for v in ring]
+        digest = hashlib.sha256(repr(rounded).encode()).hexdigest()
+        self.assertEqual(
+            digest,
+            "f37e04725c3c392ca85c15be7737ed234ecebce52655c68ac940e9a36b5e52b3",
+        )
 
 
 @unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
