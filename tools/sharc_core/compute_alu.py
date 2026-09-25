@@ -9,6 +9,8 @@ branch's own PRM/PGR citation.
 
 from __future__ import annotations
 
+import math
+import struct
 from collections.abc import Callable, Mapping
 
 from .encoding import (
@@ -39,6 +41,7 @@ from .floats import (
     _approx_recips,
     _fixed_to_float,
     _fixed_to_float_scaled,
+    _float32_bits,
     _float_binary,
     _float_clip,
     _float_copysign,
@@ -347,6 +350,27 @@ def alu_float_subtract(
     )
 
 
+# PRM p.19-4 ("FN = (FX + FY) / 2;", opcode 1000 1001): "Adds the
+# floating-point operands in registers Fx and Fy and divides the result by
+# 2, by decrementing the exponent of the sum before rounding." Its own
+# ASTATx/y Flags table (p.19-4/19-5) differs from plain float-add's: AI is
+# the same invalid condition (NAN input, or opposite-signed infinities --
+# _float_binary already computes this for the identical add-shaped
+# operation), AN and AZ follow the result the same way every other float
+# ALU op's do, but AV is documented "Cleared" unconditionally rather than
+# tracking overflow the way float-add's AV does.
+def alu_float_average(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
+    value, _overflow, invalid = _float_binary(
+        left, right, "(F%d + F%d) / 2" % (rx, ry), lambda a, b: (a + b) / 2
+    )
+    return (
+        rn,
+        value,
+        "float-average",
+        _astatx_from_updates(_float_alu_updates(value, av=False, ai=invalid)),
+    )
+
+
 # PGR p.11-27 (pgr.txt:21185), opcode 1001 0010: Fn = abs(Fx - Fy).
 # Magnitude (and so AV/AZ) is identical to plain float-subtract above;
 # only the sign bit changes (cleared) and AN is architecturally fixed 0
@@ -640,26 +664,128 @@ def alu_trunc_scaled(rn, rx, ry, left, right, values, special, approx_recips) ->
 
 
 # PRM p.427 / PGR p.11-44/11-45: Fn = recips/rsqrts Fx -- iterative
-# reciprocal/reciprocal-sqrt seed instructions. The seed mantissa comes
-# from an ROM lookup table the public manuals do not print, so this
-# tracer decodes the instruction (unblocking whatever reads its flags or
-# continues past it) without claiming a numeric seed value it cannot
-# verify; AV/AI are genuinely data-dependent here and left unknown too.
+# reciprocal/reciprocal-sqrt seed instructions. The seed *mantissa* comes
+# from an unpublished ROM lookup table, so no numeric value can be claimed
+# for the ordinary (non-special-case) input. But recips's and rsqrts's own
+# ASTATx/y Flags tables (SHARC+ PRM pp.19-16/19-17 for recips,
+# pp.19-17/19-18 for rsqrts -- both quoted in full below) define every flag
+# -- and, for three documented special-case inputs, the exact *result* too
+# -- purely from classifying FX's IEEE-754 bit pattern (sign/exponent/
+# mantissa: NAN, +-zero, +infinity, "negative and nonzero", or "unbiased
+# exponent > +125"). None of that needs the ROM table, so it is claimed
+# unconditionally (not gated behind --approx-recips, which only covers
+# recips's *ordinary-case* seed value -- see floats._approx_recips).
 def _alu_recip_seed_impl(rn, rx, left, name: str, approx_recips: bool) -> tuple:
-    # --approx-recips only covers recips: rsqrts's seed exponent rule
-    # (floor(e/2), PRM p.19-18) couples to the exponent's LSB in a way
-    # that is not a trivial mirror of recips's rule, so it is left
-    # Unknown until that is separately worked out.
-    if name == "recips" and approx_recips:
-        value, updates = _approx_recips(left)
+    label = "%s F%d (ROM seed mantissa not numerically modeled)" % (name, rx)
+    op = "float-" + name + "-seed"
+    if not isinstance(left, Const):
+        if name == "recips" and approx_recips:
+            # --approx-recips is usage-gated, not input-gated (see the
+            # docstring above _alu_recip_seed_impl's caller wiring, and
+            # compute.py's approx_recips_used calibration flag): a
+            # symbolic input still takes the approximated path, it just
+            # cannot resolve to a concrete value.
+            value, updates = _approx_recips(left)
+            return rn, value, "float-recips-seed-approx", _astatx_from_updates(updates)
+        updates = _float_alu_updates(Unknown(label), av=None, ai=None)
+        return rn, Unknown(label), op, _astatx_from_updates(updates)
+    bits = left.value & 0xFFFFFFFF
+    sign = (bits >> 31) & 1
+    biased_exp = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    is_nan = biased_exp == 0xFF and mantissa != 0
+    # PRM p.417-418 (IEEE-754-compatibility bullet, general to every
+    # computational unit; also cited in floats._approx_recips's docstring):
+    # "Denormal operands ... flush to zero when input to a computational
+    # unit." A denormal (biased_exp == 0, mantissa != 0) is therefore
+    # classified with an exact +-zero input, not with "negative nonzero".
+    is_zero = biased_exp == 0
+    is_pos_inf = biased_exp == 0xFF and mantissa == 0 and sign == 0
+    is_neg_nonzero = sign == 1 and not is_zero and not is_nan
+    updates = {AC_BIT: False, AS_BIT: False}
+
+    if name == "rsqrts":
+        # PRM p.19-18 "FN = rsqrts FX" ASTATx/y Flags:
+        #   AI  Set if the input operand is negative and nonzero, or a
+        #       NAN, otherwise cleared
+        #   AN  Set if the input operand is -zero, otherwise cleared
+        #   AV  Set if the input operand is +-zero, otherwise cleared
+        #   AZ  Set if the floating-point result is +zero (Fx = +infinity),
+        #       otherwise cleared
+        # Same page, Function: "The input +-zero returns +-infinity and
+        # sets the overflow flag. The input +infinity returns +zero. A NAN
+        # input or a negative nonzero input returns a result of all 1s."
+        updates[AI_BIT] = is_nan or is_neg_nonzero
+        updates[AN_BIT] = bool(is_zero and sign)
+        updates[AV_BIT] = is_zero
+        if is_nan or is_neg_nonzero:
+            updates[AZ_BIT] = False
+            return rn, Const(0xFFFFFFFF), op, _astatx_from_updates(updates)
+        if is_zero:
+            updates[AZ_BIT] = False
+            result = Const((sign << 31) | (0xFF << 23))
+            return rn, result, op, _astatx_from_updates(updates)
+        if is_pos_inf:
+            updates[AZ_BIT] = True
+            return rn, Const(0), op, _astatx_from_updates(updates)
+        # Ordinary positive finite input: the seed mantissa comes from an
+        # unpublished ROM table, and the manual's own exponent formula
+        # ("the unbiased exponent of Fn = INT[e/2] <?> 1", p.19-18) has a
+        # missing operator glyph between "INT[e/2]" and "1" in the PDF
+        # itself (confirmed against the rendered page image, not just
+        # extracted text -- see out/refs/sharc-plus-prm/png/p0470.png),
+        # so no bit-for-bit reproduction of the documented rule is
+        # possible.
+        # --approx-recips instead approximates the seed the same way
+        # floats._approx_recips does for recips: the true mathematical
+        # reciprocal-square-root's IEEE-754 bit pattern, keeping only the
+        # documented number of accurate mantissa bits (rsqrts is "a 4-bit
+        # accurate seed", half of recips's 8, so the top 4 mantissa bits
+        # are kept and the low 19 zeroed, vs recips's top-8/low-15 split).
+        updates[AZ_BIT] = False
+        if approx_recips:
+            x = struct.unpack("<f", struct.pack("<I", bits))[0]
+            seed_bits, _overflowed = _float32_bits(1.0 / math.sqrt(x))
+            seed_bits &= 0xFFF80000
+            return (
+                rn,
+                Const(seed_bits),
+                "float-rsqrts-seed-approx",
+                _astatx_from_updates(updates),
+            )
+        return rn, Unknown(label), op, _astatx_from_updates(updates)
+
+    # name == "recips": PRM pp.19-16/19-17 "FN = recips FX" ASTATx/y Flags
+    # (also quoted in full in floats._approx_recips's docstring):
+    #   AI  Set if the input operand is a NAN, otherwise cleared
+    #   AN  Set if the input operand is negative, otherwise cleared
+    #   AV  Set if the input operand is +-zero, otherwise cleared
+    #   AZ  Set if the floating-point result is +-zero (unbiased exponent
+    #       of Fx is greater than +125), otherwise cleared
+    updates[AI_BIT] = is_nan
+    updates[AN_BIT] = bool(sign)
+    if is_nan:
+        updates[AV_BIT] = False
+        updates[AZ_BIT] = False
+        return rn, Const(0xFFFFFFFF), op, _astatx_from_updates(updates)
+    if is_zero:
+        updates[AV_BIT] = True
+        updates[AZ_BIT] = False
+        result = Const((sign << 31) | (0xFF << 23))
+        return rn, result, op, _astatx_from_updates(updates)
+    updates[AV_BIT] = False
+    unbiased_exp = biased_exp - 127
+    if unbiased_exp > 125:
+        updates[AZ_BIT] = True
+        return rn, Const(sign << 31), op, _astatx_from_updates(updates)
+    updates[AZ_BIT] = False
+    if approx_recips:
+        # --approx-recips's own classification duplicates the above (kept
+        # separate in floats.py, verified independently); only its
+        # ordinary-case numeric mantissa approximation is used here.
+        value, _ = _approx_recips(left)
         return rn, value, "float-recips-seed-approx", _astatx_from_updates(updates)
-    label = "%s F%d (iterative seed, not numerically modeled)" % (name, rx)
-    return (
-        rn,
-        Unknown(label),
-        "float-" + name + "-seed",
-        _astatx_from_updates(_float_alu_updates(Unknown(label), av=None, ai=None)),
-    )
+    return rn, Unknown(label), op, _astatx_from_updates(updates)
 
 
 def alu_recips_seed(rn, rx, ry, left, right, values, special, approx_recips) -> tuple:
@@ -690,6 +816,7 @@ ALU_OPS: dict[int, Handler] = {
     0x43: alu_not,
     0x81: alu_float_add,
     0x82: alu_float_subtract,
+    0x89: alu_float_average,
     0x92: alu_float_abs_subtract,
     0x8A: alu_float_compare,
     0xA1: alu_float_pass,

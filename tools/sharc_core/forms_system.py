@@ -24,13 +24,14 @@ from .flags import (
 )
 from .sequencer import (
     _advance,
+    _pop_loop_stack,
+    _pop_pc_stack,
 )
 from .state import (
     State,
     _event,
     _json_value,
     _stop,
-    _sync_pc_stack,
     _ureg,
     _ureg_raw,
 )
@@ -224,22 +225,9 @@ def _type_20a(
                 lambda value, mask: value | mask,
             )
     if pop_loop:
-        if state.loops:
-            state.loops.pop()
-        state.uregs[UREG_CODES["CURLCNTR"]] = (
-            Const(state.loops[-1].remaining) if state.loops else Const(0xFFFFFFFF)
-        )
-        if not state.loops:
-            state.uregs[stkyx_code] = _bitwise(
-                _ureg(state.uregs, stkyx_code),
-                Const(1 << 26),
-                "loop stacks empty",
-                lambda value, mask: value | mask,
-            )
+        _pop_loop_stack(state)
     if pop_pc:
-        if state.call_stack:
-            state.call_stack.pop()
-        _sync_pc_stack(state)
+        _pop_pc_stack(state)
     _event(
         state,
         insn,

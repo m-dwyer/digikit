@@ -770,6 +770,23 @@ def _type_3b(
         if error:
             return [_stop(state, insn, error)]
         return _advance(state, insn)
+    if predicate is False:
+        # Matching _type_3a's identical fast path above: a concretely
+        # False predicate must not fork (the missing case here was
+        # forking on every False predicate, even a fully known one,
+        # which a single-path concrete runner cannot resolve).
+        _event(
+            state,
+            insn,
+            "memory-access-skipped",
+            space=space,
+            ureg=UREG_NAMES[ureg],
+            addressing_mode=addressing_mode,
+            access_width=access_width,
+            condition=cond,
+            predicate_assumption=False,
+        )
+        return _advance(state, insn)
     executed, skipped = _copy(state), _copy(state)
     error = access(executed)
     if error:

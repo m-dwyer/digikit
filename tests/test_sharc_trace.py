@@ -1859,11 +1859,37 @@ class TraceTest(unittest.TestCase):
         fields.update(changes)
         return fields
 
-    def test_type9a_abs_rejects_la_and_ci_modifiers(self):
+    def test_type9a_abs_rejects_ci_modifier(self):
+        # PGR p.9-36/PRM p.4-45: (CI) clears the currently-serviced
+        # interrupt's IRPTL/IMASKP bit; this tracer does not track which
+        # interrupt (if any) is active, so there is no sound bit to clear
+        # and this must fail closed rather than guess.
         stopped = self.run_one(
-            T.State(10), insn("9a_abs", self._type9a_abs_fields(a=1), 6)
+            T.State(10), insn("9a_abs", self._type9a_abs_fields(ci=1), 6)
         )
-        self.assertEqual(stopped.stopped, "unsupported Type9a control modifier")
+        self.assertEqual(stopped.stopped, "unsupported Type9a CI modifier")
+
+    def test_type9a_abs_la_pops_loop_and_pc_stacks_once(self):
+        # SHARC+ Core Programming Reference p.4-44 ("Loop Abort"): JUMP
+        # (LA) "pops the PC and loop address stacks" -- "only one pop is
+        # performed" -- when the jump executes. call_stack holds both the
+        # loop's own PC-stack entry (0x13, pushed by the loop setup) and
+        # an unrelated call return address on top (0x99); LA pops each
+        # stack independently and exactly once (Type20a's LPO+PPO do the
+        # same single-level pop, reused here -- see
+        # sequencer._apply_loop_abort).
+        state = T.State(
+            10,
+            {T.UREG_CODES["I12"]: T.Const(0x2000), T.UREG_CODES["M13"]: T.Const(4)},
+            call_stack=[0x13, 0x99],
+            loops=[T.Loop(0x13, 0x20, 2, 1)],
+        )
+        advanced = self.run_one(
+            state, insn("9a_abs", self._type9a_abs_fields(a=1), 6)
+        )
+        self.assertEqual(advanced.pc_sw, 0x2004)
+        self.assertEqual(advanced.loops, [])
+        self.assertEqual(advanced.call_stack, [0x13])
 
     def test_type9a_abs_stops_on_unknown_indirect_target(self):
         stopped = self.run_one(
@@ -1932,6 +1958,7 @@ class TraceTest(unittest.TestCase):
     def test_return_idiom_checks_known_i12_m14_target(self):
         fields = {
             "b": 0,
+            "a": 0,
             "cond[4:0]": 0x1F,
             "pmi[2:2]": 1,
             "pmi[1:0]": 0,
@@ -2713,6 +2740,42 @@ class TraceTest(unittest.TestCase):
             (skipped.uregs[4], skipped.uregs[17]), (T.Const(7), T.Const(0x80))
         )
 
+    def test_type3b_concretely_false_predicate_does_not_fork_or_store(self):
+        # A regression test for a bug this lane fixed: _type_3b forked
+        # into (executed, skipped) states -- attempting the memory access
+        # on one of them -- even when the predicate resolved to a
+        # concrete False, unlike _type_3a's matching fast path. A single-
+        # path concrete runner (tools/sharc_run.py) cannot resolve a
+        # 2-state fork from an already-known-False predicate.
+        astatx_code = T.UREG_CODES["ASTATX"]
+        memory = loader_memory(loader_block(1, 0x80, 4, payload=b"\0" * 4))
+        store = {
+            "u": 0,
+            "i[2:0]": 1,
+            "m[2:0]": 2,
+            "g": 0,
+            "d": 1,
+            "l": 0,
+            "x": 1,
+            "w": 1,
+            "ureg[6:0]": 4,
+            "cond[4:0]": 0x03,  # AC clear -> False, same as test_type3a's
+        }
+        state = T.State(
+            1,
+            {17: T.Const(0x80), 34: T.Const(4), 4: T.Const(7), astatx_code: T.Const(0)},
+            concrete=memory,
+        )
+        results = T._execute(state, insn("3b", store))
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual(result.uregs[17], T.Const(0x80))  # no post-modify
+        self.assertIsNone(T._dm_read(result, 0x80, 4))  # store never ran
+        self.assertEqual(
+            (result.trace[-1]["action"], result.trace[-1]["predicate_assumption"]),
+            ("memory-access-skipped", False),
+        )
+
     def test_type3b_dm_postmodify_and_pm_premodify(self):
         store = {
             "i[2:0]": 1,
@@ -2996,6 +3059,77 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(taken.pending.target, 17)
         self.assertEqual(not_taken.uregs[T.UREG_CODES["R2"]], T.Const(4))
         self.assertIsNone(not_taken.pending)
+
+    def test_type9a_relative_non_delayed_jump_transfers_immediately(self):
+        # A regression test for a bug this lane fixed: 9a_rel used to fail
+        # closed on any non-delayed (j=0) jump, even though 9a_abs/9b_abs
+        # already supported one via _immediate_transfer.
+        branch = insn(
+            "9a_rel",
+            {
+                "b": 0,
+                "a": 0,
+                "cond[4:0]": 31,
+                "j": 0,
+                "e": 0,
+                "ci": 0,
+                "compute[22:16]": 0,
+                "compute[15:0]": 0,
+                "reladdr[5:5]": 0,
+                "reladdr[4:0]": 7,
+            },
+            6,
+        )
+        advanced = self.run_one(T.State(10), branch)
+        self.assertEqual(advanced.pc_sw, 17)
+        self.assertIsNone(advanced.pending)
+
+    def test_type9a_relative_la_pops_loop_and_pc_stacks_once(self):
+        # SHARC+ Core Programming Reference p.4-44 ("Loop Abort"): see the
+        # identical 9a_abs test above for the exact citation.
+        branch = insn(
+            "9a_rel",
+            {
+                "b": 0,
+                "a": 1,
+                "cond[4:0]": 31,
+                "j": 0,
+                "e": 0,
+                "ci": 0,
+                "compute[22:16]": 0,
+                "compute[15:0]": 0,
+                "reladdr[5:5]": 0,
+                "reladdr[4:0]": 7,
+            },
+            6,
+        )
+        state = T.State(
+            10, call_stack=[0x13, 0x99], loops=[T.Loop(0x13, 0x20, 2, 1)]
+        )
+        advanced = self.run_one(state, branch)
+        self.assertEqual(advanced.pc_sw, 17)
+        self.assertEqual(advanced.loops, [])
+        self.assertEqual(advanced.call_stack, [0x13])
+
+    def test_type9a_relative_rejects_ci_modifier(self):
+        branch = insn(
+            "9a_rel",
+            {
+                "b": 0,
+                "a": 0,
+                "cond[4:0]": 31,
+                "j": 1,
+                "e": 0,
+                "ci": 1,
+                "compute[22:16]": 0,
+                "compute[15:0]": 0,
+                "reladdr[5:5]": 0,
+                "reladdr[4:0]": 7,
+            },
+            6,
+        )
+        stopped = self.run_one(T.State(10), branch)
+        self.assertEqual(stopped.stopped, "unsupported Type9a CI modifier")
 
     def test_type2a_not_av_saturate_mrf_preserves_unknown_dependency(self):
         saturate = insn(
@@ -4736,6 +4870,45 @@ class FloatComputeTest(unittest.TestCase):
         self.assertEqual(value, T.Const(0xFFFFFFFF))
         self.assertEqual(T._astatx_known_bit(astatx, T.AI_BIT), True)
 
+    # -- Fn = (Fx + Fy) / 2 (PRM p.19-4, opcode 1000 1001) -------------------
+
+    def test_float_average(self):
+        rn, value, op, astatx = self.astatx_after(
+            full_compute(0, 0x89, 0, 1, 2),
+            {1: T.Const(f32(1.0)), 2: T.Const(f32(2.0))},
+            T.Unknown("start"),
+        )
+        self.assertEqual(op, "float-average")
+        self.assertEqual(value, T.Const(f32(1.5)))
+        self.assertEqual(T._astatx_known_bit(astatx, T.AZ_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.AN_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), False)
+
+    def test_float_average_near_max_stays_finite_and_av_clear(self):
+        # PRM p.19-4/19-5: favg's own ASTATx/y Flags table marks AV
+        # "Cleared" unconditionally -- unlike plain float-add's AV, which
+        # tracks post-rounded overflow. Averaging two already-in-range
+        # float32 values can never itself overflow (the result is always
+        # within the larger operand's magnitude), unlike a plain add, so
+        # this also exercises the near-FLT_MAX case that would overflow
+        # float-add.
+        _, value, _, astatx = self.astatx_after(
+            full_compute(0, 0x89, 0, 1, 2),
+            {1: T.Const(f32(3.4e38)), 2: T.Const(f32(3.4e38))},
+            T.Unknown("start"),
+        )
+        self.assertEqual(value, T.Const(f32(3.4e38)))
+        self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), False)
+
+    def test_float_average_nan_input_returns_all_ones_and_sets_ai(self):
+        _, value, _, astatx = self.astatx_after(
+            full_compute(0, 0x89, 0, 1, 2),
+            {1: T.Const(f32(float("nan"))), 2: T.Const(f32(1.0))},
+            T.Unknown("start"),
+        )
+        self.assertEqual(value, T.Const(0xFFFFFFFF))
+        self.assertEqual(T._astatx_known_bit(astatx, T.AI_BIT), True)
+
     # -- Fn = -Fx / Fn = abs Fx (PGR p.11-30/11-31) --------------------------
 
     def test_float_negate(self):
@@ -5074,6 +5247,12 @@ class FloatComputeTest(unittest.TestCase):
     # -- Fn = recips/rsqrts Fx seeds (PRM p.427, PGR p.11-44/11-45) ---------
 
     def test_recips_rsqrts_decode_without_a_numeric_seed(self):
+        # Neither op's ordinary-case seed *mantissa* is claimed without
+        # --approx-recips (it comes from an unpublished ROM table), but
+        # both ops' own ASTATx/y Flags tables (PRM pp.19-16/19-17 recips,
+        # pp.19-17/19-18 rsqrts) define AV purely from classifying the
+        # input bit pattern, not from the ROM -- so AV is known (clear)
+        # here even though the seed value itself stays Unknown.
         for opcode, name in ((0xC4, "float-recips-seed"), (0xC5, "float-rsqrts-seed")):
             with self.subTest(opcode=hex(opcode)):
                 _, value, op, astatx = self.astatx_after(
@@ -5083,7 +5262,7 @@ class FloatComputeTest(unittest.TestCase):
                 )
                 self.assertEqual(op, name)
                 self.assertIsInstance(value, T.Unknown)
-                self.assertIsNone(T._astatx_known_bit(astatx, T.AV_BIT))
+                self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), False)
 
     # -- --approx-recips: opt-in documented-formula seed approximation ------
 
@@ -5161,10 +5340,108 @@ class FloatComputeTest(unittest.TestCase):
         self.assertEqual(op, "float-recips-seed-approx")
         self.assertIsInstance(value, T.Unknown)
 
-    def test_approx_recips_does_not_extend_to_rsqrts(self):
-        # Decision: rsqrts's seed exponent rule is not a trivial mirror of
-        # recips's, so --approx-recips leaves it exactly as undocumented.
-        _, value, op, _ = self.approx_after(0xC5, T.Const(f32(4.0)))
+    # -- --approx-recips extended to rsqrts's own special cases and its
+    # ordinary-case seed (PRM pp.19-17/19-18, "FN = rsqrts FX") -----------
+    #
+    # The manual's own exponent formula for the ordinary case ("the
+    # unbiased exponent of Fn = INT[e/2] <?> 1") has a missing operator
+    # glyph in the PDF itself (confirmed against the rendered page image,
+    # out/refs/sharc-plus-prm/png/p0470.png, not just extracted text), so
+    # --approx-recips approximates the seed the same way it does for
+    # recips: the true mathematical reciprocal-square-root's IEEE-754 bit
+    # pattern, keeping only the documented number of accurate mantissa
+    # bits (rsqrts: "a 4-bit accurate seed", so the top 4 mantissa bits).
+    # The four special-case inputs (NAN, +-zero, +infinity, negative
+    # nonzero), and every flag, are fully determined by the input's bit
+    # pattern and need no ROM data at all, so they are exact regardless of
+    # --approx-recips.
+
+    def test_approx_rsqrts_ordinary_positive_value_within_documented_accuracy(self):
+        _, value, op, astatx = self.approx_after(0xC5, T.Const(f32(4.0)))
+        self.assertEqual(op, "float-rsqrts-seed-approx")
+        approx = struct.unpack("<f", struct.pack("<I", value.value))[0]
+        # PRM p.19-18: "a 4-bit accurate seed" for 1/sqrt(4) = 0.5.
+        self.assertLess(abs(approx - 0.5) / 0.5, 2**-4)
+        self.assertEqual(T._astatx_known_bit(astatx, T.AN_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.AI_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), False)
+        self.assertEqual(T._astatx_known_bit(astatx, T.AZ_BIT), False)
+
+    def test_rsqrts_ordinary_value_stays_unknown_without_approx(self):
+        _, value, op, astatx = self.astatx_after(
+            full_compute(0, 0xC5, 0, 1, 0),
+            {1: T.Const(f32(4.0))},
+            T.Unknown("start"),
+        )
+        self.assertEqual(op, "float-rsqrts-seed")
+        self.assertIsInstance(value, T.Unknown)
+        self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), False)
+
+    def test_rsqrts_nan_or_negative_nonzero_input_returns_all_ones(self):
+        # PRM p.19-18: "A NAN input or a negative nonzero input returns a
+        # result of all 1s"; AI set for either case, AN only for -zero.
+        for bits in (0x7FC00000, f32(-4.0) & 0xFFFFFFFF):
+            with self.subTest(bits=hex(bits)):
+                _, value, op, astatx = self.astatx_after(
+                    full_compute(0, 0xC5, 0, 1, 0),
+                    {1: T.Const(bits)},
+                    T.Unknown("start"),
+                )
+                self.assertEqual(op, "float-rsqrts-seed")
+                self.assertEqual(value, T.Const(0xFFFFFFFF))
+                self.assertEqual(T._astatx_known_bit(astatx, T.AI_BIT), True)
+                self.assertEqual(T._astatx_known_bit(astatx, T.AN_BIT), False)
+
+    def test_rsqrts_zero_input_returns_signed_infinity_and_sets_av(self):
+        # PRM p.19-18: "The input +-zero returns +-infinity and sets the
+        # overflow flag"; AN set only for -zero.
+        for zero_bits, expected, an in (
+            (0x00000000, 0x7F800000, False),
+            (0x80000000, 0xFF800000, True),
+        ):
+            with self.subTest(zero_bits=hex(zero_bits)):
+                _, value, op, astatx = self.astatx_after(
+                    full_compute(0, 0xC5, 0, 1, 0),
+                    {1: T.Const(zero_bits)},
+                    T.Unknown("start"),
+                )
+                self.assertEqual(op, "float-rsqrts-seed")
+                self.assertEqual(value, T.Const(expected))
+                self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), True)
+                self.assertEqual(T._astatx_known_bit(astatx, T.AN_BIT), an)
+                self.assertEqual(T._astatx_known_bit(astatx, T.AZ_BIT), False)
+
+    def test_rsqrts_denormal_input_is_flushed_to_zero_first(self):
+        # Same general denormal-input rule as recips (PRM p.417-418):
+        # a flushed +denormal takes rsqrts's own +-zero -> +-infinity path,
+        # not the "negative nonzero" all-1s path.
+        _, value, op, astatx = self.astatx_after(
+            full_compute(0, 0xC5, 0, 1, 0),
+            {1: T.Const(0x00000001)},
+            T.Unknown("start"),
+        )
+        self.assertEqual(op, "float-rsqrts-seed")
+        self.assertEqual(value, T.Const(0x7F800000))
+        self.assertEqual(T._astatx_known_bit(astatx, T.AV_BIT), True)
+
+    def test_rsqrts_positive_infinity_input_returns_zero(self):
+        # PRM p.19-18: "The input +infinity returns +zero."
+        _, value, op, astatx = self.astatx_after(
+            full_compute(0, 0xC5, 0, 1, 0),
+            {1: T.Const(0x7F800000)},
+            T.Unknown("start"),
+        )
+        self.assertEqual(op, "float-rsqrts-seed")
+        self.assertEqual(value, T.Const(0))
+        self.assertEqual(T._astatx_known_bit(astatx, T.AZ_BIT), True)
+
+    def test_approx_rsqrts_symbolic_input_stays_unknown(self):
+        # Unlike recips, --approx-recips's usage-gated string is not
+        # extended to a symbolic rsqrts input: rsqrts's ordinary-case
+        # approximation is keyed off a concretely classified input (see
+        # _alu_recip_seed_impl), so a symbolic input takes the generic
+        # not-a-Const branch and reports the plain (non-approx) op name.
+        _, value, op, _ = self.approx_after(0xC5, T.Unknown("uninitialized R1"))
         self.assertEqual(op, "float-rsqrts-seed")
         self.assertIsInstance(value, T.Unknown)
 

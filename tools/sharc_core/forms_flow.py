@@ -163,8 +163,14 @@ def _type_9a_abs(
     # compute. I pre-modified by M gives the target; I is unchanged.
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
-    if _field(f, "a") or _field(f, "ci"):
-        return [_stop(state, insn, "unsupported Type9a control modifier")]
+    if _field(f, "ci"):
+        # PGR p.9-36 / SHARC+ PRM p.4-45 ("Interrupt Driven Loop Abort"):
+        # (CI) clears the bit for the currently-serviced interrupt in
+        # IRPTL/IMASKP so its ISR can be re-entered. This tracer does not
+        # track which interrupt (if any) is currently being serviced, so
+        # there is no sound bit to clear; fail closed rather than guess.
+        return [_stop(state, insn, "unsupported Type9a CI modifier")]
+    loop_abort = bool(_field(f, "a"))
     pmi = (_field(f, "pmi[2:2]") << 2) | _field(f, "pmi[1:0]")
     pmm = _field(f, "pmm")
     cond = _field(f, "cond")
@@ -193,6 +199,12 @@ def _type_9a_abs(
         and _field(f, "j") == 1
     ):
         # The verified I12/M14 (DB) return idiom of 9b_abs, plus the compute.
+        if loop_abort:
+            # (LA) on the verified return idiom is not a documented or
+            # observed pattern (PGR/PRM describe (LA) for JUMP, to leave a
+            # loop, not for the RTS-equivalent CALL/JUMP(I12,M14) return
+            # idiom); fail closed rather than guess at stack effects.
+            return [_stop(state, insn, "unsupported Type9a LA on return idiom")]
         if not state.call_stack:
             return [_stop(state, insn, "return without followed call")]
         mismatch = _check_return_target(state)
@@ -229,7 +241,7 @@ def _type_9a_abs(
             error = apply_compute(state)
             if error:
                 return [_stop(state, insn, error)]
-        return transfer(state, insn, target, call, predicate)
+        return transfer(state, insn, target, call, predicate, loop_abort=loop_abort)
     taken, not_taken = _copy(state), _copy(state)
     compute_state = taken if compute_when_taken else not_taken
     error = apply_compute(compute_state)
@@ -245,7 +257,7 @@ def _type_9a_abs(
         condition=cond,
         predicate_assumption=False,
     )
-    return transfer(taken, insn, target, call, True) + transfer(
+    return transfer(taken, insn, target, call, True, loop_abort=loop_abort) + transfer(
         not_taken, insn, target, call, False
     )
 
@@ -267,6 +279,10 @@ def _type_9b_abs(
         and pmm == 6
         and _field(f, "j") == 1
     ):
+        if _field(f, "a"):
+            # (LA) on the verified return idiom: not a documented or
+            # observed pattern -- see _type_9a_abs's identical guard.
+            return [_stop(state, insn, "unsupported Type9a LA on return idiom")]
         if not state.call_stack:
             return [_stop(state, insn, "return without followed call")]
         mismatch = _check_return_target(state)
@@ -282,8 +298,10 @@ def _type_9b_abs(
     # Any other Type 9b JUMP/CALL (Md, Ic): DAG2 I(8+pmi) + M(8+pmm).
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
-    if _field(f, "a") or _field(f, "ci"):
-        return [_stop(state, insn, "unsupported Type9b control modifier")]
+    if _field(f, "ci"):
+        # See _type_9a_abs's identical CI guard for why this fails closed.
+        return [_stop(state, insn, "unsupported Type9b CI modifier")]
+    loop_abort = bool(_field(f, "a"))
     i_value = _ureg(state.uregs, UREG_CODES["I%d" % (8 + pmi)])
     m_value = _ureg(state.uregs, UREG_CODES["M%d" % (8 + pmm)])
     if not isinstance(i_value, Const) or not isinstance(m_value, Const):
@@ -302,6 +320,7 @@ def _type_9b_abs(
         target,
         bool(_field(f, "b")),
         _predicate_simd_branch(state, _field(f, "cond")),
+        loop_abort=loop_abort,
     )
 
 
@@ -340,8 +359,10 @@ def _type_9a_rel(
     """9a_rel."""
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
-    if _field(f, "a") or _field(f, "ci") or not _field(f, "j"):
-        return [_stop(state, insn, "unsupported Type9a control modifier")]
+    if _field(f, "ci"):
+        # See _type_9a_abs's identical CI guard for why this fails closed.
+        return [_stop(state, insn, "unsupported Type9a CI modifier")]
+    loop_abort = bool(_field(f, "a"))
     relative = (_field(f, "reladdr[5:5]") << 5) | _field(f, "reladdr[4:0]")
     target = (state.pc_sw + _signed(relative, 6)) & 0xFFFFFF
     predicate = _predicate(state, _field(f, "cond"))
@@ -362,12 +383,14 @@ def _type_9a_rel(
         return None
 
     compute_when_taken = not bool(_field(f, "e"))
+    call = bool(_field(f, "b"))
+    transfer = _transfer if _field(f, "j") else _immediate_transfer
     if predicate is not None:
         if predicate == compute_when_taken:
             error = apply_compute(state)
             if error:
                 return [_stop(state, insn, error)]
-        return _transfer(state, insn, target, bool(_field(f, "b")), predicate)
+        return transfer(state, insn, target, call, predicate, loop_abort=loop_abort)
 
     taken, not_taken = _copy(state), _copy(state)
     compute_state = taken if compute_when_taken else not_taken
@@ -388,8 +411,8 @@ def _type_9a_rel(
         condition=_field(f, "cond"),
         predicate_assumption=False,
     )
-    return _transfer(taken, insn, target, bool(_field(f, "b")), True) + _transfer(
-        not_taken, insn, target, bool(_field(f, "b")), False
+    return transfer(taken, insn, target, call, True, loop_abort=loop_abort) + transfer(
+        not_taken, insn, target, call, False
     )
 
 

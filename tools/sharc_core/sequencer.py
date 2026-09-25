@@ -366,8 +366,60 @@ def _check_return_target(state: State) -> str | None:
     return None
 
 
+def _pop_loop_stack(state: State) -> None:
+    """Pop the loop (loop-address) stack once: the same single-level pop
+    Type20a's LPO performs (sharc_core.forms_system's ``_type_20a``), and
+    what JUMP (LA)'s loop-abort also does (see ``_apply_loop_abort``).
+    Updates CURLCNTR and STKYX's loop-stacks-empty bit (bit 26) the way
+    ``_advance``'s own loop-exit path does."""
+    if state.loops:
+        state.loops.pop()
+    state.uregs[UREG_CODES["CURLCNTR"]] = (
+        Const(state.loops[-1].remaining) if state.loops else Const(0xFFFFFFFF)
+    )
+    if not state.loops:
+        stkyx_code = UREG_CODES["STKYX"]
+        state.uregs[stkyx_code] = _bitwise(
+            _ureg(state.uregs, stkyx_code),
+            Const(1 << 26),
+            "loop stacks empty",
+            lambda value, mask: value | mask,
+        )
+
+
+def _pop_pc_stack(state: State) -> None:
+    """Pop the PC (call) stack once and resync PCSTK/PCSTKP/STKYX: the same
+    single-level pop Type20a's PPO performs, and what JUMP (LA)'s loop-abort
+    also does (see ``_apply_loop_abort``)."""
+    if state.call_stack:
+        state.call_stack.pop()
+    _sync_pc_stack(state)
+
+
+def _apply_loop_abort(state: State) -> None:
+    """JUMP ... (LA) -- SHARC+ Core Programming Reference p.4-44 ("Loop
+    Abort"): "This instruction causes an automatic loop abort when it
+    occurs inside a loop. When the loop aborts, the sequencer pops the PC
+    and loop address stacks[,] ... only one pop is performed[; the] loop
+    abort cannot be used to jump more than one level of loop nesting."
+    Also PGR p.9-36: "(LA)-loop abort-causes the loop stacks and PC stack
+    to be popped when the jump is executed." Exactly one pop of each stack,
+    reusing Type20a's own LPO+PPO single-level-pop logic; applied only to
+    the taken side of a jump/call, at the point the transfer is resolved as
+    taken (this tracer does not model delay-slot pipeline timing, so the
+    pop lands with the rest of the transfer's bookkeeping rather than
+    exactly on the DB-delayed cycle)."""
+    _pop_loop_stack(state)
+    _pop_pc_stack(state)
+
+
 def _transfer(
-    state: State, insn: Instruction, target: int, call: bool, cond: bool | None
+    state: State,
+    insn: Instruction,
+    target: int,
+    call: bool,
+    cond: bool | None,
+    loop_abort: bool = False,
 ) -> list[State]:
     if state.pending:
         return [_stop(state, insn, "nested delayed transfer")]
@@ -385,9 +437,13 @@ def _transfer(
     # 9 after a 48-bit one). Resolve it when the slots complete.
     return_sw = AFTER_DELAY_SLOTS if call else None
     if cond is True:
+        if loop_abort:
+            _apply_loop_abort(state)
         state.pc_sw, state.pending = fall, Pending(target, call, return_sw=return_sw)
         return [state]
     taken, not_taken = _copy(state), _copy(state)
+    if loop_abort:
+        _apply_loop_abort(taken)
     taken.pc_sw, taken.pending = fall, Pending(target, call, return_sw=return_sw)
     not_taken.pc_sw, not_taken.pending = fall, Pending(None)
     not_taken.trace[-1]["action"] = "branch-not-taken"
@@ -395,7 +451,12 @@ def _transfer(
 
 
 def _immediate_transfer(
-    state: State, insn: Instruction, target: int, call: bool, cond: bool | None
+    state: State,
+    insn: Instruction,
+    target: int,
+    call: bool,
+    cond: bool | None,
+    loop_abort: bool = False,
 ) -> list[State]:
     """Execute a Type 8 transfer without the instruction's DB modifier."""
     if state.pending:
@@ -407,9 +468,13 @@ def _immediate_transfer(
     if cond is False:
         return _advance(state, insn)
     if cond is True:
+        if loop_abort:
+            _apply_loop_abort(state)
         state.pending = Pending(target, call, slots=1, return_sw=fall if call else None)
         return _advance(state, insn)
     taken, not_taken = _copy(state), _copy(state)
+    if loop_abort:
+        _apply_loop_abort(taken)
     taken.pending = Pending(target, call, slots=1, return_sw=fall if call else None)
     not_taken.trace[-1]["action"] = "branch-not-taken"
     return _advance(taken, insn) + _advance(not_taken, insn)

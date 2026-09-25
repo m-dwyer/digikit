@@ -166,7 +166,7 @@ def test_dispatch_tables_have_no_duplicate_or_shadowed_keys():
     # compute_mult.py/compute_shift.py/compute_multi.py (a Python dict
     # literal cannot contain a duplicate key, but confirms the count
     # actually intended, not just "it didn't raise").
-    assert len(ALU_OPS) == 42
+    assert len(ALU_OPS) == 43  # +1: 0x89 Fn = (Fx + Fy) / 2 (PRM p.19-4)
     assert len(MULT_OPS) == 10
     assert len(SHIFT_OPS) == 13
     assert len(CU3_OPS) == 1
