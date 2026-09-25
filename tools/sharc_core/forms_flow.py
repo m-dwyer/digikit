@@ -308,31 +308,30 @@ def _type_9b_abs(
 def _type_25c_rframe(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
 ) -> list[State]:
-    """25c_rframe."""
-    if state.pending and state.pending.return_from_call:
-        frame = _ureg(state.uregs, UREG_CODES["I6"])
-        state.uregs[UREG_CODES["I7"]] = frame
-        if isinstance(frame, Const):
-            restored = _dm_read(state, frame.value, 4)
-            if restored is None:
-                state.uregs[UREG_CODES["I6"]] = Unknown(
-                    "RFRAME load from unavailable memory"
-                )
-            else:
-                state.uregs[UREG_CODES["I6"]] = restored
-        else:
+    """25c_rframe: I7 = I6, I6 = DM(0, I6) (SHARC+ PRM pp.17-17/17-18, Type 25c
+    RFRAME; no context restriction). The
+    firmware uses it in the delay slot of a return and of a tail-call jump;
+    the operation is the same in both."""
+    frame = _ureg(state.uregs, UREG_CODES["I6"])
+    state.uregs[UREG_CODES["I7"]] = frame
+    if isinstance(frame, Const):
+        restored = _dm_read(state, frame.value, 4)
+        if restored is None:
             state.uregs[UREG_CODES["I6"]] = Unknown(
-                "RFRAME load through nonconcrete I6"
+                "RFRAME load from unavailable memory"
             )
-        _event(
-            state,
-            insn,
-            "rframe",
-            frame=_json_value(frame),
-            restored_i6=_json_value(_ureg(state.uregs, UREG_CODES["I6"])),
-        )
-        return _advance(state, insn)
-    return [_stop(state, insn, "rframe outside verified return delay slots")]
+        else:
+            state.uregs[UREG_CODES["I6"]] = restored
+    else:
+        state.uregs[UREG_CODES["I6"]] = Unknown("RFRAME load through nonconcrete I6")
+    _event(
+        state,
+        insn,
+        "rframe",
+        frame=_json_value(frame),
+        restored_i6=_json_value(_ureg(state.uregs, UREG_CODES["I6"])),
+    )
+    return _advance(state, insn)
 
 
 def _type_9a_rel(
