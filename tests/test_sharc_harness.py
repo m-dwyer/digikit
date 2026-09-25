@@ -788,9 +788,14 @@ class FrameRenderFromInitTest(unittest.TestCase):
         self.assertEqual(len(results), 1)
         halt = results[0].halt
         self.assertEqual(halt.reason.split(" ", 1)[0], "fork")
-        # The first of the three known stops this lane's task brief and
-        # handover both record for an (almost) empty synthetic frame.
-        self.assertEqual(halt.pc_sw, 0xB88E4B)
+        # Originally the first of the known stops for an (almost) empty
+        # synthetic frame was 0xB88E4B (FIX-of-NaN/infinity, unsaturated).
+        # Lane G2 (2026-09-26) fixed that tools/sharc_core gap (see
+        # tools/sharc_core/floats.py's _float_to_fixed), so an unpatched
+        # render no longer forks there; the next known stop, 0x1C4969
+        # (the still-open, architecturally-undocumented BITEXT(BITLEN12>32)
+        # gap -- docs/findings/06's own "Lane G2" section), is now first.
+        self.assertEqual(halt.pc_sw, 0x1C4969)
 
     def test_render_frames_with_frame_patch_table_returns(self):
         runner, results = h.render_frames(self.memory, "dt2-1.16", n_frames=1)
@@ -1056,8 +1061,22 @@ class RealFrameRingAMilestoneTest(unittest.TestCase):
     surviving hack -- the real per-track accumulate path still does not
     carry a track's samples to the master mix even with this real gate data,
     see docs/findings/06's own "[C]" update) is active. `FRAME_PATCH_TABLE`
-    stays: its own two forks (`0x1c2fec`, `0x1c4965`) are unrelated to
-    per-track mixing.
+    stays: its remaining fork (`0x1c4965`, unrelated to per-track mixing)
+    is still open (lane G2, docs/findings/06's own "Lane G2" section --
+    the BITEXT(BITLEN12>32) result it forces is architecturally
+    undocumented, not a `tools/sharc_core` gap this project may guess at).
+    `0x1c2fec`'s own entry is gone (lane G2 fixed the underlying
+    `tools/sharc_core` FIX-of-NaN/infinity saturation gap instead: a real,
+    documented `0xFFFFFFFF` FIX result now reaches this render instead of
+    the entry's own arbitrary `0x4000` override). This test's own digest
+    below is UNCHANGED even so -- checked by running this exact
+    configuration both with and without that entry: the fork it used to
+    patch belongs to a genuinely silent OTHER track's own per-track divide
+    (see docs/findings/06's own "Lane G2" section), not to `voice`'s own
+    decimated output this test measures (`write_master_mix=True` injects
+    that output directly, bypassing the per-track accumulate path
+    entirely), so the two runs' ring A content is bit-for-bit identical
+    even though their own total instruction counts differ slightly.
 
     Real frame data changes the render's own instruction count per frame
     (fewer instructions once the gate data lets more of the per-track

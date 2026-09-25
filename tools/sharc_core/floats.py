@@ -275,30 +275,48 @@ def _float_to_fixed(
     result is Unknown when TRUNCATE itself is unknown, rather than guessing
     which rounding applied.
 
-    A result within int32 range needs no saturation. Out-of-range
-    magnitudes and NAN/+-infinity inputs are governed by MODE1.ALUSAT (PGR:
-    "In saturation mode ... positive overflows and +infinity return
-    0x7FFFFFFF, and negative overflows and -infinity return 0x80000000");
-    when ALUSAT is known clear the PGR instead documents a "floating-point
-    all 1s" *Rn* pattern for that corner, an architecturally odd case this
-    tracer does not attempt to reproduce bit-for-bit, so it reports Unknown
-    there and whenever MODE1 itself isn't known, rather than guessing.
+    A result within int32 range needs no saturation. Out-of-range magnitudes
+    and NAN/+-infinity inputs follow the SHARC+ Core PGR's own FIX/TRUNC
+    pages verbatim (out/refs/sc58x-2158x-prm/all.txt pp.20-11..20-14, "RN =
+    fix/trunc Fx[ by Ry]" -- identical wording on all four pages):
+
+    - A NAN input is unconditional on ALUSAT: "A NAN input returns a
+      floating-point all 1s result" is its own sentence, not part of the
+      "If saturation mode is not set" clause that follows it, and the AI
+      flag bullet lists "the input operand is a NAN" separately from the
+      saturation-gated "either input is an infinity or the result
+      overflows". AV's own bullet never mentions NAN (only "+-infinity"),
+      matching this module's existing NAN convention elsewhere (see
+      ``_float_binary``'s docstring): overflow=False, invalid=True.
+    - "In saturation mode (ALUSAT=1) positive overflows and +infinity
+      return 0x7FFFFFFF, and negative overflows and -infinity return
+      0x8000 0000" -- AV is set (the AV bullet: "if the input is
+      +-infinity" / mantissa-shift condition, with no ALUSAT gate), AI is
+      cleared (the AI bullet's infinity/overflow clause only fires "when
+      saturation mode is not set").
+    - "If saturation mode is not set, an infinity input or a result that
+      overflows returns a floating-point result of all 1s" -- AV is set
+      (same unconditional bullet as above) and now AI is also set (the
+      "when saturation mode is not set" clause applies).
+    - When ALUSAT itself is unknown, an infinity input or numeric overflow
+      still sets AV (that bullet never depends on ALUSAT), but the result
+      and AI are Unknown since which saturation behaviour applies cannot be
+      told apart.
+
     Returns (result, overflow, invalid).
     """
     a = _float32(value)
     if a is None:
         return Unknown(expression), None, None
     saturating = _astatx_known_bit(mode1, ALUSAT_BIT)
-    if math.isnan(a) or math.isinf(a):
+    if math.isnan(a):
+        return _FLOAT_ALL_ONES, False, True
+    if math.isinf(a):
         if saturating:
-            return (
-                Const(0x7FFFFFFF if (math.isnan(a) or a > 0) else 0x80000000),
-                True,
-                True,
-            )
+            return Const(0x7FFFFFFF if a > 0 else 0x80000000), True, False
         if saturating is False:
-            return Unknown(expression + " (unsaturated NAN/infinity fix)"), True, True
-        return Unknown(expression), None, True
+            return _FLOAT_ALL_ONES, True, True
+        return Unknown(expression), True, None
     if always_truncate:
         rounded = math.trunc(a)
     else:
@@ -311,8 +329,8 @@ def _float_to_fixed(
     if saturating:
         return Const(0x7FFFFFFF if rounded > 0 else 0x80000000), True, False
     if saturating is False:
-        return Unknown(expression + " (unsaturated fix overflow)"), True, False
-    return Unknown(expression), None, False
+        return _FLOAT_ALL_ONES, True, True
+    return Unknown(expression), True, None
 
 
 def _float_to_fixed_trunc(
@@ -550,23 +568,25 @@ def _double_to_fixed(
     """RN = fix FX:Y / RN = trunc FX:Y (SC58x/2158x PRM p.20-28/20-30,
     p.20-29/20-32 for the BY RY forms -- the caller pre-scales HI/LO via
     ``_scale_double_input``): same rounding/saturation rule as
-    ``_float_to_fixed``, reading a 64-bit input and always producing a
-    plain 32-bit RN (Table 18-28: the fix/trunc destination column is
-    "Rn/Rx/Ry/Rz", not a register pair)."""
+    ``_float_to_fixed`` (see its docstring for the NAN/infinity/overflow
+    flag derivation -- the double FIX/TRUNC pages carry the identical
+    wording, "A NAN input returns a floating point all 1s result" as its
+    own unconditional sentence and the AI/AV bullets split the same way),
+    reading a 64-bit input and always producing a plain 32-bit RN (Table
+    18-28: the fix/trunc destination column is "Rn/Rx/Ry/Rz", not a
+    register pair)."""
     a = _double(hi, lo)
     if a is None:
         return Unknown(expression), None, None
     saturating = _astatx_known_bit(mode1, ALUSAT_BIT)
-    if math.isnan(a) or math.isinf(a):
+    if math.isnan(a):
+        return _FLOAT_ALL_ONES, False, True
+    if math.isinf(a):
         if saturating:
-            return (
-                Const(0x7FFFFFFF if (math.isnan(a) or a > 0) else 0x80000000),
-                True,
-                True,
-            )
+            return Const(0x7FFFFFFF if a > 0 else 0x80000000), True, False
         if saturating is False:
-            return Unknown(expression + " (unsaturated NAN/infinity fix)"), True, True
-        return Unknown(expression), None, True
+            return _FLOAT_ALL_ONES, True, True
+        return Unknown(expression), True, None
     if always_truncate:
         rounded = math.trunc(a)
     else:
@@ -579,8 +599,8 @@ def _double_to_fixed(
     if saturating:
         return Const(0x7FFFFFFF if rounded > 0 else 0x80000000), True, False
     if saturating is False:
-        return Unknown(expression + " (unsaturated fix overflow)"), True, False
-    return Unknown(expression), None, False
+        return _FLOAT_ALL_ONES, True, True
+    return Unknown(expression), True, None
 
 
 def _scale_double_input(

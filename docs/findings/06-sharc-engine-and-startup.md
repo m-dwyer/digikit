@@ -3762,17 +3762,29 @@ LOOP's value across the wrap, as "Flags and seed" says. Checked by one agent
 (field decode and a register override at the load); **[O]** until the
 emulator fix and a second check.
 
-**BITEXT, still open [O].** The frame-render fcomp at `0x1c4969`
-(`FUN_1c4914`, `IF LT`) does not depend on `BITEXT`: its flags are ALU-group,
-`BITEXT` writes only shifter flags, and the `BITEXT` result `R0` from the
-call at `0x1c4949` is overwritten before use -- that part is **[V]**. The
-five `BITEXT (NU)` sites (opcode `0x19`) all carry `BITLEN12` outside 0..32
+**BITEXT, still open [O]. [C] Lane G2 (2026-09-26): the "`R0` ... is
+overwritten before use" claim below is corrected by execution -- see this
+file's own "Lane G2" section (under lane F2's Task 1) for the full,
+register-level trace.** The frame-render fcomp at `0x1c4969`
+(`FUN_1c4914`, `IF LT`) does not depend on `BITEXT` directly: its flags
+are ALU-group, `BITEXT` writes only shifter flags, and the `BITEXT`
+result `R0` from the call at `0x1c4949` IS overwritten before `R0` itself
+is next used -- but that same instruction's parallel ureg-copy (`R15 =
+R0`, form `5a_move`) reads `R0`'s value from BEFORE the overwrite (SHARC's
+documented "compute and move both read the pre-instruction file" dual-op
+rule), which carries the BITEXT taint into `R15` -- and from there into
+the fcomp at `0x1c4969` -- anyway. **Do not read this as "BITEXT does not
+reach the fork"**: lane G2's own live trace confirms it does. The five
+`BITEXT (NU)` sites (opcode `0x19`) all carry `BITLEN12` outside 0..32
 (95, 535, 384, 192, 256) in dt2-1.16, dt2-1.15C and dn2-1.11 (192, 256); the
 two opcode `0x14` sites (`0xb884b7`/`0xb884ba`) are `BITEXT 32` after a
 `BFFWRP` read, matching the manual's example. The width decode is
 unambiguous (a single 48-bit match) -- either an encoding row error in our
-compute table for `BITEXT (NU)`, or real use of that range. `0xb88fe6` is
-unreachable (after an unconditional delayed jump). Both remain **[O]**.
+compute table for `BITEXT (NU)`, or real use of that range (lane G2: PGR
+p.11-91 only documents `BITLEN12 > 32` as "prohibited"/SV-setting, with no
+numeric result for real silicon, so this stays open rather than guessed
+at). `0xb88fe6` is unreachable (after an unconditional delayed jump). Both
+remain **[O]**.
 
 **The `0x1c4969` fork's own harness patch is the frame-path pitch bug's
 root cause (lane E1, 2026-09-26) `[O]`.** `tools/sharc_harness.py`'s
@@ -4320,6 +4332,74 @@ as lane E1's own milestone) still measures its tone at
 that frequency, near-zero at 1000 Hz itself) -- unchanged from lane E1's
 own figure, confirming this lane made no accidental regression or
 improvement to the render path itself.
+
+### Lane G2 (2026-09-26): the FIX-of-NaN/Infinity fix, and settling the BITEXT fork by execution **[V][C]**
+
+**`0x1C2FEC` fixed and removed.** `tools/sharc_core/floats.py`'s
+`_float_to_fixed`/`_double_to_fixed` now implement the SC58x/2158x PRM's
+FIX/TRUNC pages verbatim (`out/refs/sc58x-2158x-prm/all.txt` pp.20-11..
+20-14 for the 32-bit forms, pp.20-28..20-32 for the 64-bit `Fx:y` forms):
+a NAN input always returns the floating-point all-1s pattern
+(`0xFFFFFFFF`, `AI` set), unconditional on `MODE1.ALUSAT` -- the PRM's own
+wording ("A NAN input returns a floating-point all 1s result") is its own
+sentence, not part of the following "If saturation mode is not set"
+clause, which instead governs only an infinity input or a numeric
+overflow (`AV` set either way; `AI` set only when ALUSAT=0, cleared when
+ALUSAT=1 and the input instead saturates to `0x7FFFFFFF`/`0x80000000`).
+Checked live (same real-frame call as lane F2's own Task 1: capture
+`dt2-1.16-play-pretracks-fulltx.dt2cap`, frame 20, track 2, master-bus
+table masked): with `0x1C2FEC` removed, the fork at `0xb88e4b` no longer
+occurs -- `fix()` on the genuine `Const(0)`-divisor NaN now resolves to a
+concrete `0xFFFFFFFF` -- and the render reaches the SAME final halt
+("return without followed call" at `0x1c75d3`) as with the entry present,
+confirming the patch is no longer needed. New unit tests in
+`tests/test_sharc_trace.py` cover NAN/+-infinity/overflow under
+ALUSAT=1/0/unknown for both the 32- and 64-bit forms.
+
+**`0x1C4965` stays -- and this lane corrects this section's own earlier
+`[V]` claim** ("the `BITEXT` result `R0` from the call at `0x1c4949` is
+overwritten before use"). That claim is INCOMPLETE, not a false trace: a
+live, single-instruction-stepped register trace through this fork (same
+capture/frame/track, `0x1C4965` removed) shows `R0` genuinely does get a
+fresh value from the `Rn=comp(Rx,Ry); Rm=Rn`-shaped instruction at
+`0x1c4950` (form `5a_move`) right after `CALL 0xb88f70` at `0x1c4949` --
+but `tools/sharc_core/forms_move.py`'s own `_type_5a_move` implements the
+documented SHARC dual-op rule that "the Type 5a data move and compute both
+consume the pre-instruction file": the PARALLEL `R15 = R0` ureg-copy in
+that SAME instruction reads `R0`'s value from BEFORE `0x1c4950` executes,
+not the compute half's newly written result. A register snapshot at every
+intervening pc confirms the mechanism precisely: `0xb88fa4`, inside
+`FUN_b88f70` (the call target -- a leading-zero-count/normalize helper,
+unrelated to the fixed-point-divide helper `FUN_b88e04` above despite the
+similar address range), is a genuine `BITEXT (NU)` (shiftimm opcode
+`0x19`) with `BITLEN12=95` (one of this section's own five sightings
+above), written to `R0` as `FUN_b88f70`'s return value
+(`Unknown('bitext: undefined (bitlen 95 > 32)')`); `0x1c4950`'s `R15 = R0`
+copies that SAME Unknown into `R15` one step before `0x1c4950`'s own
+compute half overwrites `R0` with something else -- `R15` reads
+`Unknown('bitext: ...')` starting at `0x1c4953`, then flows
+`F15=fsub(F15,F7)` (`0x1c4961`, `R10`/`F10` itself a genuine, unrelated
+`Const`), `F2=F10*F15` (`0x1c495a`), `F4=fmax(F2,F13)` (`0x1c4963`), into
+the fork's own `F6=fcomp(F6,F4)` at `0x1c4965` -- matching lane F2's own
+trace element for element. So the earlier framing was right that `R0`
+itself gets clobbered, but wrong to read that as discarding the BITEXT
+taint: the SAME instruction is what smuggles it into `R15` first.
+
+**Still not a `tools/sharc_core` fix this lane may make.** PGR p.11-91
+documents `BITLEN12 > 32` as "prohibited" for BITEXT's own FEXT-based
+pseudocode step and says only that SV is set -- it does not document what
+numeric result, if any, real silicon produces for that width. Unlike the
+FIX/TRUNC NaN/infinity case above, there is no PRM/PGR page to cite for a
+specific value here, so implementing one would be exactly the
+undocumented guess this project's own `sharc_core`-fix rule (a PRM page, a
+test, or a widthaudit 0-mismatch proof) exists to rule out. `0x1C4965`
+therefore stays in `FRAME_PATCH_TABLE`, and lane E1's frame-path pitch bug
+(`FIELD_PHASE` advancing a fixed ~40.43 samples/frame regardless of
+`pitch_step`) is UNCHANGED -- re-measured on this lane's own 384-real-frame
+render (freq=1000 Hz, `0x1C4965` present, `0x1C2FEC` now removed): still
+**631.7191123962402 Hz**, identical to lane F2's own figure, confirming
+the fix above did not touch this bug (it lives entirely behind the
+remaining patch).
 
 ### Task 2: the companding record's real address, and confirmation it is unwritten everywhere reachable **[V][O]**
 

@@ -1185,42 +1185,88 @@ def companding_record_fields(state, image: str) -> list[int]:
 #   (a PRM page, a test, or a widthaudit 0-mismatch proof) exists to rule
 #   out). Confirmed present with the SAME real capture/frame/track as above.
 #
-# Net: **both entries stay in this table.** "Remove both" (this lane's own
-# task) needs either a `tools/sharc_core` fix for one or both of these two
-# gaps (FIX-of-non-finite saturation; BITEXT wider than 32 bits) -- out of
-# this lane's scope, per this repo's CLAUDE.md and this lane's own brief
-# ("don't edit sharc_core ... stop at it and report") -- or a full,
-# independently-verified reimplementation of `FUN_1c4afe`'s own
-# note/tune-to-step arithmetic as a harness-level patch, which this lane
-# judged disproportionate to attempt inline here. The frame path's pitch
-# bug (`FIELD_PHASE` advancing a fixed 40.43 samples/frame regardless of
-# `pitch_step`, docs/findings/06 lane E1) is UNCHANGED: `0x1C4965`'s forced
+# **[C] Lane G2 (2026-09-26): the `0x1C2FEC` entry is REMOVED -- its
+# `tools/sharc_core` gap is fixed.** `tools/sharc_core/floats.py`'s
+# `_float_to_fixed`/`_double_to_fixed` (the shared FIX/TRUNC[ BY RY]
+# helper) now implements the SC58x/2158x PRM's own FIX/TRUNC pages verbatim
+# (out/refs/sc58x-2158x-prm/all.txt pp.20-11..20-14 for the 32-bit forms,
+# pp.20-28..20-32 for the 64-bit `Fx:y` forms -- identical wording on all
+# six pages): a NAN input is unconditional on MODE1.ALUSAT ("A NAN input
+# returns a floating-point all 1s result" is its own sentence, not part of
+# the following "If saturation mode is not set" clause) and returns
+# `0xFFFFFFFF` with `invalid=True` either way; an infinity input or a
+# result that numerically overflows saturates to `0x7FFFFFFF`/`0x80000000`
+# when ALUSAT=1 (`invalid=False`, since the AI bullet's infinity/overflow
+# clause is itself gated "when saturation mode is not set") or returns the
+# same `0xFFFFFFFF` all-1s pattern with `invalid=True` when ALUSAT=0 (see
+# `_float_to_fixed`'s own docstring for the full flag derivation). Checked
+# live: removing this entry and re-running the SAME real-frame call this
+# table's own module note above describes (capture
+# `dt2-1.16-play-pretracks-fulltx.dt2cap`, frame 20, track 2, master-bus
+# table masked) reaches the identical final halt ("return without followed
+# call" at `0x1c75d3`) as with the entry present -- the fork at `0xb88e4b`
+# no longer occurs because `fix()` on the genuine `Const(0)`-divisor NaN
+# now resolves to a concrete `0xFFFFFFFF` instead of `Unknown`. The
+# instruction count differs slightly (82,325 vs. 82,263 -- the real
+# `0xFFFFFFFF`/AI=1 result take a different, but still successful, path
+# than this entry's own arbitrary `0x4000` override did), so
+# `RealFrameRingAMilestoneTest`'s own ring-A digest changes too (see
+# `tests/test_sharc_harness.py`'s own note on that hash for why -- an
+# intended fix, not a regression).
+#
+# **[C] Lane G2: `0x1C4965` stays, and corrects docs/findings/06's own
+# "BITEXT, still open" `[V]` claim that "the BITEXT result R0 from the
+# call at 0x1c4949 is overwritten before use."** That claim is INCOMPLETE,
+# not a false trace: a live, single-instruction-stepped register trace
+# through this exact fork (capture/frame/track as above, `0x1C4965`
+# removed) shows `R0` genuinely does get a fresh value from the
+# `Rn=comp(Rx,Ry); Rm=Rn`-shaped instruction at `0x1c4950` (form
+# `5a_move`) that follows the `CALL 0xb88f70` at `0x1c4949` -- but
+# `forms_move.py`'s own `_type_5a_move` comment ("The Type 5a data move and
+# compute both consume the pre-instruction file") means the PARALLEL
+# `R15 = R0` ureg-copy in that SAME instruction reads `R0`'s
+# PRE-instruction value, not the compute's newly written one. Traced live:
+# `0xb88fa4` (inside `FUN_b88f70`, the call target -- a leading-zero-count/
+# normalize helper, not the fixed-point divide `0xb88e04` unrelated to it)
+# is a genuine `BITEXT (NU)` (shiftimm opcode `0x19`) with `BITLEN12=95`
+# (one of docs/findings/06's own five sightings), written to `R0` as
+# `FUN_b88f70`'s own return value; `0x1c4950`'s `R15 = R0` copies that
+# SAME still-`Unknown('bitext: undefined (bitlen 95 > 32)')` value into
+# `R15` BEFORE `0x1c4950`'s own compute half gets to overwrite `R0` --
+# confirmed by a register snapshot at every intervening pc: `R15` reads
+# `Unknown('bitext: ...')` starting at `0x1c4953` (the very next step),
+# then flows `F15=fsub(F15,F7)` (`0x1c4961`), `F2=F10*F15` (`0x1c495a`,
+# `R10` itself a genuine, unrelated `Const`), `F4=fmax(F2,F13)`
+# (`0x1c4963`), into the fork's own `F6=fcomp(F6,F4)` at `0x1c4965` --
+# matching lane F2's own trace element for element. So the earlier "[V]"
+# framing was right that `R0` itself gets clobbered, but wrong to treat
+# that as discarding the BITEXT taint: this SAME instruction is what
+# smuggles it into `R15` first. **This is still not a `tools/sharc_core`
+# fix this lane may make**: PGR p.11-91 documents `BITLEN12 > 32` as
+# "prohibited" for BITEXT's own FEXT-based pseudocode step and says only
+# that SV is set, without documenting what numeric result (if any) real
+# silicon produces for that width -- unlike the FIX/TRUNC NaN/infinity
+# case above, there is no PRM/PGR page to cite for a specific value here,
+# so implementing one would be exactly the undocumented guess this
+# project's own rule (a PRM page, a test, or a widthaudit 0-mismatch
+# proof) exists to rule out. The frame path's pitch bug (`FIELD_PHASE`
+# advancing a fixed 40.43 samples/frame regardless of `pitch_step`,
+# docs/findings/06 lane E1) is therefore UNCHANGED: `0x1C4965`'s forced
 # `1.0f`/`1.0f` operands still discard the real (buggy) Positions
 # computation every frame, so `render_frames_to_ring_a()`'s frame-path
 # output still does not match `check_correctness()`'s `freq * pitch_step`.
 FRAME_PATCH_TABLE: sv.PatchTable = {
-    # 0xb88e47 -> fork at 0xb88e4b: FUN_b88e04's recips-based fixed-point
-    # divide (the same helper the voice record contract's Step formula
-    # uses) computes ASTATX.AZ from a comparison whose R1 operand traces
-    # (via FUN_1c3570/FUN_1c3594) back to a per-track "(sw)" DM read at
-    # 0x1c2fe9 (`R4 = DM(0x2560b8) (sw)`) that reads 0 for the track being
-    # processed. **[C] Lane F2:** this is not specific to an empty
-    # synthetic frame -- see this table's own module-level note above: a
-    # genuinely silent track's real gain is ALSO zero, and the actual gap
-    # is `tools/sharc_core`'s `fix()` not saturating a NaN/infinity input.
-    # Patched one instruction later (0x1c2fec) as a register override, not
-    # a DM poke at 0x2560b8 itself (see this table's own docstring).
-    0x1C2FEC: [("reg", "R4", 0x4000)],
     # 0x1c4965 -> fork at 0x1c4969: FUN_1c4914 (the voice record contract's
     # "Positions" setter helper) computes ASTATX.AN/AZ/AV from
     # `F6=fcomp(F6,F4)` over an fmax/fsub chain of BITEXT-decoded voice
-    # record position fields. **[C] Lane F2:** this is not specific to this
-    # lane's own synthetic voice either -- see this table's own
-    # module-level note above: the real gap is a `tools/sharc_core` BITEXT
-    # decode that refuses a field wider than 32 bits, hit on every frame's
-    # call into `FUN_1c4afe` (real note-trigger call path or not). Forces
-    # both fcomp operands to a finite 1.0f -- still a discard of the real,
-    # buggy Positions computation (see the frame-path pitch bug note
+    # record position fields. **[C] Lane F2, corrected further by Lane
+    # G2 (see this table's own module-level note above for the full,
+    # execution-confirmed trace):** the real gap is a genuine, architecturally
+    # undocumented `tools/sharc_core` BITEXT(NU) result for `BITLEN12=95 >
+    # 32`, hit on every frame's call into `FUN_1c4afe` (real note-trigger
+    # call path or not) -- not specific to this lane's own synthetic voice.
+    # Forces both fcomp operands to a finite 1.0f -- still a discard of the
+    # real, buggy Positions computation (see the frame-path pitch bug note
     # above), not a fix.
     0x1C4965: [("reg", "R6", 0x3F800000), ("reg", "R4", 0x3F800000)],
 }
@@ -1271,11 +1317,21 @@ FRAME_DIAGNOSTIC_ASTATX_PATCH: sv.PatchTable = {0x1C0885: [("reg", "ASTATX", 0x4
 # halt fires exactly when block_handler's own return executes -- the frame
 # render call chain (block_handler -> command_dispatch_fn -> cmd_handler_3
 # -> render_frame -> ...) completed. tools/sharc_widthaudit.py --root frame
-# confirms 0 access-width mismatches across all 17,468 load/store events
-# checked in this run.
+# confirms 0 access-width mismatches across all load/store events checked
+# in this run.
+#
+# 2026-09-26 (lane G2): the instruction count moved 95,982 -> 96,044 (+62)
+# when the `0x1C2FEC` FRAME_PATCH_TABLE entry was removed (its
+# `tools/sharc_core` gap -- FIX-of-NaN/infinity saturation -- is fixed; see
+# that entry's own former docstring and docs/findings/06's "Lane G2"
+# section). The real, documented `fix()` result (`0xFFFFFFFF`, `AI` set)
+# takes a slightly different, still-successful path than the removed
+# entry's own arbitrary `0x4000` register override did; the final halt
+# (pc, reason) is unchanged. tools/sharc_widthaudit.py --root frame
+# reconfirms 0 mismatches at the new count (17,475 load/store events).
 FRAME_MILESTONE = {
     "pc_sw": 0x1C75D3,
-    "instructions": 95982,
+    "instructions": 96044,
     "reason": "return without followed call",
 }
 

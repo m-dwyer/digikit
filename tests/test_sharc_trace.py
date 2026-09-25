@@ -16,6 +16,7 @@ T = import_module("sharc_trace")
 Instruction = import_module("sharc_disasm").Instruction
 L = import_module("sharcldr")
 encode = import_module("test_sharc_disasm").encode
+_floats = import_module("sharc_core.floats")  # _double_to_fixed isn't re-exported by T
 
 
 def loader_block(code, address, count, arg=0, payload=b""):
@@ -5539,12 +5540,108 @@ class FloatComputeTest(unittest.TestCase):
         result = T._float_to_fixed_trunc(T.Const(f32(1e10)), mode1, "trunc F1")
         self.assertEqual(result, (T.Const(0x7FFFFFFF), True, False))
 
-    def test_trunc_overflow_unknown_when_alusat_clear(self):
+    def test_trunc_overflow_all_ones_when_alusat_clear(self):
+        # SC58x/2158x PRM pp.20-11..20-14 ("RN = fix/trunc Fx[ by Ry]"):
+        # "If saturation mode is not set, ... a result that overflows
+        # returns a floating-point result of all 1s"; the AI bullet's
+        # "when saturation mode is not set ... the result overflows"
+        # clause sets AI too.
         mode1 = T.Const(0)
+        result = T._float_to_fixed_trunc(T.Const(f32(1e10)), mode1, "trunc F1")
+        self.assertEqual(result, (T._FLOAT_ALL_ONES, True, True))
+
+    def test_trunc_overflow_unknown_when_alusat_unknown(self):
+        # AV is unconditional on ALUSAT (the AV bullet has no saturation
+        # gate), but the result and AI depend on which saturation rule
+        # would apply, so they stay Unknown when ALUSAT itself is unknown.
+        mode1 = T.PartialConst(mask=1 << T.TRUNCATE_BIT, bits=0)
         result = T._float_to_fixed_trunc(T.Const(f32(1e10)), mode1, "trunc F1")
         value, overflow, invalid = result
         self.assertIsInstance(value, T.Unknown)
         self.assertEqual(overflow, True)
+        self.assertIsNone(invalid)
+
+    def test_fix_nan_input_is_all_ones_regardless_of_alusat(self):
+        # Both FIX/TRUNC pages: "A NAN input returns a floating-point all
+        # 1s result" is its own sentence, not scoped by "If saturation
+        # mode is not set" -- unlike infinity/overflow below, a NAN's
+        # result and AI do not depend on ALUSAT. AV stays clear (the AV
+        # bullet only lists "the input is +-infinity", not NAN -- matching
+        # this module's existing NAN convention, e.g. float add/sub/mult).
+        nan = T.Const(f32(float("nan")))
+        for label, mode1 in (
+            ("alusat_set", T.Const(1 << T.ALUSAT_BIT)),
+            ("alusat_clear", T.Const(0)),
+        ):
+            with self.subTest(label):
+                result = T._float_to_fixed(nan, mode1, False, "fix F1")
+                self.assertEqual(result, (T._FLOAT_ALL_ONES, False, True))
+
+    def test_fix_infinity_saturates_when_alusat_set(self):
+        # "In saturation mode ... +infinity return[s] the maximum positive
+        # number (0x7FFF FFFF), and ... -infinity return[s] the minimum
+        # negative number (0x8000 0000)." AI is cleared (its saturation-
+        # gated clause does not fire); AV is set (its own bullet: "the
+        # input is +-infinity", unconditional on ALUSAT).
+        mode1 = T.Const(1 << T.ALUSAT_BIT)
+        pinf = T.Const(f32(float("inf")))
+        ninf = T.Const(f32(float("-inf")))
+        self.assertEqual(
+            T._float_to_fixed(pinf, mode1, False, "fix F1"),
+            (T.Const(0x7FFFFFFF), True, False),
+        )
+        self.assertEqual(
+            T._float_to_fixed(ninf, mode1, False, "fix F1"),
+            (T.Const(0x80000000), True, False),
+        )
+
+    def test_fix_infinity_all_ones_when_alusat_clear(self):
+        # "If saturation mode is not set, an infinity input ... returns a
+        # floating-point result of all 1s"; AI's "when saturation mode is
+        # not set ... either input is an infinity" clause now fires too.
+        mode1 = T.Const(0)
+        pinf = T.Const(f32(float("inf")))
+        self.assertEqual(
+            T._float_to_fixed(pinf, mode1, False, "fix F1"),
+            (T._FLOAT_ALL_ONES, True, True),
+        )
+
+    def test_fix_infinity_unknown_when_alusat_unknown(self):
+        mode1 = T.PartialConst(mask=1 << T.TRUNCATE_BIT, bits=0)
+        pinf = T.Const(f32(float("inf")))
+        value, overflow, invalid = T._float_to_fixed(pinf, mode1, False, "fix F1")
+        self.assertIsInstance(value, T.Unknown)
+        self.assertEqual(overflow, True)
+        self.assertIsNone(invalid)
+
+    def test_double_fix_nan_and_infinity_match_the_float_rule(self):
+        # SC58x/2158x PRM pp.20-28..20-32 ("RN = fix/trunc Fx:y[ by Ry]")
+        # carry the identical NAN/infinity/overflow wording as the 32-bit
+        # pages above.
+        def dbl(v):
+            hi, lo = struct.unpack(">II", struct.pack(">d", v))
+            return T.Const(hi), T.Const(lo)
+
+        sat = T.Const(1 << T.ALUSAT_BIT)
+        unsat = T.Const(0)
+        nan_hi, nan_lo = dbl(float("nan"))
+        self.assertEqual(
+            _floats._double_to_fixed(nan_hi, nan_lo, sat, False, "fix F1:0"),
+            (T._FLOAT_ALL_ONES, False, True),
+        )
+        self.assertEqual(
+            _floats._double_to_fixed(nan_hi, nan_lo, unsat, False, "fix F1:0"),
+            (T._FLOAT_ALL_ONES, False, True),
+        )
+        pinf_hi, pinf_lo = dbl(float("inf"))
+        self.assertEqual(
+            _floats._double_to_fixed(pinf_hi, pinf_lo, sat, False, "fix F1:0"),
+            (T.Const(0x7FFFFFFF), True, False),
+        )
+        self.assertEqual(
+            _floats._double_to_fixed(pinf_hi, pinf_lo, unsat, False, "fix F1:0"),
+            (T._FLOAT_ALL_ONES, True, True),
+        )
 
     # -- Fn = recips/rsqrts Fx seeds (PRM p.427, PGR p.11-44/11-45) ---------
 
