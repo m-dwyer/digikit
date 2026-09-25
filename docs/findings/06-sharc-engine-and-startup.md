@@ -3988,3 +3988,47 @@ internal rate for `pitch_step=1.0` is the one that's off, and whether
 `docs/findings/06`'s own single-voice `check_correctness` (shape-only,
 ~3e-5 max error) would have caught an overall constant frequency scale
 error at all.
+
+## Lane D2: the machine-type change detector's own write target sees zero events during a real 0->2 transition, unresolved **[D][O]**
+
+"The machine type word ... is used only as a change detector" above ends
+with: on a change, the fallthrough at `0x1c33e7` stores `M14` into per-track
+arrays and calls `FUN_1c60a2`, which sets a per-track flag at
+`0x2412c8+4+t*0x1d8+0x1b9` -- exactly `tools/sharc_replay.py`'s own
+`SLOT_TYPE_WATCH`/`SLOT_TYPE_STRIDE`/`SLOT_TYPE_OFFSET` (lane C2). This
+looked like the best remaining candidate for "how a level change (not
+necessarily a note-on pulse) could still mark a voice record" -- worth
+checking directly, since lane C2's own replay already reported
+`slot_type_write: None` for every frame of the `play-pretracks` capture,
+including the frame where track 2's machine-type word first changes from
+`0` (frame 0, an unrendered command-1 reset) to `2` (frame 1, the first
+real `FUN_1c2b24` render this `Runner` ever executes, which reaches
+`frame-returned` -- full, successful completion).
+
+A direct probe (this lane's own scratch script, not committed: it replays
+those same two frames through the exact same `tools/sharc_replay.py`
+functions -- `frame_command()`, `_write_bytes(state, RX_BASE, payload)`,
+`h.call_frame_collect_all()` with the identical `target_watch` -- and then
+inspects the *raw* `runner.watch_log` for **any** write at the
+`SLOT_TYPE_WATCH` stride/offset, including a zero-valued one C2's own
+`_first_nonzero_write()` would silently skip) reproduces C2's instruction
+counts exactly (192, then 82372, both `frame-returned`; 4014 total watched
+events in frame 1 across the wider `target_watch` range) but finds **zero**
+writes at that stride/offset at all -- not filtered out, genuinely absent.
+
+This is inconsistent with the static claim that a machine-type value change
+unconditionally reaches `FUN_1c60a2` from inside `FUN_1c2b24`'s own,
+seemingly unconditional per-track `FUN_1c24e9` loop. Three explanations, none
+checked here: (a) `FUN_1c24e9`'s own per-track loop, or the specific half of
+it containing the change-detector, is not actually reached on this harness's
+call path; (b) the "previous value" `FUN_1c24e9` compares against is not
+seeded the way a real device's persistent cache would be, so no change is
+detected even though the payload's own byte changed; (c) `I5`'s absolute
+address (already flagged `[O]` above, "not yet pinned") is different at
+runtime than assumed, so the watch's fixed `0x2412cc` base misses the real
+write. Concrete next step for a future lane: a `Watchpoint` directly on
+`FUN_1c24e9`'s own comparison target (`I0`, at whatever address it resolves
+to at `0x1c33d2` during this exact replay) plus a code-reachability check
+(e.g. an instruction-count histogram, or a temporary breakpoint at
+`0x1c60a2`) to see whether that function executes at all, before assuming
+the write address is wrong.

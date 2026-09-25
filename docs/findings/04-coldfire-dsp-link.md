@@ -2039,3 +2039,150 @@ snapshots/dt2-1.16/boot400M.snap --out out/captures/dt2-1.16-play-pretracks.dt2c
 --kind play --instrs 15000000 --pre-instrs 15000000 --syx <a 1.16 .syx whose
 sha-256 matches sections/.source-sha256>`. Capture not committed (`out/` is
 gitignored).
+
+## Lane D2: the DSPI2 tail (past the 0x802-byte payload) is not tag-only, but the difference is the kit-load event, not a trigger **[D][C][O]**
+
+`tools/sharc_capture_run.py`'s driver hook previously read only `tx_len`
+(`0x802`, `TX_PAYLOAD_BYTES["dt2"]`) bytes from the TX buffer at
+`emu/dspiframe.py`'s `TX_BASE_DT2` (`0x80005348`). This lane changed it to
+read the whole `dspiframe.FRAME_BYTES` (`0xabc`, 2,748 bytes) instead, since
+that buffer is one persistent on-chip-SRAM region (`RX_BASE_DT2` is exactly
+`0xabc` bytes before it, back to back, no gap) and the eDMA word count is
+shared between TX and RX per "TX length and RX length above are misleading"
+above -- so the 698-byte tail past the payload is real, readable driver
+memory, not a value this tool invented. **[D]**
+
+**Correction to "the rest of the frame is tag-only entries" above, for the
+tail's *content*, not its wire role.** That claim (the driver pads with
+`0x8001xxxx`-tagged, no-payload PUSHR entries) is still the right model for
+*how the frame is built*, but this lane's own captures show the tail is
+**not byte-constant across frames**: on `snapshots/dt2-1.16/boot400M.snap`,
+`--kind play --instrs 15000000 --pre-instrs 15000000` (the same run "Lane
+A3" above uses), 184 of 291 frames have a distinct 698-byte tail, and 355 of
+the 698 byte offsets vary at least once across the run. Two regions stand
+out: **[D]**
+
+- **A slowly-incrementing 16-bit counter at absolute frame offset `0x82a`**
+  (u16be), present in *every* capture including a bare `--kind idle
+  --instrs 15000000` run with no `--pre-instrs` and no panel input at all:
+  it climbs from 0 and reaches the identical value `0x7f00` by the run's
+  last frame in both the idle-only and the play-pretracks capture at a
+  similar frame count -- a generic, saturating tick/uptime-shaped counter,
+  unrelated to a trigger or even to a loaded kit. **[D]**
+- **A denser, 16-element-sized block at frame offsets `0x808`-`0x828`**
+  (16 consecutive u16be words), all zero in the idle-only capture but
+  populated and ramping-then-settling (within about 10 frames) in any
+  capture that uses `--pre-instrs` -- **identical byte-for-byte between a
+  `--kind idle --pre-instrs 15000000` capture and a `--kind play
+  --pre-instrs 15000000` capture at every sampled frame** (0, 1, 2, 5, 10,
+  50, 150, 290). Most of the 16 words settle at the same value
+  (`0x0334`); five differ (`0x0246`, `0x026b` twice, `0x030f`, `0x0290`) --
+  shaped like a per-something (not obviously per-track: mapping index 0 to
+  track 0 does not line up track 2's own real machine type, or the pattern's
+  actual trig tracks 3/12/13/15 from the Z1 lane above, with the offsets
+  that differ here). **[D][O]**
+
+**So this tail-region discovery does not supply a trigger signal either.**
+Applying the same controlled-A/B method the "Note trigger and sample data"
+section above already used on the 2,050-byte payload -- hold everything
+else equal, vary only the one thing under test -- to the tail specifically:
+a `--kind idle --pre-instrs 15000000 --instrs 15000000` capture (kit-load
+refresh, no PLAY) and a `--kind play --pre-instrs 15000000 --instrs
+15000000` capture (kit-load refresh, then PLAY) are **byte-for-byte
+identical in the tail at every sampled frame**. The settling block above is
+caused by the natural per-track kit-load-and-refresh event ("Lane A3" above,
+`FUN_4002d9c4`/`FUN_4002d438`), not by starting the sequencer or firing a
+trigger. This extends the existing negative result -- "DSPI2's frame is
+unchanged by a real trigger once row state is held equal" -- from the
+2,050-byte payload to the full 2,748-byte transfer: **[D][C]**
+
+**Net reading, extended.** Across the whole DSPI2 transfer, not only its
+documented real-payload prefix, no distinct edge-triggered "play this note
+now" byte was found; every byte that does change between frames is
+explained by either a generic counter or the kit-load level-state refresh,
+both already accounted for. This does not prove no such signal exists
+anywhere (a different `--force-period`/timing, a different pattern, or
+un-swept ColdFire code paths are all untested here), but it closes the one
+concrete gap ("look in the full 2,748-byte transfer, not only the payload")
+this lane was asked to check. **[O]**
+
+Not independently re-checked by a second agent (this lane's own budget);
+reproduce with:
+
+```
+uv run python tools/sharc_capture_run.py snapshots/dt2-1.16/boot400M.snap \
+  --out out/captures/dt2-1.16-idle-pretracks-fulltx.dt2cap \
+  --kind idle --instrs 15000000 --pre-instrs 15000000 --syx <the .syx>
+uv run python tools/sharc_capture_run.py snapshots/dt2-1.16/boot400M.snap \
+  --out out/captures/dt2-1.16-play-pretracks-fulltx.dt2cap \
+  --kind play --instrs 15000000 --pre-instrs 15000000 --syx <the .syx>
+```
+
+then compare `frame.tx[0x802:]` across both captures with
+`emu/sharc_capture.py`'s `load()`. Captures not committed (`out/` is
+gitignored).
+
+## Lane D2: DM(0x261a10) is a small SPI-slave driver control block, not the frame payload **[D][O]**
+
+`docs/findings/06-sharc-engine-and-startup.md`'s "Task loop" section names
+`FUN_1c77b4` (the sole writer of `command_word_shift_src`, `DM(0x261ca4)`)
+as "a callback on a driver around RX buffer `0x261a10`" (lane C2). Static
+reading of that driver's own construction (`FUN_1c9fd5(R12=0x261a10,
+R4=2)`, called from `FUN_1c7bd4`) and its sibling configuration helpers:
+
+- **Size.** `FUN_1c9fd5` zero-fills exactly `0x104` (260) bytes starting at
+  `0x261a10` (`CALL FUN_1c0ccf` with `R4=0x261a10, R12=0x104`, a generic
+  memset the width-audit style trip-count halving confirms is byte-granular)
+  -- far too small to hold the 2,050-byte real payload, let alone the
+  2,748-byte transfer. It also writes the buffer pointer itself into a
+  40-byte-stride driver-object table entry at `0x2694a0 + 2*0x28` (word
+  offset +9, i.e. byte `+0x24`, form 15b/x4), and builds a small
+  self-referencing sub-descriptor at `0x261a10+0x24` (word 7 of the buffer
+  itself points back to `+0x24`; word 16 is set to the constant `0x10`).
+  **[D]**
+- **Peripheral: an on-chip SPI configured as a slave.** Five small helper
+  functions share the same "object -> word 0 -> +4" control-register-mirror
+  indirection and each set/clear one SPI_CTL bitfield (ADSP-2156x HWR Table
+  15-18, `out/refs/adsp-2156x-hwr/pages/`): `FUN_1c8ef4` sets `SIZE=1`
+  (16-bit words, bits 10:9), `FUN_1c8e9f` clears `CPOL` (bit 5),
+  `FUN_1c8e8c` sets `CPHA` (bit 4), `FUN_1c8edf` writes the `MIOM` field
+  (bits 21:20), and `FUN_1c9195` -- after taking a lock via `0xb87838` (the
+  same lock the SPORT/DMA descriptor-submission code in
+  docs/findings/06-sharc-engine-and-startup.md's "Static results for the
+  DMA/SPORT slice" also uses) -- clears bit **1**, `SPI_CTL.MSTR`, i.e.
+  configures the peripheral as **slave** (0), consistent with the ColdFire
+  being DSPI2 master. The lock/unlock pair (`0xb87838`/`0xb87871`) and the
+  object-init helper `FUN_1c9f9c` (calls `0xb87e25` with a fixed size
+  argument `0x4c`) live in the same `0xb87xxx`-`0xb8dxxx` L2 overlay finding
+  06 already identifies as "ADI SSL driver-service bookkeeping" -- this
+  driver object is very likely a standard ADI System Services Library SPI
+  service instance, not bespoke code, which is also why `FUN_1c77b4` (the
+  registered callback) has no static caller: it is invoked through the
+  library's own generic ISR-to-callback dispatch, not called by name
+  anywhere in this image. **[D][O]** Which physical instance (SPI0/1/2) was
+  not pinned down: no SPI MMR literal (`0x3102e000`-`0x31031000`) was found
+  by a `dataref`-table query over the whole image. **[O]**
+- **Readers of the buffer's own payload area: none found.** `img.readers`/
+  `img.writers` over `[0x261a10, 0x261a10+0x104)` return only `base_only`
+  (unresolved-offset, same-page) hits, no `resolved` one -- consistent with
+  this being a *control* object (lock, callback pointer, capacity fields)
+  that SHARC code touches by field, while the actual received bytes are
+  moved by DMA hardware directly to wherever the peripheral's own
+  descriptor's `ADDRSTART` points (not traced to a concrete value here: the
+  self-referencing sub-descriptor at `+0x24` is shaped like the same
+  `DSCPTR_NXT, ADDRSTART, CFG, XCNT, XMOD, YCNT, YMOD` template finding 06's
+  SPORT/DMA section already documents for the audio rings, but its own
+  `ADDRSTART` field was not resolved statically here). **[D][O]**
+- **Relation to `0x2558dc`: not a copy source, and the 2,748-byte transfer
+  is not split between them.** `0x2558dc` (finding 06, "The ColdFire frame
+  is mapped into SHARC DM at `0x2558dc`") is the confirmed, execution-tested,
+  2,050-byte payload landing zone; `0x261a10` is a 260-byte control block
+  that cannot hold any meaningful fraction of either the payload or the
+  full transfer, and lies immediately before the live ring A/B/C/D DMA
+  buffers (`0x261cc8`-`0x263938`) -- writing the full transfer there (tried
+  as a bounded, capped diagnostic poke in `tools/sharc_replay.py
+  --poke-transfer-tail`, bounded to this block's own `0x104`-byte size to
+  avoid stomping the rings) is not a plausible real destination. The two
+  addresses serve different roles of the *same* DSPI2 link: `0x261a10` is
+  the driver's own bookkeeping; `0x2558dc` is where the payload lands.
+  **[D]**

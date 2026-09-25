@@ -131,11 +131,37 @@ CANDIDATE_RX_BUFFERS = {
 
 # docs/findings/06's "The ColdFire frame is mapped into SHARC DM at
 # 0x2558dc": the confirmed (by execution) whole-frame mapped range
-# [0x2558dc, 0x2560de], 0x802 bytes -- exactly this tool's own captured `tx`
-# length (tools/sharc_capture_run.py hooks the firmware's own driver call,
-# whose own argument length is 0x802). Byte i of the payload maps to DM byte
-# RX_BASE + i, one-to-one.
+# [0x2558dc, 0x2560de], 0x802 bytes -- the real-payload prefix of this tool's
+# own captured `tx` (see TX_PAYLOAD_BYTES below; tools/sharc_capture_run.py
+# now captures the whole FRAME_BYTES-byte wire frame, not only this prefix).
+# Byte i of the payload maps to DM byte RX_BASE + i, one-to-one.
 RX_BASE = 0x2558DC
+
+# emu/dspiframe.py's TX_PAYLOAD_BYTES["dt2"]: the real-payload length the
+# ColdFire driver copies out of its own TX source buffer before padding the
+# rest of the FRAME_BYTES=0xabc (2,748) byte wire frame with tag-only PUSHR
+# entries (docs/findings/04-coldfire-dsp-link.md, "TX length ... are not two
+# independently sized directions"). RX_BASE's own confirmed mapping covers
+# exactly this prefix -- write only this many bytes of a captured frame
+# there; the rest (`TRANSFER_TAIL_*` below) is a separate, unconfirmed
+# question this lane's own task asks to check, not assumed to share the same
+# destination.
+TX_PAYLOAD_BYTES = 0x802
+
+# Lane D2's own item 1/2: DM(0x261a10) is the small (0x104-byte, confirmed by
+# tracing its own zero-fill call `FUN_1c9fd5(R12=0x261a10, R4=2)` ->
+# `FUN_1c0ccf`) control block of an on-chip SPI peripheral driver (SPI_CTL
+# bitfield writers found nearby -- CPOL/CPHA/SIZE/MSTR=0, i.e. configured as
+# an SPI *slave*, matching the ColdFire being DSPI2 master), not a payload
+# buffer: it is far too small to hold the 2,050-byte real payload, let alone
+# the full 2,748-byte transfer, and lies immediately before the SHARC's own
+# live ring A/B/C/D DMA buffers (0x261cc8-0x263938), which a naive "write the
+# whole captured transfer here" would stomp over. This tool writes at most
+# this many bytes of a captured transfer's *tail* (the part past
+# `TX_PAYLOAD_BYTES`) there -- a bounded, diagnostic-only poke
+# (`--poke-transfer-tail`), not a claim that this is the real destination.
+TRANSFER_TAIL_BASE = 0x261A10
+TRANSFER_TAIL_MAX_BYTES = 0x104
 
 # docs/findings/04's per-track TX frame map: offsets into the ColdFire's own
 # 0x802-byte payload, which is also this tool's captured `tx` bytes (see
@@ -195,7 +221,11 @@ def frame_command(tx: bytes) -> int:
 def describe_frame(tx: bytes) -> dict:
     """-> per-track machine type / derived-flag words this captured frame
     carries, from the ColdFire's own documented TX layout -- independent of
-    where, or whether, it lands on the SHARC side."""
+    where, or whether, it lands on the SHARC side. Also reports the
+    transfer's tail (past `TX_PAYLOAD_BYTES`, see that constant's own
+    docstring): a capture made before this lane's `tools/sharc_capture_run.py`
+    fix only ever has `tx_len == TX_PAYLOAD_BYTES` (an empty tail, `None`
+    fields below), not a claim the tail is absent on real hardware."""
     tracks = [
         {
             "track": i,
@@ -205,7 +235,14 @@ def describe_frame(tx: bytes) -> dict:
         }
         for i in range(TRACK_COUNT)
     ]
-    return {"tx_len": len(tx), "tracks": tracks}
+    tail = tx[TX_PAYLOAD_BYTES:]
+    return {
+        "tx_len": len(tx),
+        "tracks": tracks,
+        "has_tail": len(tail) > 0,
+        "tail_len": len(tail),
+        "tail_nonzero": any(tail) if tail else None,
+    }
 
 
 def _write_bytes(state, base: int, data: bytes) -> None:
@@ -318,6 +355,7 @@ def replay(
     *,
     n_frames: int | None = None,
     poke_candidates: bool = False,
+    poke_transfer_tail: bool = False,
     command: int | None = None,
     ring_flag: int = 0,
     tone_freq: float = 1000.0,
@@ -374,6 +412,7 @@ def replay(
     first_stop = None
     other_voices_active: dict[int, int] = {}
     commands_seen: dict[int, int] = {}
+    prev_tail: bytes | None = None
 
     target_lo = min(MASTER_BUS_DECODED[0], MIX_GATE[0], SLOT_TYPE_WATCH[0])
     target_hi = max(MASTER_BUS_DECODED[1], MIX_GATE[1], SLOT_TYPE_WATCH[1])
@@ -395,10 +434,25 @@ def replay(
         info["command"] = cmd
         commands_seen[cmd] = commands_seen.get(cmd, 0) + 1
 
-        _write_bytes(state, RX_BASE, frame.tx)
+        payload = frame.tx[:TX_PAYLOAD_BYTES]
+        tail = frame.tx[TX_PAYLOAD_BYTES:]
+        _write_bytes(state, RX_BASE, payload)
         if poke_candidates:
             for addr in CANDIDATE_RX_BUFFERS.values():
-                _write_bytes(state, addr, frame.tx)
+                _write_bytes(state, addr, payload)
+        if poke_transfer_tail and tail:
+            # Lane D2 item 2/3, diagnostic only -- see TRANSFER_TAIL_BASE's
+            # own docstring: this is bounded to the driver control block's
+            # own zero-filled size, not the tail's full length, since the
+            # tail (up to 698 bytes for DT2) is longer than that block and
+            # would otherwise overwrite the live ring A/B/C/D DMA buffers
+            # that start immediately after it.
+            _write_bytes(state, TRANSFER_TAIL_BASE, tail[:TRANSFER_TAIL_MAX_BYTES])
+        info["tail_changed_from_previous"] = (
+            None if prev_tail is None or not tail else tail != prev_tail
+        )
+        if tail:
+            prev_tail = tail
         h._poke(state, p.command_word_shift_src, 0)
         h._poke(state, p.command_word, cmd)
 
@@ -459,8 +513,11 @@ def replay(
         "frames_in_capture": len(cap.dspi2_frames),
         "frames_replayed": len(frames),
         "rx_base": "%#x" % RX_BASE,
+        "tx_payload_bytes": "%#x" % TX_PAYLOAD_BYTES,
+        "transfer_tail_base": "%#x" % TRANSFER_TAIL_BASE,
         "candidate_rx_buffers": {k: "%#x" % v for k, v in CANDIDATE_RX_BUFFERS.items()},
         "poked_candidates": poke_candidates,
+        "poked_transfer_tail": poke_transfer_tail,
         "tone_freq_hz": tone_freq,
         "commands_seen": commands_seen,
         "forced_command": command,
@@ -500,6 +557,15 @@ def parse_args(argv=None):
         "docstring) alongside the confirmed RX_BASE -- diagnostic only",
     )
     p.add_argument(
+        "--poke-transfer-tail",
+        action="store_true",
+        help="also write the captured transfer's tail (past TX_PAYLOAD_BYTES, "
+        "only present in captures made with tools/sharc_capture_run.py's "
+        "full-transfer capture) to TRANSFER_TAIL_BASE (0x261a10), bounded to "
+        "TRANSFER_TAIL_MAX_BYTES -- diagnostic only, see that constant's own "
+        "docstring for why it is not written in full",
+    )
+    p.add_argument(
         "--force-command",
         type=int,
         default=None,
@@ -517,6 +583,7 @@ def main(argv=None) -> int:
         args.capture,
         n_frames=args.frames,
         poke_candidates=args.poke_candidates,
+        poke_transfer_tail=args.poke_transfer_tail,
         command=args.force_command,
         tone_freq=args.freq,
         sample_len=args.sample_len,

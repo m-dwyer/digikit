@@ -456,7 +456,27 @@ def run(
     def driver_hook(uc, addr, size, data):
         sp = uc.reg_read(UC_M68K_REG_A7)
         ret, tx_len, tx, rx_len, rx = dspiframe.read_driver_call(uc, sp)
-        tx_bytes = bytes(uc.mem_read(tx, tx_len)) if tx and tx_len else b""
+        # Capture the *whole* `dspiframe.FRAME_BYTES`-byte wire frame from
+        # `tx`, not only the driver call's own `tx_len` (0x802 real payload
+        # words) argument -- see this module's own docstring, "Getting a
+        # DSPI2 driver call to happen at all", and dspiframe.py's "TX length"
+        # note: the driver's TX source buffer is one persistent
+        # `FRAME_BYTES`-byte on-chip SRAM region (TX_BASE_DT2/DN2), built
+        # once at boot with `0x8001xxxx` PUSHR tag-only entries past
+        # `tx_len` and only the first `tx_len` bytes refreshed by a memcpy
+        # each cycle; reading the whole region lets a capture consumer (see
+        # tools/sharc_replay.py) check that tail for a signal docs/findings/
+        # 04-coldfire-dsp-link.md's "Note trigger and sample data" section
+        # did not find in the payload alone, instead of assuming it is
+        # constant tag padding. Falls back to `tx_len` bytes if the extra
+        # read is not safely mapped (e.g. the test-mode driver's own
+        # differently based, possibly shorter TX buffer), so this is a
+        # strict superset of the old behaviour on every real DT2/DN2 capture.
+        want = max(tx_len, dspiframe.FRAME_BYTES)
+        try:
+            tx_bytes = bytes(uc.mem_read(tx, want)) if tx and want else b""
+        except Exception:
+            tx_bytes = bytes(uc.mem_read(tx, tx_len)) if tx and tx_len else b""
         rx_bytes = peer.exchange(tx_bytes)
         if rx and rx_len:
             fill = rx_bytes[:rx_len].ljust(rx_len, b"\x00")
