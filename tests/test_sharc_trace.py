@@ -875,11 +875,130 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(loaded_pair.uregs[10], T.Const(0x12345678))
         self.assertEqual(loaded_pair.uregs[11], T.Const(0x9ABCDEF0))
 
-        odd_pair = self.run_one(
-            T.State(10),
+        # An odd-coded ureg pairs with ureg-1, not ureg+1 (PRM p.6-5's odd
+        # DAG-register case): R7 (explicit, low half) with R6 (its
+        # neighbor, high half) -- the reverse order from the even R6/R7
+        # pairing above, but the same two addresses.
+        odd_store = self.run_one(
+            T.State(
+                10,
+                {6: T.Const(0x11111111), 7: T.Const(0x22222222)},
+                concrete=memory,
+                assume_nw32=True,
+            ),
             insn("14a", {**long_fields, "ureg[6:0]": 7}, 6),
         )
-        self.assertEqual(odd_pair.stopped, "unsupported Type14a odd UREG pair")
+        self.assertIsNone(odd_store.stopped)
+        self.assertEqual(odd_store.trace[0]["ureg_pair"], ["R7", "R6"])
+        self.assertEqual(T._dm_read(odd_store, 0x200, 4), T.Const(0x22222222))
+        self.assertEqual(T._dm_read(odd_store, 0x204, 4), T.Const(0x11111111))
+
+        odd_store.pc_sw = 10
+        odd_load = self.run_one(
+            odd_store,
+            insn("14a", {**long_fields, "d": 0, "ureg[6:0]": 7}, 6),
+        )
+        self.assertIsNone(odd_load.stopped)
+        self.assertEqual(odd_load.trace[0]["ureg_pair"], ["R7", "R6"])
+        self.assertEqual(odd_load.uregs[7], T.Const(0x22222222))
+        self.assertEqual(odd_load.uregs[6], T.Const(0x11111111))
+
+    def test_type14a_long_word_system_register_and_unpaired_uregs(self):
+        """Real SW 0x1c32ad (1847981): "USTAT2 = DM(0xc0210f0c), long"
+        (ureg[6:0]=113=USTAT2, d=0, g=0, l=1) -- previously refused
+        outright as "unsupported Type14a odd UREG pair". USTAT1/USTAT2 is
+        one of Table 2-3's complementary pairs (PRM p.2-12), not a
+        register-file neighbor pair, so a (LW) load fills only the named
+        register (p.2-9: "USTAT1 = DM (LW address); /* Loads only USTAT1
+        in SISD mode */"); a store still writes both (same page: "DM (LW
+        address) = USTAT1; /* Stores both USTAT1 and USTAT2 */"). A UREG
+        with no pair at all (PC here) instead replicates its one value
+        into both halves on a store (p.2-9/2-10's "Uncomplementary Ureg to
+        Memory LW Transfers") and, symmetrically, a load fills only the
+        named register.
+        """
+        memory = loader_memory(loader_block(0, 0x400, 8, payload=b"\0" * 8))
+        fields = {
+            "addr[31:16]": 0,
+            "addr[15:0]": 0x400,
+            "g": 0,
+            "l": 1,
+        }
+
+        store = self.run_one(
+            T.State(
+                10,
+                {
+                    T.UREG_CODES["USTAT1"]: T.Const(0x11111111),
+                    T.UREG_CODES["USTAT2"]: T.Const(0x22222222),
+                },
+                concrete=memory,
+                assume_nw32=True,
+            ),
+            insn("14a", {**fields, "d": 1, "ureg[6:0]": T.UREG_CODES["USTAT2"]}, 6),
+        )
+        self.assertIsNone(store.stopped)
+        self.assertEqual(store.trace[0]["ureg_pair"], ["USTAT2", "USTAT1"])
+        self.assertEqual(T._dm_read(store, 0x400, 4), T.Const(0x22222222))
+        self.assertEqual(T._dm_read(store, 0x404, 4), T.Const(0x11111111))
+
+        # Each State has its own write overlay (concrete memory is
+        # immutable and shared), so seed this fresh state's own overlay
+        # directly rather than relying on the store above.
+        load_state = T.State(10, {}, concrete=memory, assume_nw32=True)
+        self.assertTrue(T._dm_write(load_state, 0x400, 4, T.Const(0x22222222)))
+        self.assertTrue(T._dm_write(load_state, 0x404, 4, T.Const(0x11111111)))
+        load = self.run_one(
+            load_state,
+            insn("14a", {**fields, "d": 0, "ureg[6:0]": T.UREG_CODES["USTAT2"]}, 6),
+        )
+        self.assertIsNone(load.stopped)
+        # Only the named register is filled -- USTAT1 is left untouched.
+        self.assertEqual(load.trace[0]["ureg_pair"], ["USTAT2"])
+        self.assertEqual(load.uregs[T.UREG_CODES["USTAT2"]], T.Const(0x22222222))
+        self.assertNotIn(T.UREG_CODES["USTAT1"], load.uregs)
+
+        pc_memory = loader_memory(loader_block(0, 0x500, 8, payload=b"\0" * 8))
+        pc_store = self.run_one(
+            T.State(
+                10,
+                {T.UREG_CODES["PC"]: T.Const(0x33333333)},
+                concrete=pc_memory,
+                assume_nw32=True,
+            ),
+            insn(
+                "14a",
+                {
+                    **fields,
+                    "addr[15:0]": 0x500,
+                    "d": 1,
+                    "ureg[6:0]": T.UREG_CODES["PC"],
+                },
+                6,
+            ),
+        )
+        self.assertIsNone(pc_store.stopped)
+        self.assertEqual(pc_store.trace[0]["ureg_pair"], ["PC", "PC"])
+        # No real neighbor: the one value is replicated into both halves.
+        self.assertEqual(T._dm_read(pc_store, 0x500, 4), T.Const(0x33333333))
+        self.assertEqual(T._dm_read(pc_store, 0x504, 4), T.Const(0x33333333))
+
+        pc_load_state = T.State(10, {}, concrete=pc_memory, assume_nw32=True)
+        self.assertTrue(T._dm_write(pc_load_state, 0x500, 4, T.Const(0x33333333)))
+        self.assertTrue(T._dm_write(pc_load_state, 0x504, 4, T.Const(0x99999999)))
+        pc_load = self.run_one(
+            pc_load_state,
+            insn(
+                "14a",
+                {**fields, "addr[15:0]": 0x500, "d": 0, "ureg[6:0]": T.UREG_CODES["PC"]},
+                6,
+            ),
+        )
+        self.assertIsNone(pc_load.stopped)
+        self.assertEqual(pc_load.trace[0]["ureg_pair"], ["PC"])
+        # The high half (0x99999999) is never consulted for an unpaired
+        # UREG's load.
+        self.assertEqual(pc_load.uregs[T.UREG_CODES["PC"]], T.Const(0x33333333))
 
     def test_type7d_aconv_matches_prm_worked_example(self):
         # out/refs/sharc-plus-prm p.351 ACONV Example: "I0 = B2W(I2);" and
@@ -1211,6 +1330,8 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(loaded_pair.uregs[10], T.Const(0x11111111))
         self.assertEqual(loaded_pair.uregs[11], T.Const(0x22222222))
 
+        # R7 (explicit, odd) pairs with R6, not R8 (PRM p.6-5's odd
+        # DAG-register case): no concrete memory here, only the pairing.
         odd_pair = self.run_one(
             T.State(1, {16: T.Const(0x300)}),
             insn(
@@ -1227,7 +1348,10 @@ class TraceTest(unittest.TestCase):
                 6,
             ),
         )
-        self.assertEqual(odd_pair.stopped, "unsupported Type15a odd UREG pair")
+        self.assertIsNone(odd_pair.stopped)
+        self.assertEqual(odd_pair.trace[0]["ureg_pair"], ["R7", "R6"])
+        self.assertIsInstance(odd_pair.uregs[7], T.Unknown)
+        self.assertIsInstance(odd_pair.uregs[6], T.Unknown)
 
     def test_type4a_store_and_type15a_load_of_the_same_normal_word_slot(self):
         """A Type4a store and a Type15a load of the same architectural
@@ -1357,6 +1481,8 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(loaded.uregs[5], T.Const(0x55667788))
         self.assertEqual(loaded.trace[0]["access_width"], "long-word")
 
+        # R7 (explicit, odd) pairs with R6, not R8: no concrete data backs
+        # this address, only the pairing.
         odd_pair = self.run_one(
             T.State(1, {i6: T.Const(0x2000)}, concrete=loader_memory()),
             insn(
@@ -1365,7 +1491,10 @@ class TraceTest(unittest.TestCase):
                 4,
             ),
         )
-        self.assertEqual(odd_pair.stopped, "unsupported Type15b odd UREG pair")
+        self.assertIsNone(odd_pair.stopped)
+        self.assertEqual(odd_pair.trace[0]["ureg_pair"], ["R7", "R6"])
+        self.assertIsInstance(odd_pair.uregs[7], T.Unknown)
+        self.assertIsInstance(odd_pair.uregs[6], T.Unknown)
 
         store_state = T.State(
             1,

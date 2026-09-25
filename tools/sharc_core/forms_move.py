@@ -38,6 +38,8 @@ from .state import (
     _cureg_code,
     _event,
     _json_value,
+    _lw_pair_loads_mate,
+    _lw_pair_mate,
     _render,
     _simd_active,
     _stop,
@@ -46,10 +48,38 @@ from .state import (
 from .values import (
     Const,
     Unknown,
+    Value,
     _add,
     _multiply,
     _signed,
 )
+
+
+def _lw_store_pair(
+    uregs: Mapping[int, Value], code: int
+) -> tuple[list[int], list[Value]]:
+    """UREG codes (explicit first) and values a (LW) store from CODE writes
+    low-then-high into memory. A real pair-mate's own value goes in the
+    high half (_lw_pair_mate); an unpaired UREG (_lw_pair_mate returns
+    None) replicates CODE's own value into both halves instead (PRM
+    p.2-9/2-10, see state._LW_COMPLEMENTARY_CODES)."""
+    mate = _lw_pair_mate(code)
+    explicit_value = _ureg(uregs, code)
+    if mate is None:
+        return [code, code], [explicit_value, explicit_value]
+    return [code, mate], [explicit_value, _ureg(uregs, mate)]
+
+
+def _lw_load_codes(code: int) -> list[int]:
+    """UREG codes a (LW) load into CODE fills, explicit (low half) first:
+    both members of a register-file neighbor pair, or just CODE itself for
+    a complementary system-register pair or an unpaired UREG (see
+    state._lw_pair_loads_mate)."""
+    if _lw_pair_loads_mate(code):
+        mate = _lw_pair_mate(code)
+        assert mate is not None
+        return [code, mate]
+    return [code]
 
 
 def _type_17a(
@@ -92,10 +122,11 @@ def _type_3a(
     # instruction modifier (LW) overrides SIMD Mode" -- matching
     # Type14a's PM/DM long-word branch and memory._simd_ureg_mem_
     # companion's own long-word case, this is SISD-only, no
-    # complementary-register companion transfer. Only an even-coded
-    # ureg is supported (this tracer's existing Type14a convention:
-    # the neighbor is ureg+1); an odd ureg has no lower neighbor to
-    # pair with here and is left unsupported rather than guessed.
+    # complementary-register companion transfer. An odd-coded ureg pairs
+    # with ureg-1 instead of ureg+1 (state._lw_pair_mate, PRM p.6-5's
+    # odd-DAG-register case), and a handful of non-register-file ureg
+    # codes pair up (or, for a load, do not) differently again --
+    # state._lw_pair_mate's docstring has the full rule and citations.
     cond = _field(f, "cond")
     old = dict(state.uregs)
     compute_fields = dict(f)
@@ -115,8 +146,6 @@ def _type_3a(
 
     long_word = bool(_field(f, "l"))
     ureg = _field(f, "ureg")
-    if long_word and (ureg & 1 or ureg + 1 >= len(UREG_NAMES)):
-        return [_stop(state, insn, "unsupported Type3a odd UREG pair")]
 
     def run_transfer(target: State) -> None:
         bank = 8 if _field(f, "g") else 0
@@ -131,13 +160,12 @@ def _type_3a(
         address = iv if post_modify else modified
         rendered = _render(address)
         if long_word:
-            pair = (ureg, ureg + 1)
             pair_addresses = [
                 _add(address, Const(4 * offset), "%s + %d" % (rendered, 4 * offset))
                 for offset in range(2)
             ]
             if _field(f, "d"):
-                values = tuple(_ureg(old, item) for item in pair)
+                codes, values = _lw_store_pair(old, ureg)
                 writes = (
                     tuple(
                         _dm_write(target, item_address, 4, value)
@@ -153,7 +181,7 @@ def _type_3a(
                     insn,
                     "store",
                     space=space,
-                    ureg_pair=[UREG_NAMES[item] for item in pair],
+                    ureg_pair=[UREG_NAMES[item] for item in codes],
                     values=[_json_value(value) for value in values],
                     address=address,
                     expression=rendered,
@@ -162,15 +190,14 @@ def _type_3a(
                     access_width="long-word",
                 )
             else:
+                codes = _lw_load_codes(ureg)
+                offsets = pair_addresses[: len(codes)]
                 loaded_values = (
-                    tuple(
-                        _dm_read(target, item_address, 4)
-                        for item_address in pair_addresses
-                    )
+                    tuple(_dm_read(target, item_address, 4) for item_address in offsets)
                     if space == "DM"
-                    else (None, None)
+                    else tuple(None for _ in codes)
                 )
-                for item, mem_value in zip(pair, loaded_values, strict=True):
+                for item, mem_value in zip(codes, loaded_values, strict=True):
                     target.uregs[item] = mem_value or Unknown(
                         "memory-address " + rendered
                     )
@@ -179,7 +206,7 @@ def _type_3a(
                     insn,
                     "load",
                     space=space,
-                    ureg_pair=[UREG_NAMES[item] for item in pair],
+                    ureg_pair=[UREG_NAMES[item] for item in codes],
                     address=address,
                     expression=rendered,
                     concrete_values=[
@@ -252,13 +279,10 @@ def _type_14a(
         code = _field(f, "ureg")
         if _field(f, "g"):
             return [_stop(state, insn, "unsupported Type14a PM long-word access")]
-        if code & 1 or code + 1 >= len(UREG_NAMES):
-            return [_stop(state, insn, "unsupported Type14a odd UREG pair")]
         address = _wide(f, "addr")
         rendered = _render(Const(address))
-        pair = (code, code + 1)
         if _field(f, "d"):
-            values = tuple(_ureg(state.uregs, item) for item in pair)
+            codes, values = _lw_store_pair(state.uregs, code)
             writes = tuple(
                 _dm_write(state, address + 4 * offset, 4, value)
                 for offset, value in enumerate(values)
@@ -269,7 +293,7 @@ def _type_14a(
                 insn,
                 "store",
                 space="DM",
-                ureg_pair=[UREG_NAMES[item] for item in pair],
+                ureg_pair=[UREG_NAMES[item] for item in codes],
                 values=[_json_value(value) for value in values],
                 address=address,
                 expression=rendered,
@@ -278,11 +302,12 @@ def _type_14a(
                 simd_companion_possible=False,
             )
         else:
+            codes = _lw_load_codes(code)
             loaded_values = tuple(
-                _dm_read(state, address + 4 * offset, 4) for offset in range(2)
+                _dm_read(state, address + 4 * offset, 4) for offset in range(len(codes))
             )
             for item, mem_value, offset in zip(
-                pair, loaded_values, range(2), strict=True
+                codes, loaded_values, range(len(codes)), strict=True
             ):
                 state.uregs[item] = mem_value or Unknown(
                     "memory-address " + _render(Const(address + 4 * offset))
@@ -292,7 +317,7 @@ def _type_14a(
                 insn,
                 "load",
                 space="DM",
-                ureg_pair=[UREG_NAMES[item] for item in pair],
+                ureg_pair=[UREG_NAMES[item] for item in codes],
                 address=address,
                 expression=rendered,
                 concrete_values=[
@@ -997,9 +1022,9 @@ def _type_15b(
     specify long word addressing, overriding default addressing from the
     memory map... if the instruction type uses optional forced long word
     modifier (LW)... register pair access is done" -- the same
-    register-pair (ureg, ureg+1) at (address, address+4) Type15a's own
-    (lw) already implements (this form's docstring, citing p.389), not a
-    single wider (8-byte) transfer into one register. That was the
+    register-pair access (state._lw_pair_mate) at (address, address+4)
+    Type15a's own (lw) already implements (this form's docstring, citing
+    p.389), not a single wider (8-byte) transfer into one register. That was the
     previous model here; sharc_core.memory._dm_read intentionally refuses
     any width > 4 ("a register pair, which this tracer does not model"),
     so every (LW) Type15b site read Unknown rather than a wrong value --
@@ -1022,15 +1047,12 @@ def _type_15b(
     rendered = _render(address)
     code = _field(f, "ureg")
     if _field(f, "l"):
-        if code & 1 or code + 1 >= len(UREG_NAMES):
-            return [_stop(state, insn, "unsupported Type15b odd UREG pair")]
-        pair = (code, code + 1)
-        offsets = tuple(
-            _add(address, Const(4 * off), "%s + %d" % (rendered, 4 * off))
-            for off in range(2)
-        )
         if _field(f, "d"):
-            values = tuple(_ureg(state.uregs, item) for item in pair)
+            codes, values = _lw_store_pair(state.uregs, code)
+            offsets = tuple(
+                _add(address, Const(4 * off), "%s + %d" % (rendered, 4 * off))
+                for off in range(len(codes))
+            )
             writes = tuple(
                 _dm_write(state, offset_address, 4, value)
                 for offset_address, value in zip(offsets, values, strict=True)
@@ -1039,7 +1061,7 @@ def _type_15b(
                 state,
                 insn,
                 "store",
-                ureg_pair=[UREG_NAMES[item] for item in pair],
+                ureg_pair=[UREG_NAMES[item] for item in codes],
                 values=[_json_value(value) for value in values],
                 address=address,
                 expression=rendered,
@@ -1048,16 +1070,21 @@ def _type_15b(
                 concrete_write=all(writes),
             )
         else:
+            codes = _lw_load_codes(code)
+            offsets = tuple(
+                _add(address, Const(4 * off), "%s + %d" % (rendered, 4 * off))
+                for off in range(len(codes))
+            )
             loaded_values = tuple(
                 _dm_read(state, offset_address, 4) for offset_address in offsets
             )
-            for item, mem_value in zip(pair, loaded_values, strict=True):
+            for item, mem_value in zip(codes, loaded_values, strict=True):
                 state.uregs[item] = mem_value or Unknown("memory-address " + rendered)
             _event(
                 state,
                 insn,
                 "load",
-                ureg_pair=[UREG_NAMES[item] for item in pair],
+                ureg_pair=[UREG_NAMES[item] for item in codes],
                 address=address,
                 expression=rendered,
                 access_width="long-word",
@@ -1135,15 +1162,12 @@ def _type_15a(
     space = "PM" if bank else "DM"
     if _field(f, "l"):
         code = _field(f, "ureg")
-        if code & 1 or code + 1 >= len(UREG_NAMES):
-            return [_stop(state, insn, "unsupported Type15a odd UREG pair")]
-        pair = (code, code + 1)
-        offsets = tuple(
-            _add(address, Const(4 * offset), "%s + %d" % (rendered, 4 * offset))
-            for offset in range(2)
-        )
         if _field(f, "d"):
-            values = tuple(_ureg(state.uregs, item) for item in pair)
+            codes, values = _lw_store_pair(state.uregs, code)
+            offsets = tuple(
+                _add(address, Const(4 * offset), "%s + %d" % (rendered, 4 * offset))
+                for offset in range(len(codes))
+            )
             writes = tuple(
                 _dm_write(state, offset_address, 4, value) if space == "DM" else False
                 for offset_address, value in zip(offsets, values, strict=True)
@@ -1154,7 +1178,7 @@ def _type_15a(
                 insn,
                 "store",
                 space=space,
-                ureg_pair=[UREG_NAMES[item] for item in pair],
+                ureg_pair=[UREG_NAMES[item] for item in codes],
                 values=[_json_value(value) for value in values],
                 address=address,
                 expression=rendered,
@@ -1163,18 +1187,23 @@ def _type_15a(
                 simd_companion_possible=False,
             )
         else:
+            codes = _lw_load_codes(code)
+            offsets = tuple(
+                _add(address, Const(4 * offset), "%s + %d" % (rendered, 4 * offset))
+                for offset in range(len(codes))
+            )
             loaded_values = tuple(
                 _dm_read(state, offset_address, 4) if space == "DM" else None
                 for offset_address in offsets
             )
-            for item, mem_value in zip(pair, loaded_values, strict=True):
+            for item, mem_value in zip(codes, loaded_values, strict=True):
                 state.uregs[item] = mem_value or Unknown("memory-address " + rendered)
             _event(
                 state,
                 insn,
                 "load",
                 space=space,
-                ureg_pair=[UREG_NAMES[item] for item in pair],
+                ureg_pair=[UREG_NAMES[item] for item in codes],
                 address=address,
                 expression=rendered,
                 concrete_values=[

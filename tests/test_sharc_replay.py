@@ -98,13 +98,15 @@ class ReplayIdleCaptureTest(unittest.TestCase):
     scan) reaches the same "frame-returned" milestone FRAME_MILESTONE pins.
     Frame 1 -- the first call to render_frame a *second* time, on state
     carried over from frame 0 -- hits a stop FRAME_MILESTONE's own
-    single-call measurement never reaches: forms_move.py's Type14a handler
-    refusing a long-word access whose decoded UREG code is odd (not a valid
-    register-pair start). This is a real, reproducible tools/sharc_core gap
-    (every later frame in a full 38-frame idle replay hits the identical
-    stop -- see Z2-report.md), not something this test papers over: an
-    intended fix updates this pin and says why, exactly like
-    FRAME_MILESTONE's own docstring asks.
+    single-call measurement never reaches. It used to be forms_move.py's
+    Type14a handler refusing a long-word access whose decoded UREG code is
+    odd (0x1c32ad, USTAT2); that gap is fixed (sharc_core.state
+    ._lw_pair_mate implements the PRM's odd-register and complementary
+    -pair (LW) rules, p.2-4/2-9/2-12/6-5), so frame 1 now runs one
+    instruction further and hits the next, unrelated gap: an unconfirmed
+    opcode at 0x1c32b0. This is still a real, reproducible tools/sharc_core
+    gap, not something this test papers over: an intended fix updates this
+    pin and says why, exactly like FRAME_MILESTONE's own docstring asks.
 
     ring_a_mono stays all-zero: the mix gate (Z2-report.md's "mix_gate")
     blocks the hand-set-up voice's output before it reaches the master mix,
@@ -130,9 +132,17 @@ class ReplayIdleCaptureTest(unittest.TestCase):
         self.assertEqual(frame0["stop_reason"], "frame-returned")
         self.assertEqual(frame0["instructions"], 95982)
 
-        self.assertEqual(frame1["stop_reason"], "unsupported Type14a odd UREG pair")
-        self.assertEqual(frame1["stop_pc"], "0x1c32ad")
-        self.assertEqual(frame1["instructions"], 82548)
+        # Type14a's odd-UREG-pair gap at 0x1c32ad is fixed (sharc_core.state
+        # ._lw_pair_mate: an odd ureg pairs with ureg-1, and USTAT2's own
+        # complementary-pair/load-only-the-named-register rule, PRM
+        # p.2-9/2-12); frame 1 now executes one instruction further and
+        # hits the next, unrelated gap -- an unconfirmed opcode.
+        self.assertEqual(
+            frame1["stop_reason"],
+            "uncertain or undecodable form: source: firmware (undocumented; unconfirmed)",
+        )
+        self.assertEqual(frame1["stop_pc"], "0x1c32b0")
+        self.assertEqual(frame1["instructions"], 82549)
 
         self.assertEqual(len(result["ring_a_mono"]), 64)
         self.assertEqual(max(abs(v) for v in result["ring_a_mono"]), 0.0)

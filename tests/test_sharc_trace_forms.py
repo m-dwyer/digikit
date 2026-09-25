@@ -597,7 +597,10 @@ class Type3aLongWordTest(unittest.TestCase):
         self.assertEqual(T._dm_read(result, 0x30002008, 4), T.Const(0x11111111))
         self.assertEqual(T._dm_read(result, 0x3000200C, 4), T.Const(0x22222222))
 
-    def test_odd_ureg_pair_is_unsupported(self):
+    def test_odd_ureg_pairs_with_the_register_below_it(self):
+        # R1 (explicit, odd) pairs with R0 (its neighbor), not R2 (PRM
+        # p.6-5's odd DAG-register case, mirrored onto R/S/I/M/L/B): the
+        # named register is always the low half regardless of parity.
         fields = {
             "compute": 0,
             "cond": 31,
@@ -607,11 +610,21 @@ class Type3aLongWordTest(unittest.TestCase):
             "l": 1,
             "m": 4,
             "u": 1,
-            "ureg": 1,  # R1: odd, no lower neighbor to pair with.
+            "ureg": 1,
         }
-        state = T.State(0x10, {T.UREG_CODES["I1"]: T.Const(0x1000)})
+        state = T.State(
+            0x10,
+            {T.UREG_CODES["I1"]: T.Const(0x30001000)},
+            concrete=loader_memory(),
+        )
+        self.assertTrue(T._dm_write(state, 0x30001000, 4, T.Const(0xCCCC)))
+        self.assertTrue(T._dm_write(state, 0x30001004, 4, T.Const(0xDDDD)))
         [result] = T._execute(state, insn("3a", fields, length=6))
-        self.assertEqual(result.stopped, "unsupported Type3a odd UREG pair")
+        self.assertIsNone(result.stopped)
+        load = result.trace[-1]
+        self.assertEqual(load["ureg_pair"], ["R1", "R0"])
+        self.assertEqual(result.uregs[T.UREG_CODES["R1"]], T.Const(0xCCCC))
+        self.assertEqual(result.uregs[T.UREG_CODES["R0"]], T.Const(0xDDDD))
 
 
 class UndocumentedFormsStopWithReasonTest(unittest.TestCase):

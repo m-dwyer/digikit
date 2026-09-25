@@ -275,9 +275,19 @@ def _event(state: State, insn: Instruction, action: str, **extra) -> None:
     if not state.record_events:
         # A few call sites (the predicate-resolved Type3a/2a/5a_move/9a_abs
         # idiom) do trace[-1].update(...) or trace[-1][...] = ... right
-        # after this call, on the non-forking, always-taken path -- so this
-        # must still append one dict, just not the full one.
-        state.trace.append({"action": action})
+        # after this call, on the non-forking, always-taken path -- so
+        # trace[-1] must exist and be this step's own dict, but nothing
+        # anywhere reads further back than that (grep the module docstring
+        # note above State.record_events) once this flag is off. Replacing
+        # the list's contents instead of appending to it keeps every
+        # State carrying this flag at a *constant* one entry for the rest
+        # of the run, however many instructions execute: appending here
+        # (the previous behaviour) left this the one unbounded structure in
+        # a long concrete run, since every State that copies TRACE forward
+        # (_copy, sharc_run.fresh_call_state, sharc_harness._clone_state)
+        # does ``[dict(event) for event in state.trace]`` -- a full replay
+        # transcript neither wanted nor read.
+        state.trace[:] = [{"action": action}]
         return
     for key in ("address", "value", "concrete_value"):
         if key in extra:
@@ -386,6 +396,52 @@ def _cureg_code(code: int) -> int | None:
     """The SIMD companion (Cureg) UREG code for CODE, or None if CODE has
     no SIMD complement (see _CUREG_PAIRS)."""
     return _CUREG_PAIRS.get(code)
+
+
+# SHARC+ Core Programming Reference (out/refs/sharc-plus-prm) p.2-4 (PDF
+# p.54) "Data Register Neighbor Pairing" and Table 2-2, and p.6-5 (PDF
+# p.189) "Long Word Memory Access Restrictions" and Table 6-1: every
+# register-file UREG (R0-15, I0-15, M0-15, L0-15, B0-15, S0-15; codes 0-95)
+# is grouped into fixed {2k, 2k+1} neighbor pairs for a (LW) transfer, and
+# the *explicit* (named) register always carries the low 32 bits, whichever
+# side of the pair it is on: "If the long word transfer specifies an odd
+# numbered DAG register ... the odd numbered register value transfers on
+# the lower half ... and the [even] register - 1 value transfers on the
+# upper half" (p.6-5, mirroring the even-register case's own "I2 loads to
+# I8/9 pair" example). XOR 1 gives the other member of the pair on either
+# side of the boundary, since every group starts on an even code and is 16
+# (an even count) wide, so it never crosses into the next group.
+#
+# p.2-12 (PDF p.62) Table 2-3 "Universal and System Register Complementary
+# Pairs" adds three more even/odd-adjacent pairs outside the register
+# files -- PX1/PX2, USTAT1/USTAT2, USTAT3/USTAT4 (UREG_NAMES codes 108/109,
+# 112/113, 126/127) -- so XOR 1 finds their mate too. Every other UREG (PC,
+# LCNTR, MODE1, ...) has no pair at all: p.2-9/2-10 (PDF p.60)
+# "Uncomplementary Ureg to Memory LW Transfers" shows a store of one of
+# these replicating its single 32-bit value into both halves of the long
+# word rather than reading a second register.
+_LW_COMPLEMENTARY_CODES = frozenset(
+    UREG_CODES[name]
+    for pair in (("PX1", "PX2"), ("USTAT1", "USTAT2"), ("USTAT3", "USTAT4"))
+    for name in pair
+)
+
+
+def _lw_pair_mate(code: int) -> int | None:
+    """The other UREG code CODE forms a (LW) pair with, or None if CODE has
+    no pair at all (see the comment above _LW_COMPLEMENTARY_CODES)."""
+    if code < 96 or code in _LW_COMPLEMENTARY_CODES:
+        return code ^ 1
+    return None
+
+
+def _lw_pair_loads_mate(code: int) -> bool:
+    """Whether a (LW) load into CODE also fills its pair-mate. True only
+    for the register-file neighbor pairs (codes 0-95, p.6-5's I8/I9 and
+    M5/M4 examples): the complementary system-register pairs load only the
+    named register (p.2-9's "USTAT1 = DM (LW address); /* Loads only
+    USTAT1 in SISD mode */"), same as an unpaired UREG."""
+    return code < 96
 
 
 def _simd_active(state: State) -> bool | None:

@@ -157,9 +157,9 @@ def _w_3a(f: dict) -> str:
     Table, every u/g/d row repeated with "(lw)" appended): l=1 selects the
     same long-word register-pair access as Type14a/15a/15b's (lw) option
     (``_w_pair``, PRM p.2-4 "Data Register Neighbor Pairing"); l=0 is an
-    ordinary normal-word transfer. ``_type_3a`` only executes l=1 for an
-    even-coded ureg (its own neighbor-pair convention); an odd ureg stops
-    before any load/store event, so this rule is never evaluated there."""
+    ordinary normal-word transfer. ``_type_3a`` executes l=1 for every
+    ureg, odd or even (``sharc_core.state._lw_pair_mate``), so this rule
+    applies regardless of parity."""
     return "long-word" if f.get("l") else "normal-word"
 
 
