@@ -48,6 +48,29 @@ second).
   transfer. The ColdFire emulator's PIT/DTIM timer service delays the kit
   load (lane A3), so the sequencer may not be running in real time.
 
+## Update (J1, J2, K1 and static reading, @ K1 merge)
+
+- `running.snap` (RTOS running, kit loaded) and `running-audio.snap` (SSI0
+  clocked at the audio rate, vector 191 fires by itself) exist. A real TRIG
+  on track 2 arms voice 4 through FUN_1c642a -> FUN_1c4eaf (no pokes).
+- The note path is mapped: FUN_1c2b24's tail loop (FUN_1c3289,
+  0x1c3289-0x1c33fe) handles new notes. Per voice it calls FUN_1c7442
+  (0x1c3371) -> FUN_1c4e70, which loads a sample into the voice (word +0
+  pointer, +0x188 length as Q31, +0x194 loop start; zero arguments clear
+  the voice, which is what we see every frame), and it writes the guard
+  bytes that make FUN_1c642a arm the voice. Its inputs come through the
+  pointers 0x254d78..0x254d90, copied each frame from the record at
+  0x266220 + (page<<12).
+- FUN_1c7bd4 (called from 0x1c80a2) builds two DMA descriptor rings with
+  the same length: ring 1 at 0x2641b0/0x2641cc -> 0x265220/0x264220 (the
+  command pages replay fills) and ring 2 at 0x2641e8/0x264204 ->
+  0x267220/0x266220 (the record pages). So the record is filled by DMA,
+  not by code: no static writer exists. Replay only fills ring 1.
+- Next: find which DMA channel and peripheral use ring 2 and its direction
+  (the second half of a full-duplex SPI? DSPI1?), capture that traffic from
+  running.snap, and deliver it in replay. Then the tail loop gets real
+  sample pointers and lengths.
+
 ## Update (lanes H1-H3, @ e8056cf)
 
 - Root cause of "no notes": no capture ever came from a ColdFire with its
