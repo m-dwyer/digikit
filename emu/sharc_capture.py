@@ -28,7 +28,7 @@ transport modeled -- only what crossed it).
 
     magic    8 bytes   b"DT2CAP1\\n"
     header   u32 length, then that many bytes of UTF-8 JSON:
-             {"frame_bytes": 2748, "kind": "idle"|"note", "device": "dt2",
+             {"frame_bytes": 2748, "kind": "idle"|"note"|"play", "device": "dt2",
               "source_sha256": "...", ...caller-supplied metadata}
     then records, back to back, each:
         type     1 byte    1=DSPI2 TX  2=DSPI2 RX  3=SSI0 RX
@@ -63,7 +63,7 @@ REC_SSI0_RX = 3
 _NO_COUNT = 0xFFFFFFFFFFFFFFFF
 _REC_HEADER = struct.Struct(">BQI")
 
-VALID_KINDS = ("idle", "note")
+VALID_KINDS = ("idle", "note", "play")
 
 
 class CaptureWriter:

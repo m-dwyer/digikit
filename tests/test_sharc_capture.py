@@ -77,13 +77,28 @@ class CaptureRoundTripTest(unittest.TestCase):
             if os.path.exists(path):
                 os.remove(path)
 
-    def test_kind_must_be_idle_or_note(self):
+    def test_kind_must_be_valid(self):
         with self.assertRaises(ValueError):
             CaptureWriter(
                 "/tmp/test_sharc_capture_bad_kind.dt2cap",
                 frame_bytes=2748,
                 kind="wat",
             )
+
+    def test_kind_play_round_trips(self):
+        # tools/sharc_capture_run.py's `--kind play` (presses the panel PLAY
+        # button instead of a single TRIG, to start the loaded pattern's own
+        # sequencer -- see that module's docstring): CaptureWriter/load must
+        # accept and preserve "play" the same way as "idle"/"note".
+        path = "/tmp/test_sharc_capture_kind_play.dt2cap"
+        try:
+            tx_frames, _ = self._write(path, kind="play", frames=2, ssi0=0)
+            cap = load(path)
+            self.assertEqual(cap.kind, "play")
+            self.assertEqual(len(cap.dspi2_frames), 2)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
 
     def test_counter_none_round_trips_as_none(self):
         path = "/tmp/test_sharc_capture_no_counter.dt2cap"

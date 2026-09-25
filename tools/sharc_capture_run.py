@@ -3,8 +3,9 @@ in" requests) from a running Digitakt II 1.16 snapshot, for
 tools/sharc_replay.py.
 
     uv run python tools/sharc_capture_run.py SNAPSHOT --out CAPTURE.dt2cap \
-        --kind idle|note --instrs N [--syx SYX] [--ssi0-hz N] [--trig-at N]
-        [--force-period N] [--unblock] [--poke-track-type TRACK:TYPE ...]
+        --kind idle|note|play --instrs N [--syx SYX] [--ssi0-hz N]
+        [--trig-at N] [--force-period N] [--unblock]
+        [--poke-track-type TRACK:TYPE ...]
 
 Two things a run needs, both handled here:
 
@@ -73,6 +74,26 @@ in that chain is the panel's own "Track 1" (1-indexed on the hardware,
 captures. No UI/framebuffer read is needed: the whole chain is inferred
 from the resulting TX frame bytes this tool already captures.
 
+**Starting the sequencer instead of a single panel trigger.** `--kind play`
+injects a panel "PLAY" press+release at `--trig-at` the same way (wire bytes
+`encode_buttons(2, 8)` then `encode_buttons(2, 0)` -- PLAY is channel 2 bit
+3, read back from the running image's own button-name table,
+`emu/panelin.py`'s `control_names(m, profile, 'button')`: code 20 = "PLAY",
+matching `code_for`'s `channel*8+bit+1` for channels 0-5). This does not
+need a `--poke-track-type`: the snapshot's already-loaded pattern has real
+active trigs on it (docs/findings/03-ui-and-panel.md, "A panel-path track
+trigger joins machine invalidation to the refresh queue": the causal
+control "machine change followed by `PLAY` scheduled records only for the
+current pattern's tracks 3, 12, 13 and 15" -- so starting the transport on
+a stock `boot400M.snap`-derived snapshot already reaches the same
+record/queue path as a bare panel TRIG, for those four tracks, with no
+pattern-data poke needed). Use it to test whether firmware-driven sequencer
+playback reaches the SHARC by a path a single hand-pressed TRIG does not
+exercise (real timing, real step advance) -- `--instrs` needs to cover at
+least one full pattern loop (16 steps) for every active track to be hit at
+least once; at the default tempo that is on the order of 10-20M ColdFire
+instructions from the press, not the few million `--kind note` needs.
+
 **Changing a track's machine, without re-running the real UI navigation.**
 The same finding's own causal-control run (`out/experiments/a2-queue-
 trigger/report.json`) already established, end to end and byte-checked,
@@ -129,6 +150,22 @@ from emu.sharc_capture import CaptureWriter, CapturingPeer  # noqa: E402
 TRIG_1_CHANNEL = 3
 TRIG_1_BIT = 0
 
+# PLAY's (channel, bit), read back from the running 1.16 image's own button
+# name table (`emu/panelin.py`'s `control_names(m, profile, 'button')`:
+# code 20 = "PLAY", code 19 = "RECORD", code 21 = "STOP", codes 25-40 =
+# "TRIG 1".."TRIG 16" -- matching `panelin.code_for`'s channel*8+bit+1 for
+# channels 0-5: code 20 -> channel 2, bit 3). Used for `--kind play`: start
+# the sequencer on the pattern already loaded in the snapshot (the a2-queue-
+# trigger experiment's "current pattern enqueues tracks 3,12,13,15 only"
+# recorded in docs/findings/03-ui-and-panel.md, "A panel-path track trigger
+# joins machine invalidation to the refresh queue" -- so a stock snapshot's
+# default pattern already has active trigs, with no pattern-data poke
+# needed) instead of a single panel TRIG, to test whether firmware-driven
+# sequencer playback reaches the SHARC by a different path than a bare panel
+# trigger.
+PLAY_CHANNEL = 2
+PLAY_BIT = 3
+
 # tools/framelink.py TABLES's 'track_9a' entry (base corrected to 0x80003cd0
 # in docs/findings/04-coldfire-dsp-link.md, "Corrections to the SRAM
 # layout"): 16 rows of 0x9a bytes; byte 0 of each row is the track's machine
@@ -184,9 +221,9 @@ def run(
     unblock: bool = False,
     poke_track_types: tuple[tuple[int, int], ...] = (),
 ) -> dict:
-    if kind not in ("idle", "note"):
-        raise ValueError("kind must be 'idle' or 'note', got %r" % (kind,))
-    if kind == "note" and trig_at is None:
+    if kind not in ("idle", "note", "play"):
+        raise ValueError("kind must be 'idle', 'note' or 'play', got %r" % (kind,))
+    if kind in ("note", "play") and trig_at is None:
         trig_at = instrs // 4
 
     image = config.main_image()
@@ -261,10 +298,15 @@ def run(
     forced = {"last": 0}
 
     def on_chunk(pc_, done):
-        if kind == "note" and not triggered["done"] and done >= trig_at:
-            data = panelin.encode_buttons(
-                TRIG_1_CHANNEL, 1 << TRIG_1_BIT
-            ) + panelin.encode_buttons(TRIG_1_CHANNEL, 0)
+        if kind in ("note", "play") and not triggered["done"] and done >= trig_at:
+            channel, bit = (
+                (TRIG_1_CHANNEL, TRIG_1_BIT)
+                if kind == "note"
+                else (PLAY_CHANNEL, PLAY_BIT)
+            )
+            data = panelin.encode_buttons(channel, 1 << bit) + panelin.encode_buttons(
+                channel, 0
+            )
             panelin.feed(m, panel_profile, data)
             triggered["done"] = True
         if done - forced["last"] >= force_period:
@@ -293,7 +335,7 @@ def run(
         "frames": writer.counts["dspi2_frames"],
         "ssi0_rx": writer.counts["ssi0_rx"],
         "ssi0_status": ssi0_status,
-        "triggered": triggered["done"] if kind == "note" else None,
+        "triggered": triggered["done"] if kind in ("note", "play") else None,
         "image_sha256": image_sha256,
         "out": out_path,
     }
@@ -305,7 +347,14 @@ def parse_args(argv=None):
     )
     p.add_argument("snapshot")
     p.add_argument("--out", required=True)
-    p.add_argument("--kind", choices=("idle", "note"), required=True)
+    p.add_argument(
+        "--kind",
+        choices=("idle", "note", "play"),
+        required=True,
+        help="idle: no panel input. note: panel TRIG 1 press+release at "
+        "--trig-at. play: panel PLAY press+release at --trig-at (starts "
+        "the loaded pattern; see this module's own docstring)",
+    )
     p.add_argument("--instrs", type=lambda s: int(s, 0), default=2_000_000)
     p.add_argument("--syx")
     p.add_argument("--ssi0-hz", type=int, default=1000)
