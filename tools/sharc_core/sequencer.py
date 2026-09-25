@@ -350,10 +350,26 @@ def _predicate_simd_branch(state: State, cond: int) -> bool | None:
     return pex if both == pex else None
 
 
-def _check_return_target(state: State) -> str | None:
-    """The firmware returns through JUMP (M14, I12) (DB). When both registers
-    are known, the jump target must equal the recorded return address."""
-    index = _ureg(state.uregs, UREG_CODES["I12"])
+def _check_return_target(state: State, pmi: int) -> str | None:
+    """The firmware returns through JUMP (M14, I(8+pmi)) (DB). SHARC+ Core
+    Programming Reference p.111 ("PC Stack Access", Table 4-3): only CALL
+    pushes the hardware PC stack and only RTS/RTI pop it -- an ordinary
+    JUMP (any addressing mode, including this one) has no PC-stack effect
+    at all. So this idiom is a pure software convention, not a hardware
+    return: the callee loads its own saved return address (from the
+    compiler's manual return-address stack -- the DM(I7++, M7) push
+    generated at the call site's delay slots) into whichever DAG2 index
+    register (I8-I15) its own register allocation leaves free, then jumps
+    back through that register plus M14 (the ABI's fixed return-address
+    modifier: DEFAULT_REGS/CORE_MMR reset gives M14 == 1). I12 (pmi == 4)
+    is what nearly every occurrence uses (tools/sharcdb census of dt2-1.16:
+    1051 of 1052 cond=0x1F/b=0/j=1/pmm=6 Type9a_abs/9b_abs instructions);
+    I13 (pmi == 5) appears once, at 0x1c0cb5, traced back to a DM load of
+    the same manual return-address slot into I13 at that function's own
+    entry (0x1c0c57) -- the identical idiom, a different register. When
+    both registers are known, the jump target must equal the recorded
+    return address."""
+    index = _ureg(state.uregs, UREG_CODES["I%d" % (8 + pmi)])
     modifier = _ureg(state.uregs, UREG_CODES["M14"])
     if not isinstance(index, Const) or not isinstance(modifier, Const):
         return None

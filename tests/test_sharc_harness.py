@@ -725,33 +725,55 @@ class FrameRenderFromInitTest(unittest.TestCase):
         # handover both record for an (almost) empty synthetic frame.
         self.assertEqual(halt.pc_sw, 0xB88E4B)
 
-    def test_render_frames_with_frame_patch_table_reaches_the_return_mismatch(self):
+    def test_render_frames_with_frame_patch_table_reaches_the_long_word_stop(self):
         runner, results = h.render_frames(self.memory, "dt2-1.16", n_frames=1)
         self.assertEqual(len(results), 1)
         halt = results[0].halt
         # FRAME_PATCH_TABLE's two hypotheses get past the first two known
         # stops (0xb88e4b, 0x1c4969); the Type18a bit test on a partly known
-        # ASTATX now resolves the third (0x1c088e). The frame then stops on
-        # a computed return in the 0xb82xxx routines.
+        # ASTATX now resolves the third (0x1c088e). The frame then used to
+        # stop on a computed return in the 0xb82xxx routines (0xb82bf1,
+        # 79,625 instructions: "return target 0xb82d1a differs from
+        # recorded return 0xb82b31").
         #
-        # pc_sw and instructions both moved (from 0xb82a30/191363) once
-        # tools/sharc_widthaudit.py's own audit found and this lane fixed
-        # two sharc_core width bugs it reaches: Type3d's w=0 branch
-        # ignoring l/x (tools/sharc_core/forms_move.py's _type_3d, see its
-        # own docstring) and Type4b's local width table mis-keying (1, 1,
-        # 1)/(0, 1, 1) against ACCESS_WIDTHS (_type_4b's own docstring).
-        # Before those fixes, both handlers silently performed a
-        # concretely wrong-width memory access instead of the correct one
-        # (Type3d) or an Unknown/no-op (Type4b's now-declined long-word
-        # case); the frame render used those wrong concrete values for
-        # longer before finally diverging, reaching this same class of
-        # halt 111,706 instructions later than it now does. This new stop
-        # is the more trustworthy one -- it reflects a run that stopped
-        # guessing on schedule (a wrong-width memory access misleading
-        # nothing) -- not a regression.
-        self.assertIn("differs from recorded return", halt.reason)
-        self.assertEqual(halt.pc_sw, 0xB82BF1)
-        self.assertEqual(results[0].instructions, 79625)
+        # That stop was this lane's own sequencer gap, not a firmware
+        # anomaly: FUN_b82b09 (0xb82b09) calls FUN_1c0c3f (0x1c0c40) with a
+        # real hardware CALL (pushing 0xb82b31 onto call_stack), but
+        # FUN_1c0c3f returns through a Type9b_abs JUMP over I13/M14
+        # (0x1c0cb5, "JUMP delayed target=indirect PM(I5, M6)" in this
+        # image's own disassembly -- I5/M6 there are DAG2's local index 5
+        # and modifier 6, i.e. I13/M14), not the I12/M14 pattern
+        # sequencer._check_return_target used to hardcode. Traced back
+        # (concrete run with State.record_events on), I13 is loaded at
+        # FUN_1c0c3f's own entry (0x1c0c57) from the manual return-address
+        # slot the call's own delay slots pushed via DM(I7++, M7) -- the
+        # exact same software return-address convention as the verified
+        # I12/M14 idiom, just through a different DAG2 index register.
+        # SHARC+ Core Programming Reference p.111 ("PC Stack Access",
+        # Table 4-3) confirms only CALL/IVT-branch/DO-UNTIL push the
+        # hardware PC stack and only RTS/RTI pop it: an ordinary JUMP
+        # (I12/M14's idiom included) never touches it, so this was always
+        # a software convention, not a literal hardware return -- and nothing
+        # rules out a different free DAG2 index register per callee. A
+        # tools/sharcdb census of dt2-1.16's Type9a_abs/9b_abs population
+        # confirms this reading: 1051 of 1052 cond=0x1F/b=0/j=1/pmm=6
+        # (M14) instructions use pmi=4 (I12); exactly one (0x1c0cb5) uses
+        # pmi=5 (I13). sequencer._check_return_target now takes pmi and
+        # checks I(8+pmi)/M14 generally instead of hardcoding I12, so this
+        # one instruction is recognized as a return (popping call_stack)
+        # like the other 1051. That was the only fix this lane made; see
+        # tools/sharc_core/sequencer.py's docstring for the full citation.
+        #
+        # With that gap closed, the frame runs 7,115 instructions further
+        # (86,740 vs 79,625) before stopping on an unrelated, pre-existing
+        # sharc_core gap this lane's brief does not own: a Type3a long-word
+        # (32-bit) DM access at 0x1c2920 that forms_move.py's Type3a
+        # handler does not support (see its own "unsupported Type3a
+        # long-word access" message) -- not a return mismatch, so this is
+        # the milestone this lane was asked to reach.
+        self.assertEqual(halt.reason, "unsupported Type3a long-word access")
+        self.assertEqual(halt.pc_sw, 0x1C2920)
+        self.assertEqual(results[0].instructions, 86740)
 
 
 @unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")

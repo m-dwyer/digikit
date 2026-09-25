@@ -191,23 +191,19 @@ def _type_9a_abs(
             _apply_compute(executed, insn, compute)
         return None
 
-    if (
-        _field(f, "b") == 0
-        and cond == 0x1F
-        and pmi == 4
-        and pmm == 6
-        and _field(f, "j") == 1
-    ):
-        # The verified I12/M14 (DB) return idiom of 9b_abs, plus the compute.
+    if _field(f, "b") == 0 and cond == 0x1F and pmm == 6 and _field(f, "j") == 1:
+        # The verified I(8+pmi)/M14 (DB) return idiom of 9b_abs, plus the
+        # compute -- see _check_return_target's docstring for why any DAG2
+        # index register (not just I12) belongs here.
         if loop_abort:
             # (LA) on the verified return idiom is not a documented or
             # observed pattern (PGR/PRM describe (LA) for JUMP, to leave a
-            # loop, not for the RTS-equivalent CALL/JUMP(I12,M14) return
+            # loop, not for the RTS-equivalent CALL/JUMP(Ix,M14) return
             # idiom); fail closed rather than guess at stack effects.
             return [_stop(state, insn, "unsupported Type9a LA on return idiom")]
         if not state.call_stack:
             return [_stop(state, insn, "return without followed call")]
-        mismatch = _check_return_target(state)
+        mismatch = _check_return_target(state, pmi)
         if mismatch:
             return [_stop(state, insn, mismatch)]
         if compute_when_taken:
@@ -216,7 +212,7 @@ def _type_9a_abs(
                 return [_stop(state, insn, error)]
         if insn.length_bytes is None:
             raise ValueError("cannot return from an instruction without a length")
-        _event(state, insn, "return-branch", index="I12", modifier="M14")
+        _event(state, insn, "return-branch", index="I%d" % (8 + pmi), modifier="M14")
         state.steps += 1
         state.pc_sw = state.pc_sw + insn.length_bytes // 2
         state.pending = Pending(None, slots=2, return_from_call=True)
@@ -262,10 +258,18 @@ def _type_9a_abs(
     )
 
 
-# The verified compiler return is a TRUE 9b_abs jump through I12/M14,
-# with two delay slots, one of which is the confident 25c_rframe form.
+# The verified compiler return is a TRUE 9b_abs jump through I(8+pmi)/M14,
+# with two delay slots, one of which is the confident 25c_rframe form. Per
+# SHARC+ Core Programming Reference p.111 ("PC Stack Access", Table 4-3:
+# push only on CALL/IVT branch/DO UNTIL, pop only on RTS/RTI/loop
+# termination), this JUMP has no hardware PC-stack effect of its own --
+# it is a software return convention, and pmi selects whichever DAG2
+# index register (I8-I15) the callee's own entry code loaded its saved
+# return address into (see _check_return_target's docstring: I12 is used
+# in 1051 of 1052 firmware occurrences, I13 in the one remaining case).
 # Do not treat rframe alone, its provisional 48-bit sibling, or another
-# register-indirect jump as a return.
+# register-indirect jump (one that does not match this cond/b/j/pmm
+# fingerprint) as a return.
 def _type_9b_abs(
     state: State, insn: Instruction, f: Mapping[str, int], name: str
 ) -> list[State]:
@@ -275,7 +279,6 @@ def _type_9b_abs(
     if (
         _field(f, "b") == 0
         and _field(f, "cond") == 0x1F
-        and pmi == 4
         and pmm == 6
         and _field(f, "j") == 1
     ):
@@ -285,12 +288,12 @@ def _type_9b_abs(
             return [_stop(state, insn, "unsupported Type9a LA on return idiom")]
         if not state.call_stack:
             return [_stop(state, insn, "return without followed call")]
-        mismatch = _check_return_target(state)
+        mismatch = _check_return_target(state, pmi)
         if mismatch:
             return [_stop(state, insn, mismatch)]
         if insn.length_bytes is None:
             raise ValueError("cannot return from an instruction without a length")
-        _event(state, insn, "return-branch", index="I12", modifier="M14")
+        _event(state, insn, "return-branch", index="I%d" % (8 + pmi), modifier="M14")
         state.steps += 1
         state.pc_sw = state.pc_sw + insn.length_bytes // 2
         state.pending = Pending(None, slots=2, return_from_call=True)
