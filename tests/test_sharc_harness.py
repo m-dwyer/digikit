@@ -69,6 +69,47 @@ class WriteWavTest(unittest.TestCase):
         self.assertEqual(values, (32767, -32767))
 
 
+class WriteRingAWavTest(unittest.TestCase):
+    """`read_ring_a()`'s own dict shape (module docstring: "left"/"right",
+    32 floats each) fed straight into `write_ring_a_wav()` -- no Runner
+    needed, since both ends of this are plain Python."""
+
+    def _ring(self, left, right):
+        return {"left": list(left), "right": list(right)}
+
+    def test_stereo_concatenates_frames_in_order(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        path = str(SCRATCH / "ring_a_stereo.wav")
+        rings = [
+            self._ring([0.5, 0.25], [-0.5, -0.25]),
+            self._ring([1.0, -1.0], [0.1, -0.1]),
+        ]
+        h.write_ring_a_wav(path, rings, sample_rate=48000, stereo=True)
+        with wave.open(path, "rb") as wav:
+            self.assertEqual(wav.getnchannels(), 2)
+            self.assertEqual(wav.getframerate(), 48000)
+            self.assertEqual(wav.getnframes(), 4)
+            frames = wav.readframes(wav.getnframes())
+        samples = struct.unpack("<%dh" % (len(frames) // 2), frames)
+        left = samples[0::2]
+        right = samples[1::2]
+        self.assertEqual(left[2], 32767)  # 1.0 clipped to full scale
+        self.assertEqual(left[3], -32767)
+        self.assertLess(right[0], right[1])  # -0.5 vs -0.25 -> more negative first
+        self.assertLess(right[0], 0)
+
+    def test_mono_is_the_l_r_average(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        path = str(SCRATCH / "ring_a_mono.wav")
+        rings = [self._ring([1.0], [-1.0])]
+        h.write_ring_a_wav(path, rings, sample_rate=48000, stereo=False)
+        with wave.open(path, "rb") as wav:
+            self.assertEqual(wav.getnchannels(), 1)
+            frames = wav.readframes(wav.getnframes())
+        (value,) = struct.unpack("<1h", frames)
+        self.assertEqual(value, 0)  # 0.5*(1.0 + -1.0) == 0.0
+
+
 class ReferenceRenderTest(unittest.TestCase):
     def test_unity_step_identity_coefficients_pass_input_through(self):
         # A one-phase, one-tap "coefficient table" of [1.0] at unity step

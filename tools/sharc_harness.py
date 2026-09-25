@@ -144,6 +144,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import sharc as sharcmod  # noqa: E402
+import sharc_dac  # noqa: E402
 import sharc_run as sr  # noqa: E402
 import sharc_survey as sv  # noqa: E402
 import sharc_symbols  # noqa: E402
@@ -1126,48 +1127,91 @@ def read_master_mix(memory, image: str, runner: sr.Runner) -> list[float]:
 
 
 def read_ring_a(memory, image: str, runner: sr.Runner, count: int = 64) -> dict:
-    """The DAC output ring (docs/findings/06's "Rings": "0x1c74a1 converts
-    0x25f180/0x25f200 to Q31, L/R interleaved, into ring A half
-    0x261cc8 + (flag << 8)"; "B as codec input, A as DAC output: [D]") --
-    for checking whether an active voice's signal reached the DMA-facing
-    output buffer after a frame call, one step past `read_master_mix`'s
-    pre-conversion float sum.
+    """The DAC output ring: `tools/sharc_dac.py` owns the format itself
+    (module docstring there has the full static + dynamic evidence for
+    "FUN_1c74a1 converts DM(0x25f180)/DM(0x25f200) to Q31, L/R interleaved,
+    into ring A half RING_A_BASE + flag*RING_A_HALF_BYTES") -- this
+    function is now just the `Runner`-shaped adapter over it, for checking
+    whether an active voice's signal reached the DMA-facing output buffer
+    after a frame call, one step past `read_master_mix`'s pre-conversion
+    float sum.
 
-    `profile(image).ring_a`/`.ring_flag` resolve the literal DM addresses
-    `setup_frame()` already pokes `ring_flag` through (this module's own
-    "Task loop" comment); `ring_flag`'s bit 0 selects which of the two
-    256-byte (64 word) ping-pong halves the *last completed* frame wrote
-    (block_handler's own tail toggles it *after* the render, so the half
-    written by the frame that just returned is `flag_after ^ 1`, not
-    `flag_after` itself).
+    `profile(image).ring_flag` resolves the literal DM address
+    `setup_frame()` already pokes through (this module's own "Task loop"
+    comment); `sharc_dac.ring_half_just_written()` applies the
+    post-toggle-flag correction (see its own docstring) that used to be
+    hand-rolled here.
+
+    `count` is kept for backward compatibility with callers that pass it,
+    but `sharc_dac` always reads a full 64-word (32 stereo sample) half --
+    a partial COUNT only truncates the returned lists, it does not change
+    how many words are actually read from memory.
 
     Returns {"flag_after": the current (post-toggle) ring_flag value,
-    "half_written": the byte offset of the half the last frame wrote,
-    "q31": COUNT raw Q31 ints (None where memory is unavailable), "float":
-    the same words as -1.0..1.0 floats (Q31's own full-scale convention)}.
+    "half_written": the byte offset of the half the last frame wrote (None
+    when `flag_after` itself is None, e.g. a Runner whose loader never
+    mapped `ring_flag`), "q31": raw Q31 ints (interleaved L0,R0,L1,R1,...;
+    an unmapped word reads as 0, matching `sharc_dac.decode_ring_a_words()`
+    -- real SHARC+ SRAM after reset, not "unknown"), "float": the same
+    words as -1.0..1.0 floats (Q31's own full-scale convention), plus
+    "left"/"right" (32 de-interleaved floats each) and
+    "left_raw"/"right_raw" (their Q31 ints) -- `sharc_dac.RingAFrame`'s own
+    fields, for a caller that wants one channel without re-deriving the
+    interleave.}
     """
     flag_raw = st._dm_read(runner.state, profile(image).ring_flag, 4)
     flag_after = flag_raw.value & 1 if flag_raw is not None else None
-    half_written = None if flag_after is None else ((flag_after ^ 1) * 0x100)
-    base = profile(image).ring_a + (half_written or 0)
-    q31: list[int | None] = []
-    floats: list[float | None] = []
-    for i in range(count):
-        raw = st._dm_read(runner.state, base + i * 4, 4)
-        if raw is None:
-            q31.append(None)
-            floats.append(None)
-            continue
-        value = raw.value & 0xFFFFFFFF
-        signed = value - 0x100000000 if value & 0x80000000 else value
-        q31.append(signed)
-        floats.append(signed / 2**31)
+
+    def dm_read(address: int) -> int | None:
+        raw = st._dm_read(runner.state, address, 4)
+        return None if raw is None else raw.value & 0xFFFFFFFF
+
+    frame = sharc_dac.read_ring_a_pcm(dm_read, flag_after)
+    q31 = frame.interleaved_q31()[:count]
+    floats = [v / sharc_dac.Q31_FULL_SCALE for v in q31]
     return {
         "flag_after": flag_after,
-        "half_written": half_written,
+        "half_written": None if flag_after is None else frame.half_written,
         "q31": q31,
         "float": floats,
+        "left": frame.left,
+        "right": frame.right,
+        "left_raw": frame.left_raw,
+        "right_raw": frame.right_raw,
     }
+
+
+def write_ring_a_wav(
+    path: str,
+    rings: Sequence[dict],
+    *,
+    sample_rate: int = 48000,
+    stereo: bool = True,
+) -> None:
+    """Concatenate `read_ring_a()`'s own per-frame return dicts (RINGS, in
+    frame order) into one WAV at PATH: stereo (both of ring A's own L/R
+    channels, `sharc_dac.write_wav_stereo()`) by default, or a mono L+R
+    average (`tools/sharc_harness.py`'s own `write_wav()`, the same
+    downmix `render_frames_to_ring_a()` already computes for
+    `measure_tone()`) when STEREO is False.
+
+    This is ring A's own WAV writer -- `write_wav()` above stays the
+    voice-render (mono-only) one; a caller with several frames' worth of
+    `read_ring_a()` dicts (one call per rendered frame) uses this instead
+    of hand-concatenating "left"/"right" itself."""
+    left: list[float] = []
+    right: list[float] = []
+    for ring in rings:
+        left.extend(ring["left"])
+        right.extend(ring["right"])
+    if stereo:
+        sharc_dac.write_wav_stereo(path, left, right, sample_rate=sample_rate)
+    else:
+        mono = [
+            0.5 * (l_sample + r_sample)
+            for l_sample, r_sample in zip(left, right, strict=True)
+        ]
+        write_wav(path, mono, sample_rate=sample_rate)
 
 
 # --- Voice -> track -> master mix -> ring A (lane A2, 2026-09-25) ---------

@@ -3802,3 +3802,73 @@ at rates 0.5, 0.75, 1.0, 1.5, 2.0 with max error 2.4e-5..3.0e-5 against a
 reference built from the rules above; a 1 kHz sine source gives a clean
 periodic output with no block-boundary glitches. The output rate after 2:1
 decimation is taken to be 48 kHz **[D]**.
+
+## The DAC ring-A format, nailed down exactly, and the ring-A output confirmed to just be a faithful copy of the master mix (lane C1, 2026-09-25) **[V][O]**
+
+Confirms and sharpens "The audio path from the task loop to the rings"'s
+own "Rings [V]" bullet above (`0x1c74a1` converts `0x25f180`/`0x25f200` to
+Q31, L/R interleaved, into ring A). `tools/sharc_dac.py` now owns this as
+data plus a reader/writer, cited fully in its own module docstring; summary:
+
+**Format [V].** `FUN_1c74a1` (sw `0x1c74a1`-`0x1c74cd`, called from sw
+`0x1c7734` inside the command-3 render path, right after `FUN_1c2b24`'s
+own `CALL 0x1c207b` has filled the master mix) hardcodes its own source
+pointer `I3 = 0x25f180` (sw `0x1c74b0`) -- the master mix is NOT passed as
+an argument, only the two destination pointers are. Its `DO ... UNTIL LCE`
+loop (sw `0x1c74b5`-`0x1c74c1`, trip 32) reads `DM(I3, M6)` then
+`DM(I3 + 31)` each iteration; SHARC+'s byte address space scales a DAG
+modify's own literal by the access size (`out/refs/sharc-plus-prm`,
+"Enhanced Modify Instruction for Address Scaling", p.6-9), so a
+word-size `+31` displacement applied after `I3`'s own `M6=1`-word
+post-increment lands exactly on `0x25f200 + 4*k` at iteration k --
+confirming the master mix is 32 PLANAR L floats at `DM(0x25f180)` followed
+by 32 PLANAR R floats at `DM(0x25f200)` (matching `read_master_mix()`'s
+existing 64-contiguous-float read), NOT interleaved. Each sample is then
+converted with the ALU's own documented idiom
+(`out/refs/sharc-plus-prm` toc.md page 67, "Fixed-to-Float Conversion
+Instructions with Scaling": `"Ry = 31; Rn = FIX Fx BY Ry; /* fixed-point
+1.31 format */"` -- `FUN_1c74a1` sets `R2 = 0x1f = 31` at sw `0x1c74b3`,
+opcode `0xD9` "fix_by", PRM Table 18-5). The two conversion results are
+stored through pointers `R13 = 4` BYTES (one word; a plain register add,
+not a scaled DAG modify) apart, each auto-incrementing 2 words (`+2`,
+scaled) per iteration -- net effect a clean L,R,L,R,... Q31 interleave,
+one word per channel per sample, 32 stereo samples = 64 words = 256 bytes
+per half, matching `DM(0x261dc8) - DM(0x261cc8) == 0x100` bytes exactly.
+
+**Dynamic cross-check [V].** An isolated `Runner.fresh_call` at
+`FUN_1c74a1`'s own entry, given a fresh master-mix buffer poked with
+distinct per-index values (`L[k] = 0.1 + 0.01*k`, `R[k] = -0.2 - 0.01*k`)
+and `R4`/`R8` pointing at a scratch destination, reproduces this format
+exactly: 64 output words, word `2k == round(L[k]*2**31)`, word
+`2k+1 == round(R[k]*2**31)`, both sign and magnitude correct. This rules
+out a sign/stride bug in the conversion routine itself (`fix_by`'s
+execution in `tools/sharc_core`, and `FUN_1c74a1`'s own addressing).
+`tools/test_sharc_dac.py`'s own tests exercise `sharc_dac`'s pure-Python
+format logic against this same isolated-test data; the isolated-call
+transcript itself lives in this lane's own report, not committed as a
+script (per this repo's rule against ad hoc probe scripts -- the
+reusable form is `tools/sharc_dac.py` plus its tests).
+
+**Where the tone actually breaks: at or before the master mix, not ring A
+[O].** Re-running `render_frames_to_ring_a()`'s own technique (96 frames,
+1 kHz injected into track 0, `CONTINUOUS_MIX_SCALAR_PATCH` active) and
+comparing, frame by frame, `inject_track_buffer()`'s own return (the
+track-0 input, `DM(0x252df8)`/`DM(0x252e78)`) against `read_master_mix()`
+(`DM(0x25f180)`) and the new `read_ring_a()`'s own `"left"`/`"right"`:
+ring A's own L/R match `read_master_mix()`'s own L/R exactly (same
+`power_ratio`/`rms_dbfs`/`peak_dbfs` to full float precision, every frame)
+-- so ring A is, as the format analysis above says it must be, a lossless
+Q31 copy of whatever the master mix holds; it adds no corruption of its
+own. But the track-0 input is dense (every one of 3040 sampled points
+across 96 frames nonzero, and visibly a smooth, continuous, slowly-varying
+curve -- a real waveform) while the master mix is sparse (only 570/3040 L,
+855/3040 R nonzero, with no visible relationship in timing or amplitude to
+the smooth input feeding it). The signal is therefore already broken
+somewhere inside `FUN_1c2b24`'s own per-track accumulate/gain stage
+(`0x1c207b`, between `DM(0x252df8)` and `DM(0x25f180)`) -- consistent with
+this file's own still-open "does not simply copy a track's 32-word buffer
+1:1" hypothesis above, now narrowed to a specific stage boundary and ruling
+out ring A/the DAC conversion as a candidate cause. Not resolved by this
+lane (out of its own scope: no `sharc_core` or accumulate-loop changes were
+made); a second agent should re-run this same stage-by-stage comparison
+before promoting the "at or before the master mix" claim to `[V]`.

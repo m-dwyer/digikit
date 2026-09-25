@@ -16,6 +16,7 @@ TYPED = [
     "emu/sharc_peer.py",
     "tools/sharc.py",
     "tools/sharc_core",
+    "tools/sharc_dac.py",
     "tools/sharc_disasm.py",
     "tools/sharc_framemap.py",
     "tools/sharc_harness.py",
