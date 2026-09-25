@@ -317,6 +317,32 @@ class RunnerStepTest(unittest.TestCase):
         # No half-executed state was kept as "the" state after a fork.
         self.assertEqual(runner.instructions, 0)
 
+    def test_provisional_interpretations_off_by_default(self):
+        # No --provisional given -> Runner threads an empty mapping, and
+        # 21p_undoc16 (a confirmed-decode, no-confirmed-semantics form)
+        # stops exactly as before this mechanism existed.
+        runner = sr.Runner(loader_memory(), 0x10)
+        runner._cache[0x10] = insn("21p_undoc16", {"operand[6:0]": 0x25}, length=2)
+        with self.assertRaises(sr.Halt) as ctx:
+            runner.step()
+        self.assertEqual(
+            ctx.exception.reason,
+            "undocumented form 21p_undoc16 has no confirmed semantics",
+        )
+        self.assertEqual(runner.state.provisional_interpreted, ())
+
+    def test_provisional_interpretations_opt_in_nop_advances(self):
+        runner = sr.Runner(
+            loader_memory(),
+            0x10,
+            provisional_interpretations={"21p_undoc16": "nop"},
+        )
+        runner._cache[0x10] = insn("21p_undoc16", {"operand[6:0]": 0x25}, length=2)
+        runner.step()
+        self.assertEqual(runner.state.pc_sw, 0x11)
+        self.assertEqual(runner.instructions, 1)
+        self.assertEqual(runner.state.provisional_interpreted, ("21p_undoc16",))
+
     def test_diagnose_unknown_off_by_default_leaves_halt_unchanged(self):
         # diagnose_unknown defaults False: Halt.unknowns must stay empty
         # (and to_json() must therefore omit the key) so a caller that
@@ -974,6 +1000,32 @@ class RunnerRunTest(unittest.TestCase):
         self.assertEqual(payload["halt"]["reason"], "breakpoint")
         self.assertIn("instructions_per_second", payload)
         self.assertIn("form_counts", payload)
+
+    def test_to_json_omits_provisional_key_by_default(self):
+        # Byte-identical JSON shape to before this field existed for a
+        # caller that never opted in (same convention as watch_log above).
+        runner = sr.Runner(loader_memory(), 0x10, breakpoints=[0x10])
+        runner._cache[0x10] = insn("21a", {}, length=6)
+        result = runner.run(max_steps=100)
+        self.assertNotIn("provisional", result.to_json())
+
+    def test_provisional_reports_form_mode_and_count_in_result(self):
+        runner = sr.Runner(
+            loader_memory(),
+            0x10,
+            provisional_interpretations={"21p_undoc16": "nop"},
+        )
+        runner._cache[0x10] = insn("21p_undoc16", {"operand[6:0]": 0x25}, length=2)
+        runner._cache[0x11] = insn("21p_undoc16", {"operand[6:0]": 0x25}, length=2)
+        result = runner.run(max_steps=2)
+        self.assertEqual(result.halt.reason, "max-steps")
+        self.assertEqual(result.instructions, 2)
+        self.assertEqual(result.provisional, (("21p_undoc16", "nop", 2),))
+        payload = result.to_json()
+        self.assertEqual(
+            payload["provisional"],
+            [{"form": "21p_undoc16", "mode": "nop", "count": 2}],
+        )
 
 
 class ParseKvTest(unittest.TestCase):

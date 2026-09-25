@@ -666,6 +666,59 @@ class UndocumentedFormsStopWithReasonTest(unittest.TestCase):
                 self.assertEqual(result.pc_sw, 0x10)
                 self.assertEqual(result.uregs, {0: T.Const(9)})
 
+    def test_provisional_nop_is_off_by_default_even_with_other_forms_named(self):
+        # Naming a *different* form in provisional_interpretations must not
+        # change this form's stop -- the opt-in is per exact form name, not
+        # "any provisional interpretation is active".
+        state = T.State(
+            0x10, {0: T.Const(9)}, provisional_interpretations={"22p_undoc48": "nop"}
+        )
+        fields = {"operand[6:0]": 0}
+        [result] = T._execute(state, insn("21p_undoc16", fields, length=2))
+        self.assertEqual(
+            result.stopped,
+            "undocumented form 21p_undoc16 has no confirmed semantics",
+        )
+        self.assertEqual(result.provisional_interpreted, ())
+
+    def test_provisional_nop_advances_and_touches_no_register(self):
+        # real SW 0x1c32b0 (1847984): the form this session's opt-in
+        # --provisional 21p_undoc16=nop experiment is about (see
+        # docs/findings for what is/is not established -- this is an
+        # experiment aid, not a semantics claim).
+        state = T.State(
+            0x10, {0: T.Const(9)}, provisional_interpretations={"21p_undoc16": "nop"}
+        )
+        fields = {"operand[6:0]": 0x25}
+        [result] = T._execute(state, insn("21p_undoc16", fields, length=2))
+        self.assertIsNone(result.stopped)
+        self.assertEqual(result.pc_sw, 0x11)
+        self.assertEqual(result.uregs, {0: T.Const(9)})
+        self.assertEqual(result.provisional_interpreted, ("21p_undoc16",))
+
+    def test_provisional_nop_logs_once_per_execution(self):
+        state = T.State(
+            0x10, {0: T.Const(9)}, provisional_interpretations={"21p_undoc16": "nop"}
+        )
+        fields = {"operand[6:0]": 0x25}
+        [state] = T._execute(state, insn("21p_undoc16", fields, length=2))
+        [state] = T._execute(state, insn("21p_undoc16", fields, length=2))
+        self.assertEqual(state.provisional_interpreted, ("21p_undoc16", "21p_undoc16"))
+
+    def test_provisional_mode_other_than_nop_is_not_implemented(self):
+        # Only "nop" is a recognised mode; anything else (e.g. a typo'd
+        # --provisional value) must fall through to the safe stop, not
+        # silently execute as a no-op.
+        state = T.State(
+            0x10, {0: T.Const(9)}, provisional_interpretations={"21p_undoc16": "bogus"}
+        )
+        fields = {"operand[6:0]": 0x25}
+        [result] = T._execute(state, insn("21p_undoc16", fields, length=2))
+        self.assertEqual(
+            result.stopped,
+            "undocumented form 21p_undoc16 has no confirmed semantics",
+        )
+
 
 class CircularWrapConstTest(unittest.TestCase):
     """Direct tests of the new _circular_wrap_const helper (PRM Sec. 6,

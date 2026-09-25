@@ -712,6 +712,7 @@ def make_state(
     assume_nw32: bool = True,
     max_call_depth: int = 64,
     provisional_forms: Sequence[str] = (),
+    provisional_interpretations: Mapping[str, str] | None = None,
     explicit_memory_model: bool = False,
     approx_recips: bool = False,
     watch_tracker: _WatchTracker | None = None,
@@ -720,9 +721,15 @@ def make_state(
     _dm_write() used to apply pokes -- the same canonicalisation (loader
     alias, MMR routing, width gating) a real store instruction gets.
 
-    ``provisional_forms`` and ``explicit_memory_model`` are both opt-in and
-    change nothing when left at their defaults: see sharc_core/state.py's
-    ``State.provisional_forms``/``State.explicit_memory_model`` docstrings.
+    ``provisional_forms``, ``provisional_interpretations`` and
+    ``explicit_memory_model`` are all opt-in and change nothing when left
+    at their defaults: see sharc_core/state.py's ``State.provisional_forms``
+    /``State.provisional_interpretations``/``State.explicit_memory_model``
+    docstrings. ``provisional_interpretations`` is a different mechanism
+    from ``provisional_forms``: the latter gates *uncertain decode*, the
+    former lets a *confirmed* decode with no confirmed execution semantics
+    (e.g. 21p_undoc16) run as a named MODE (only "nop" is implemented)
+    instead of stopping.
     ``approx_recips`` is sharc_trace.py's own pre-existing State field
     (State.approx_recips), exposed here too: a voice render's pitch/rate
     math (docs/findings/06's "voice record contract") goes through recips,
@@ -759,6 +766,7 @@ def make_state(
         mmrs=mmrs,
         record_events=False,
         provisional_forms=tuple(provisional_forms),
+        provisional_interpretations=dict(provisional_interpretations or {}),
         explicit_memory_model=explicit_memory_model,
         approx_recips=approx_recips,
     )
@@ -831,6 +839,15 @@ class RunResult:
     # in that (default) case, so a caller that never asked for watchpoints
     # sees byte-identical JSON to before this field existed.
     watch_log: tuple[WatchEvent, ...] = ()
+    # Empty unless Runner(provisional_interpretations=...) was given at
+    # least one form and this run actually executed it at least once (see
+    # sharc_core.state.State.provisional_interpretations/
+    # provisional_interpreted). (form, mode, count) triples, sorted by
+    # form name. to_json() omits the "provisional" key entirely when this
+    # is empty, so a caller that never opted in sees byte-identical JSON
+    # to before this field existed -- the default run and the goldens are
+    # unaffected.
+    provisional: tuple[tuple[str, str, int], ...] = ()
 
     @property
     def instructions_per_second(self) -> float:
@@ -849,6 +866,11 @@ class RunResult:
         }
         if self.watch_log:
             result["watch_log"] = [event.to_json() for event in self.watch_log]
+        if self.provisional:
+            result["provisional"] = [
+                {"form": form, "mode": mode, "count": count}
+                for form, mode, count in self.provisional
+            ]
         return result
 
 
@@ -878,6 +900,7 @@ class Runner:
         max_call_depth: int = 64,
         breakpoints: Sequence[int] = (),
         provisional_forms: Sequence[str] = (),
+        provisional_interpretations: Mapping[str, str] | None = None,
         explicit_memory_model: bool = False,
         approx_recips: bool = False,
         watchpoints: Sequence[Watchpoint] = (),
@@ -895,6 +918,7 @@ class Runner:
             assume_nw32=assume_nw32,
             max_call_depth=max_call_depth,
             provisional_forms=provisional_forms,
+            provisional_interpretations=provisional_interpretations,
             explicit_memory_model=explicit_memory_model,
             approx_recips=approx_recips,
             watch_tracker=self._watch,
@@ -1093,6 +1117,11 @@ class Runner:
         else:
             halt = Halt("max-steps", self.state.pc_sw)
         elapsed = time.perf_counter() - start_time
+        interpreted = collections.Counter(self.state.provisional_interpreted)
+        provisional = tuple(
+            (form, self.state.provisional_interpretations[form], count)
+            for form, count in sorted(interpreted.items())
+        )
         return RunResult(
             halt=halt,
             instructions=self.instructions,
@@ -1102,6 +1131,7 @@ class Runner:
             final_pc_sw=self.state.pc_sw,
             max_call_depth_reached=self.max_call_depth_reached,
             watch_log=self.watch_log,
+            provisional=provisional,
         )
 
 
@@ -1315,7 +1345,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[],
         metavar="FORM",
         help="execute this decode-table-unconfirmed form instead of "
-        "halting on it (repeatable); sets state.provisional_forms",
+        "halting on it (repeatable); sets state.provisional_forms. A form "
+        "the runtime decoder marks uncertain (e.g. 21p_undoc16) needs this "
+        "*and* --provisional FORM=MODE below to reach the handler at all",
+    )
+    p.add_argument(
+        "--provisional",
+        dest="provisional_interp",
+        action="append",
+        default=[],
+        metavar="FORM=MODE",
+        help="run FORM (a *confirmed*-decode form with no confirmed "
+        "execution semantics, e.g. 21p_undoc16) as MODE instead of "
+        "halting on it (repeatable; only MODE=nop is implemented); off by "
+        "default, and the result/Halt JSON reports every form this fired "
+        "on and how many times (sharc_core.State."
+        "provisional_interpretations, distinct from --allow-provisional-"
+        "form above, which is about uncertain decode, not confirmed-"
+        "decode-but-unknown-semantics)",
     )
     p.add_argument(
         "--explicit-memory-model",
@@ -1406,6 +1453,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name, value in _parse_kv(a.regs, "--reg").items():
         regs[name] = int(value, 0)
 
+    provisional_interpretations = _parse_kv(a.provisional_interp, "--provisional")
+    for form, mode in provisional_interpretations.items():
+        if mode != "nop":
+            p.error("--provisional %s=%s: only MODE=nop is implemented" % (form, mode))
+
     watchpoints = [
         *(
             _parse_watch_arg(spec, on_read=False, on_write=True, stop=True)
@@ -1444,6 +1496,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_call_depth=a.max_call_depth,
             breakpoints=a.breakpoints,
             provisional_forms=a.provisional_forms,
+            provisional_interpretations=provisional_interpretations,
             explicit_memory_model=a.explicit_memory_model,
             approx_recips=a.approx_recips,
             watchpoints=watchpoints,
@@ -1480,6 +1533,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("watch events:")
             for event in result.watch_log:
                 print("  %s" % event)
+        if result.provisional:
+            print("provisional (opt-in, not a semantics claim):")
+            for form, mode, count in result.provisional:
+                print("  %-16s = %-4s x%d" % (form, mode, count))
         print("top forms:")
         for form, count in result.form_counts.most_common(15):
             print("  %-16s %d" % (form, count))

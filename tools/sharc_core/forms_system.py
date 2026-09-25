@@ -292,7 +292,20 @@ def _type_8p_undoc48(
     # Guessing an execution semantics for a jump/call-shaped
     # (8p_undoc48) or fully unknown (21p/22p) opcode risks silently
     # mistracing control flow, so this stops with the specific reason
-    # instead of the generic fallback below.
+    # instead of the generic fallback below -- unless the caller opted
+    # into a specific guess for this exact form name with
+    # --provisional NAME=MODE (state.provisional_interpretations; off by
+    # default, so default behaviour and the goldens are unchanged). Only
+    # "nop" is implemented: advance past the word without touching any
+    # register or memory, and log it (state.provisional_interpreted) so a
+    # run can report how many times the guess actually fired. This is an
+    # experiment aid, not a semantics claim -- see docs/findings for what
+    # is and is not established about this bit-class.
+    mode = state.provisional_interpretations.get(name)
+    if mode == "nop":
+        state.provisional_interpreted = state.provisional_interpreted + (name,)
+        _event(state, insn, "provisional", mode=mode)
+        return _advance(state, insn)
     return [
         _stop(
             state,

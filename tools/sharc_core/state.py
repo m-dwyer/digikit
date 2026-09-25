@@ -192,6 +192,21 @@ class State:
     # and the ones it actually did. A state that used any is calibration.
     provisional_forms: tuple[str, ...] = ()
     provisional_used: tuple[str, ...] = ()
+    # Opt-in --provisional NAME=MODE (tools/sharc_run.py): a form with a
+    # *confirmed* decode but no confirmed execution semantics (e.g.
+    # sharc_core/forms_system.py's _type_8p_undoc48, which otherwise always
+    # stops) that this run may interpret as MODE ("nop" is the only mode
+    # implemented so far) instead of stopping. Distinct from
+    # provisional_forms/provisional_used above, which gate *uncertain
+    # decode*, not a confirmed decode's unknown semantics. provisional_
+    # interpreted logs FORM's name every time the interpretation actually
+    # fired (append-only, like provisional_used, so a fork never shares a
+    # mutable counter with its sibling): a report's per-form execution
+    # count is Counter(state.provisional_interpreted). A state that used
+    # any of this is explicitly a calibration run, not a claim about real
+    # hardware behaviour.
+    provisional_interpretations: Mapping[str, str] = field(default_factory=dict)
+    provisional_interpreted: tuple[str, ...] = ()
     # Opt-in --approx-recips: whether this path may substitute a documented-
     # but-unverified numeric model for recips's undocumented ROM seed, and
     # whether it actually did so at least once (calibration, like above).
