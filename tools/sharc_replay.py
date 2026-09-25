@@ -187,6 +187,28 @@ def _read_ring_a(state, image: str) -> list[float]:
     return out
 
 
+def _track_buffers_nonzero(state) -> dict[int, bool]:
+    """Whether each of the 16 master-stage per-track input buffers
+    (`sharc_harness.TRACK_MIX_BASE + t*TRACK_MIX_STRIDE`, docs/findings/06's
+    "Master stage": `0x1c207b` sums these into the master mix) holds any
+    nonzero float, L or R half, after a frame call -- read the same way
+    `sharc_harness.inject_track_buffer()` writes them, but never itself
+    written by this tool. Per-track (not just "any"), so a caller can tell
+    which of the 16 tracks the render path actually deposited output into,
+    keyed by track index 0-15."""
+    out: dict[int, bool] = {}
+    for track in range(16):
+        base = h.TRACK_MIX_BASE + track * h.TRACK_MIX_STRIDE
+        nonzero = False
+        for i in range(2 * h.TRACK_MIX_CHANNEL_WORDS):
+            raw = st._dm_read(state, base + i * 4, 4)
+            if raw is not None and raw.value & 0xFFFFFFFF:
+                nonzero = True
+                break
+        out[track] = nonzero
+    return out
+
+
 def _mono(ring_a_blocks: list[list[float]]) -> list[float]:
     """L/R-interleaved Q31 pairs -> mono, averaging each pair."""
     out = []
@@ -260,8 +282,12 @@ def replay(
             runner, image, patch_table=h.FRAME_PATCH_TABLE
         )
         state = runner.state
-        ring_a_blocks.append(_read_ring_a(state, image))
-        other_voices_active.update(h.scan_voice_active(state, image, exclude=(0,)))
+        ring_a = _read_ring_a(state, image)
+        ring_a_blocks.append(ring_a)
+        frame_voices_active = h.scan_voice_active(state, image, exclude=(0,))
+        other_voices_active.update(frame_voices_active)
+        track_buffers = _track_buffers_nonzero(state)
+        master_mix = h.read_master_mix(memory, image, runner)
 
         terminal = result.terminal
         info["handler"] = (
@@ -271,6 +297,11 @@ def replay(
         info["stop_reason"] = terminal.category
         info["stop_pc"] = "%#x" % terminal.pc
         info["instructions"] = result.instructions
+        info["voice_active_by_firmware"] = frame_voices_active
+        info["track_buffers_nonzero"] = track_buffers
+        info["any_track_buffer_nonzero"] = any(track_buffers.values())
+        info["master_mix_nonzero"] = any(v for v in master_mix)
+        info["ring_a_nonzero"] = any(v for v in ring_a)
         per_frame.append(info)
 
         if first_stop is None and terminal.category != "frame-returned":

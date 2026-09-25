@@ -147,6 +147,21 @@ class ReplayIdleCaptureTest(unittest.TestCase):
         self.assertEqual(len(result["ring_a_mono"]), 64)
         self.assertEqual(max(abs(v) for v in result["ring_a_mono"]), 0.0)
 
+        # Per-frame nonzero checks (track buffers / master mix / ring A) and
+        # the per-frame ACTIVE-byte snapshot, added alongside the pretracks
+        # capture survey (B1 2026-09-25): both frames are silent end to end
+        # -- no track buffer, the master mix, or ring A ever goes nonzero,
+        # and no voice other than the hand-set-up one (voice 0, excluded)
+        # is ever marked ACTIVE by the firmware itself.
+        for frame in (frame0, frame1):
+            self.assertEqual(frame["voice_active_by_firmware"], {})
+            self.assertEqual(
+                frame["track_buffers_nonzero"], {t: False for t in range(16)}
+            )
+            self.assertFalse(frame["any_track_buffer_nonzero"])
+            self.assertFalse(frame["master_mix_nonzero"])
+            self.assertFalse(frame["ring_a_nonzero"])
+
 
 if __name__ == "__main__":
     unittest.main()
