@@ -1247,6 +1247,68 @@ def read_ring_a(memory, image: str, runner: sr.Runner, count: int = 64) -> dict:
 # only the not-yet-resolved accumulate stage -- confirming, by execution,
 # that the DOWNSTREAM path (track buffer -> master stage 0x1c207b -> ring
 # A) is intact and unconditional once that one buffer has real content.
+#
+# --- Continuity across frames, root-caused (lane B2, 2026-09-25) ----------
+#
+# The frame-0-only problem above is NOT the "one independent post-init
+# render per frame" workaround's own two original blockers (`state.trace`'s
+# unbounded growth and the Type14a odd-UREG-pair stop at 0x1c32ad): both are
+# fixed on this branch (7e5e8c4), and a genuinely continuous Runner (one
+# `run_init()`, repeated `Runner.fresh_call()` at block_handler, checked by
+# watchpoint on this lane's own multi-frame runs) now completes any number
+# of frames cleanly. Ring A still goes silent from frame 1 onward anyway --
+# root cause, traced with watchpoints across two frames of one continuous
+# Runner (see the report):
+#
+# `FUN_1c207b`'s own per-track summation loop (`0x1c2353`, `DO ... UNTIL
+# LCE` over all 16 tracks' `0x252df8`-range input) multiplies every track's
+# contribution by three scalar coefficients held in R1/R2/R12 for the whole
+# loop. Those scalars are computed a few hundred instructions earlier
+# (`0x1c22d7`-`0x1c2353`) from `FUN_b82d41`/`FUN_b82cba`'s dynamics/
+# compressor stage output (`0x254978`/`0x2549f8`, fed by `DM(0x252d3c)` --
+# docs/findings/06's still-open mix gate) and from a ~26-field master-bus
+# parameter block this SAME function decodes fresh every frame at
+# `0x1c2e00`-`0x1c2fb0` (source table `0x255fb6`-`0x2560d0`; confirmed by
+# execution to read all zero from a synthetic `run_init()` state -- no real
+# kit/mixer configuration is ever loaded here). Frame 0's own compressor
+# output is a plausible near-unity gain/trim (R1=0.953, R2=0.984,
+# R12=-0.029 as IEEE floats); by frame 1 it has collapsed to a degenerate
+# all-zero-multiplier state, independent of the injected signal's own
+# amplitude (checked: scaling the injected tone down 10x does not change
+# this). **This is real firmware behaviour given this lane's own state (a
+# synthetic frame with a blank master-bus parameter table and no real
+# per-track "slot type" ever reaching `FUN_1cdbb2`, docs/findings/06's mix
+# gate), not an emulator bug**: with a genuinely unconfigured mix bus, the
+# compressor's own steady state is silence, and frame 0 is riding on one
+# frame's worth of "not yet converged" grace period, not a working master
+# bus.
+#
+# **Hand-set value (documented hypothesis, not a discovered real gate).**
+# Fully deriving the real per-frame scalars needs the master-bus parameter
+# table's own bit layout and `FUN_b82cba`'s own 5-stage recursive state --
+# out of this lane's own budget (see the report's "Open" section). Pinning
+# R1/R2/R12 to frame 0's own real, execution-confirmed values at every
+# recurrence of `pc=0x1c2353` -- the same "register-only override at one
+# pc" technique docs/findings/06 already recommends for this exact
+# situation, via the same `PatchTable` mechanism `FRAME_PATCH_TABLE` already
+# uses -- keeps the compressor's own downstream multiply-accumulate at its
+# frame-0 output indefinitely. This is a static, pc-keyed patch applied
+# automatically every time this pc recurs (`sharc_survey.apply_patches()`),
+# not a per-frame reset performed by this module's own Python loop: the
+# cause (a value this lane could not derive) is what gets a fixed
+# assumption, not the Runner's state. Known limitation: this freezes the
+# compressor's own gain at whatever it computed for frame 0's specific
+# transient, so it does not adapt to a different injected level the way a
+# real compressor would -- checked and accepted for this lane's own
+# single-tone deliverable, not a general fix.
+CONTINUOUS_MIX_SCALAR_PC = 0x1C2353
+CONTINUOUS_MIX_SCALAR_PATCH: sv.PatchTable = {
+    CONTINUOUS_MIX_SCALAR_PC: [
+        ("reg", "R1", 0x3F740000),  # ~0.953 -- frame 0's own computed value
+        ("reg", "R2", 0x3F7C0000),  # ~0.984
+        ("reg", "R12", 0xBCEE0000),  # ~-0.029
+    ],
+}
 
 # docs/findings/06's "Master stage": `0x1c207b` sums 16 tracks at
 # `0x252df8 + t*0x100` bytes each (32 L floats then 32 R floats, plain
@@ -1367,6 +1429,21 @@ def call_frame_with_track_injection(
     return new_runner, result, injected
 
 
+def _merge_patch_tables(*tables: sv.PatchTable | None) -> sv.PatchTable:
+    """Union TABLES' entries by pc, concatenating entry lists for a pc that
+    appears in more than one (later tables' entries applied after earlier
+    ones, at the same pc, by `sharc_survey.apply_patches()`'s own "list of
+    entries" convention -- see its docstring). `None` entries are skipped,
+    so a caller can pass an optional table straight through."""
+    merged: sv.PatchTable = {}
+    for table in tables:
+        if not table:
+            continue
+        for pc, entries in table.items():
+            merged.setdefault(pc, []).extend(entries)
+    return merged
+
+
 def render_frames_to_ring_a(
     memory,
     image: str,
@@ -1378,87 +1455,81 @@ def render_frames_to_ring_a(
     track: int = 0,
     sample_format: str = "int16",
     patch_table: sv.PatchTable | None = FRAME_PATCH_TABLE,
+    mix_scalar_patch: sv.PatchTable | None = CONTINUOUS_MIX_SCALAR_PATCH,
     max_steps: int = 4_000_000,
 ) -> dict:
-    """Render N frames of one voice's own `freq` Hz sine, injecting each
-    frame's real decimated output into `track`'s master-mix input (see
+    """Render N frames of one voice's own `freq` Hz sine on ONE continuous
+    Runner (one `run_init()`, N `Runner.fresh_call()`s at block_handler via
+    `call_frame_with_track_injection()`), injecting each frame's real
+    decimated output into `track`'s master-mix input (see
     `inject_track_buffer()`), and return ring A's own output -- the actual
     DAC-facing buffer, one stage past the master mix -- concatenated across
     frames as mono (L+R averaged) floats at the firmware's own decimated
     output rate (`SOURCE_SAMPLE_RATE / 2` = 48 kHz).
 
-    **One independent post-init render per frame, not N calls on one
-    Runner (this lane, 2026-09-25).** Repeatedly calling `call_frame()`/
-    `call_frame_collect_all()` on the SAME Runner hits two blockers this
-    lane must not fix itself: `sharc_run.State.trace` is never trimmed
-    across calls, so a long run's resident memory grows unbounded (Lane
-    Z2's report: "grew past 8 GB after ~4 minutes" replaying 15 frames this
-    way); and the second call onward hits "unsupported Type14a odd UREG
-    pair" at 0x1c32ad, a genuine `tools/sharc_core` gap lane A1 owns. This
-    project's own rule for exactly this situation ("for multi-frame runs
-    before that lands, run single frames from saved snapshots between
-    frames") is followed here via `new_runner(..., init=init)`'s cheap
-    in-memory clone of one shared `run_init()` result (see that function's
-    own docstring), which is equivalent to a snapshot round-trip but
-    avoids the file I/O: each frame gets its own fresh Runner cloned from
-    the SAME post-init State, so neither the growing trace nor whatever
-    state the Type14a stop needs ever carries forward between frames. This
-    sidesteps both blockers by construction rather than working around
-    them.
+    **One continuous Runner (lane B2, 2026-09-25; was N independent
+    post-init renders under lane A2).** That version's own two blockers
+    (`sharc_run.State.trace`'s unbounded growth across repeated calls on
+    one Runner, and an "unsupported Type14a odd UREG pair" stop at
+    0x1c32ad on the second call onward) are both fixed on this branch
+    (7e5e8c4) -- checked here by running many frames on one Runner with no
+    new stop and bounded memory. The frame-0-only silence this module's own
+    "Continuity across frames, root-caused" note (above `TRACK_MIX_BASE`)
+    documents was a THIRD, separate problem (the master stage's own
+    per-track gain scalars collapsing to zero by frame 1, given this lane's
+    blank synthetic mix configuration) -- fixed here via `mix_scalar_patch`
+    (`CONTINUOUS_MIX_SCALAR_PATCH` by default; see that constant's own
+    docstring for the full evidence and its documented-hypothesis status).
 
-    **Phase continuity across frames comes from the source tone, not from
-    carried voice-record state.** Since every frame's voice record starts
-    fresh (`setup_voice()` on a fresh clone, `start=0`), this generates
-    each frame's own short source buffer as a slice of the SAME continuous
-    `freq` Hz tone starting at sample index `frame_index * 64` (64 raw
-    samples/frame at `pitch_step=1` -- the interpolator's own per-block
-    consumption; see `check_correctness()`'s "phase advances by
-    pitch_step*64 per block"), so consecutive frames render consecutive,
-    non-overlapping windows of one continuous tone -- audibly identical to
-    a single long render, without needing the record's own FIELD_PHASE to
-    survive across the Runner resets above.
+    **Phase continuity comes from one long source buffer plus the voice
+    record's own carried state**, both true to how the firmware actually
+    plays a long sample: `setup_voice()`/`_write_samples()` run ONCE,
+    before the frame loop, over a buffer sized for all `n_frames` (unlike
+    the old per-frame-independent version, which needed the source tone
+    itself to carry phase since every frame's record restarted at
+    `start=0`).
 
     Returns `{"ring_a_mono": [...], "per_frame": [...], "any_new_stop":
     bool}`; `per_frame[i]` is `{"frame", "instructions", "halt",
     "injected_max_abs", "ring_a_nonzero"}`.
     """
     init = run_init(memory, image)
-    if not init.ran:
+    if not init.ran or init.runner is None:
         raise ValueError("render_frames_to_ring_a: run_init failed: %s" % init.error)
 
-    raw_per_frame = 64  # FUN_1c4f81's DO-64 loop: 64 raw input samples/block
-    sample_len = _default_sample_len(1, pitch_step)
+    sample_len = _default_sample_len(n_frames, pitch_step)
     sample_base = 0x310000
+    combined_patches = _merge_patch_tables(patch_table, mix_scalar_patch)
+
+    runner = init.runner
+    state = runner.state
+    tone = [
+        math.sin(2 * math.pi * (freq / SOURCE_SAMPLE_RATE) * i)
+        for i in range(sample_len)
+    ]
+    _write_samples(state, sample_base, tone, sample_format)
+    record = setup_voice(
+        state,
+        image,
+        voice,
+        sample_len=sample_len,
+        pitch_step=pitch_step,
+        sample_base=sample_base,
+    )
+    setup_frame(state, image, command=3, ring_flag=0)
 
     ring_a_mono: list[float] = []
     per_frame: list[dict] = []
     for frame_index in range(n_frames):
-        runner = new_runner(memory, image, init=init)
-        state = runner.state
-        start_index = frame_index * int(round(raw_per_frame * pitch_step))
-        tone = [
-            math.sin(2 * math.pi * (freq / SOURCE_SAMPLE_RATE) * (start_index + i))
-            for i in range(sample_len)
-        ]
-        _write_samples(state, sample_base, tone, sample_format)
-        record = setup_voice(
-            state,
-            image,
-            voice,
-            sample_len=sample_len,
-            pitch_step=pitch_step,
-            sample_base=sample_base,
-        )
-        setup_frame(state, image, command=3, ring_flag=0)
-        new_runner_, result, injected = call_frame_with_track_injection(
+        runner, result, injected = call_frame_with_track_injection(
             runner,
             image,
             record,
             track=track,
-            patch_table=patch_table,
+            patch_table=combined_patches,
             max_steps=max_steps,
         )
-        ring = read_ring_a(memory, image, new_runner_)
+        ring = read_ring_a(memory, image, runner)
         floats = ring["float"]
         mono = [
             0.5 * ((left or 0.0) + (right or 0.0))

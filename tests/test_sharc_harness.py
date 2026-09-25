@@ -793,19 +793,29 @@ class FrameRenderFromInitTest(unittest.TestCase):
 @pytest.mark.slow
 @unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
 class RingAMilestoneTest(unittest.TestCase):
-    """render_frames_to_ring_a()'s own milestone (lane A2, 2026-09-25): the
-    first real, non-silent ring A output this project has produced from a
-    synthetic voice, pinned the same way FRAME_MILESTONE/ReplayIdleCaptureTest
-    pin theirs. This is signal reached by INJECTING a voice's own
-    already-firmware-rendered decimated buffer into one track's master-mix
-    input (see inject_track_buffer()'s module note for why: the real
-    per-track accumulate gate, DM(0x252d3c), has no known runtime writer
-    that both avoids a new stop and produces this write the ordinary way),
-    not evidence that the whole per-track accumulate path is understood --
-    a fix to the mix gate (or to why signal only survives one frame per
-    independent post-init render -- see this module's own module-level
-    note and the lane's report) changes this pin, and the commit that does
-    so should say why, exactly like FRAME_MILESTONE's own docstring asks.
+    """render_frames_to_ring_a()'s own milestone: the first real, non-silent
+    ring A output this project has produced from a synthetic voice, pinned
+    the same way FRAME_MILESTONE/ReplayIdleCaptureTest pin theirs. This is
+    signal reached by INJECTING a voice's own already-firmware-rendered
+    decimated buffer into one track's master-mix input (see
+    inject_track_buffer()'s module note for why: the real per-track
+    accumulate gate, DM(0x252d3c), has no known runtime writer that both
+    avoids a new stop and produces this write the ordinary way), not
+    evidence that the whole per-track accumulate path is understood.
+
+    **Updated (lane B2, 2026-09-25): now a genuinely continuous Runner, not
+    N independent post-init renders.** render_frames_to_ring_a() runs all
+    frames on one Runner and applies CONTINUOUS_MIX_SCALAR_PATCH (see that
+    constant's own docstring in tools/sharc_harness.py for the full
+    evidence): without it, ring A goes silent from frame 1 onward given
+    this lane's blank synthetic mix configuration -- real firmware
+    behaviour, not an emulator bug, per that investigation. This changed
+    every frame's own output (the old pin was measuring a per-frame
+    cold-start declick transient repeated four times, not a continuous
+    tone), so the digest below is a new pin, not the same value. A future
+    fix to the mix gate or the master-bus parameter table (see
+    docs/findings/06) changes this pin again, and the commit that does so
+    should say why, exactly like FRAME_MILESTONE's own docstring asks.
     """
 
     @classmethod
@@ -834,7 +844,7 @@ class RingAMilestoneTest(unittest.TestCase):
         digest = hashlib.sha256(repr(rounded).encode()).hexdigest()
         self.assertEqual(
             digest,
-            "f37e04725c3c392ca85c15be7737ed234ecebce52655c68ac940e9a36b5e52b3",
+            "cf5187104e0db4496fc40f81b67c6ba87be7dd08d1a3f007064d0c4cea72c97c",
         )
 
 

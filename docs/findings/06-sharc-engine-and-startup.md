@@ -3688,11 +3688,68 @@ to run *after* `0x1c207b`, not before, ruling out a simple ordering bug.
 Lane A2's own leading hypothesis, not confirmed: `FUN_b82cba`'s dynamics
 envelope, fed `DM(0x252d3c)=0` every frame (see above), computes a
 gain-reduction state on the first frame's real transient that never
-recovers. `render_frames_to_ring_a()` works around this by rendering every
-frame independently from a fresh `run_init()` clone (see that function's
-own docstring) rather than resolving it -- audible as a per-frame
-declick/attenuation artifact (measured `power_ratio` well below a clean
-tone's), not a fix.
+recovers.
+
+**[V] Root cause of the frame-0-only silence, and a working fix (lane B2,
+2026-09-25).** A genuinely continuous Runner (one `run_init()`, repeated
+`Runner.fresh_call()` -- `render_frames()`'s own pattern, and confirmed
+here to now run any number of frames cleanly: the `state.trace`
+unbounded-growth and Type14a odd-UREG-pair blockers lane A2 cited for
+avoiding this are both fixed on this branch, 7e5e8c4) traced the cause with
+watchpoints across two frames. `FUN_1c207b`'s own per-track summation loop
+(`0x1c2353`, `DO ... UNTIL LCE` over all 16 tracks) multiplies every
+track's contribution by three scalar coefficients held in R1/R2/R12 for
+the whole loop. Those scalars are computed a few hundred instructions
+earlier (`0x1c22d7`-`0x1c2353`) from `FUN_b82d41`/`FUN_b82cba`'s dynamics
+output (`0x254978`/`0x2549f8`, fed by `DM(0x252d3c)`) and from a ~26-field
+master-bus parameter block this SAME function decodes fresh every frame at
+`0x1c2e00`-`0x1c2fb0` (source table `0x255fb6`-`0x2560d0`, confirmed by
+execution to read all zero from a synthetic `run_init()` state -- no real
+kit/mixer configuration is ever loaded here). Frame 0's own compressor
+output is a plausible near-unity gain/trim (R1=0.953, R2=0.984,
+R12=-0.029); by frame 1 it has collapsed to a degenerate all-zero-
+multiplier state, and this is independent of the injected signal's own
+amplitude (checked: scaling the injected tone down 10x does not change
+it) -- ruling out a simple clipping/overload feedback loop as the cause
+(an earlier hypothesis this lane checked and rejected: `FUN_1c14e7`, the
+function immediately after `0x1c207b`, does apply a real, unconditional
+~3.125x gain to the master-stage per-track buffer every frame -- source
+`R2 = 0x40481206` at `0x1c14fd` -- but that stage's own overdrive was
+confirmed NOT to be what the compressor reacts to, since scaling the input
+well clear of its clip range does not change frame 1's silence). **This is
+real firmware behaviour given this lane's own state (blank master-bus
+parameters, no real per-track "slot type" ever reaching `FUN_1cdbb2`),
+not an emulator bug**: with a genuinely unconfigured mix bus, the
+compressor's own steady state is silence, and frame 0 is one frame's
+worth of "not yet converged" grace period, not a working master bus.
+
+**Fix applied (documented hypothesis, not a discovered real gate):**
+`tools/sharc_harness.py`'s `CONTINUOUS_MIX_SCALAR_PATCH` pins R1/R2/R12 to
+frame 0's own real, execution-confirmed values at every recurrence of
+`pc=0x1c2353` -- the same "register-only override at one pc" technique
+recommended above, via the `PatchTable` mechanism `FRAME_PATCH_TABLE`
+already uses. `render_frames_to_ring_a()` now runs on one continuous
+Runner with this patch and produces non-silent ring A on every one of 750
+frames tested (no new stop; see the lane's own report). Known limitation:
+this freezes the compressor's gain at frame 0's specific transient, so it
+does not adapt to a different input level.
+
+**[O] New, separate finding: the reconstructed ring-A audio is not a
+clean single-frequency waveform, under this project's own established
+L/R-deinterleave convention, regardless of the fix above.** With
+continuity fixed, `measure_tone()` on a 750-frame render's mono downmix
+gives `power_ratio` near the noise floor (~5e-7) at the injected
+frequency; a coarse frequency sweep instead finds most energy near 1500
+Hz -- `SOURCE_SAMPLE_RATE/2/32`, the FRAME rate, not the injected tone --
+suggesting `0x1c207b`'s own per-track summation does not simply copy a
+track's 32-word buffer 1:1 into the corresponding ring-A positions (tried
+and rejected: several other stride/rate reinterpretations of the raw
+64-word ring content, none reaching a plausible `power_ratio`). This was
+already present, at lower amplitude, in lane A2's own frame-0-only output
+(same sparse pattern found in a single unpatched frame) -- previously
+masked by describing the whole render as "one big declick artifact"
+without checking whether even one frame's own content traced a clean
+tone. Not resolved by this lane; see its own report for what was tried.
 
 **Wrap copies +0x1bc [D].** The wrap stores `DM(I1-3) = R2` (`0x1c50fe`,
 forward) and `DM(I2-3) = R2` (`0x1c5325`, reverse) are Type4d byte stores to
