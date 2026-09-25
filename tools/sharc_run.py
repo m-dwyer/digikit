@@ -234,7 +234,6 @@ class Runner:
         provisional_forms: Sequence[str] = (),
         explicit_memory_model: bool = False,
         approx_recips: bool = False,
-        decode_overrides: Mapping[int, Instruction] | None = None,
     ) -> None:
         self.data = data
         self.state = make_state(
@@ -254,22 +253,12 @@ class Runner:
         self.instructions = 0
         self.form_counts: collections.Counter[str] = collections.Counter()
         self.max_call_depth_reached = 0
-        # A caller-supplied Instruction to use in place of st.decode_at()'s
-        # own decode at that pc_sw, for a pc_sw independently known (e.g.
-        # from out/sharcdb's own sequential-walk decode, tools/sharc.py's
-        # `img.sql("SELECT form, fields FROM insn WHERE ...")`) to decode
-        # differently there than a standalone decode_at() call gets --
-        # see docs/findings/06 (or a HANDOVER) for the pc_sw this was
-        # needed for before relying on it. Not a fix: sharc_disasm.py and
-        # the decode tables are not this module's files.
-        self._overrides: dict[int, Instruction] = dict(decode_overrides or {})
-        self._cache: dict[int, Instruction] = dict(self._overrides)
+        self._cache: dict[int, Instruction] = {}
 
     def invalidate(self, pc_sw: int) -> None:
         """Evict pc_sw from the decode cache. See the class docstring for
         why nothing calls this automatically today."""
-        if pc_sw not in self._overrides:
-            self._cache.pop(pc_sw, None)
+        self._cache.pop(pc_sw, None)
 
     def _decode(self, pc_sw: int) -> Instruction:
         insn = self._cache.get(pc_sw)

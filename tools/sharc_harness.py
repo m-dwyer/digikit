@@ -53,23 +53,6 @@ DO 64 loop actually reads PCM through. ``setup_voice()`` now writes
 overwritten before the loop used it -- this is why seeding the register
 directly, as the previous version did, had no effect).
 
-Two known-bad decodes (see ``_KNOWN_BAD_DECODE_PCS``'s docstring -- a live,
-standalone ``sharc_trace.decode_at()`` call picks a 32-bit "2b" full-compute
-form at these PCs where ``out/sharcdb``'s own sequential-walk decode, and a
-raw-buffer cross-check at every window size ``sharc_disasm.decode_loaded_at``
-tries, agree the true form is a 16-bit "2c" short-compute -- this looks like
-a systematic decode-table/disassembler bug, not two isolated ones) are
-worked around here with ``sharc_run.Runner``'s ``decode_overrides``, sourced
-live from ``out/sharcdb`` rather than hand-copied, so a database rebuild
-that changes them is picked up automatically. This is a workaround, not a
-fix: sharc_disasm.py and the decode tables are not this module's files (see
-this repo's CLAUDE.md "Agents" section on lane ownership) -- report new
-instances of the same pattern rather than adding overrides for them here
-blindly. (One consequence: a live, uncorrected ``sharc_trace`` trace of this
-same span reports the record+0 load at sw 0x1c505a, 0x10 sw higher than
-out/sharcdb's 0x1c504a -- a downstream symptom of the same width bug, not a
-second load site.)
-
 Symbols (function/data addresses) come from ``tools/sharc_symbols.py``'s
 ``resolve()`` against ``out/sharcdb``, not a hardcoded dict -- see
 ``profile()`` below. Only record layout (byte offsets within one voice
@@ -99,7 +82,6 @@ import sharc as sharcmod  # noqa: E402
 import sharc_run as sr  # noqa: E402
 import sharc_symbols  # noqa: E402
 import sharc_trace as st  # noqa: E402
-from sharc_disasm import Instruction  # noqa: E402
 from sharcldr import LoadedMemory  # noqa: E402
 
 # Firmware addresses (functions, tables) come from tools/sharc_symbols.py's
@@ -161,74 +143,23 @@ COEFF_TABLE_STRIDE_BYTES = 24
 
 Q31 = 1 << 31
 
-# See this module's docstring: a live, standalone decode_at() call picks the
-# wrong (wider) form at these two PCs, reached on FUN_1c4ecf's/FUN_1c15e3's
-# own execution paths; out/sharcdb's sequential-walk decode has the
-# firmware-consistent one. Both were independently confirmed by a raw
-# sharc_disasm.disassemble() cross-check at every window size
-# decode_loaded_at tries (2/4/6 bytes): none of them recover the 16-bit
-# form decode_loaded_at should pick, so this is not a caching or
-# window-size artefact in this module -- it is upstream, in
-# sharc_disasm.py/the decode tables (not this lane's files).
-_KNOWN_BAD_DECODE_PCS = (0x1C502B, 0x1C59CE)
-
 
 def load_image_memory(image: str):
     """The same LoadedMemory sharc_run.py's CLI reads from."""
     return sr._load_image_memory(image)
 
 
-def _decode_override(image: str, pc_sw: int) -> Instruction:
-    """out/sharcdb's own decode at PC_SW, as a sharc_disasm.Instruction --
-    see this module's docstring for why this differs from a live
-    ``sharc_trace.decode_at()`` call at these specific addresses."""
-    img = sharcmod.load(image)
-    rows = img.sql(
-        "SELECT width, form, fields FROM insn WHERE image=? AND sw=?",
-        image,
-        pc_sw,
-    )
-    if not rows:
-        raise ValueError(
-            "no out/sharcdb decode recorded at %#x for %s "
-            "(rebuild the database, or this PC no longer needs an "
-            "override)" % (pc_sw, image)
-        )
-    width, form, fields_json = rows[0]
-    return Instruction(
-        offset=0,
-        length_bytes=width,
-        type_name=form,
-        fields=json.loads(fields_json),
-        kind="confident",
-        note="out/sharcdb decode override: see sharc_harness.py",
-    )
-
-
-def decode_overrides(image: str) -> dict[int, Instruction]:
-    return {pc: _decode_override(image, pc) for pc in _KNOWN_BAD_DECODE_PCS}
-
-
-# Decode-table-unconfirmed forms this render path actually exercises (lane
-# C is verifying 3d/4d/14d -- docs/findings/06).
-_PROVISIONAL_FORMS = ("3d", "4d", "14d")
-
-
 def _make_runner(
     memory: LoadedMemory, image: str, start: int, regs: Mapping[str | int, int | str]
 ) -> sr.Runner:
     """One place for the Runner options this harness always turns on: state
-    that a real boot leaves at reset (0) rather than Unknown, the two known
-    decode overrides (see this module's docstring), ``_PROVISIONAL_FORMS``,
-    and the numeric recips model (this render path's pitch/rate math
-    divides)."""
+    that a real boot leaves at reset (0) rather than Unknown, and the numeric
+    recips model (this render path's pitch/rate math divides)."""
     return sr.Runner(
         memory,
         start,
         regs=regs,
-        decode_overrides=decode_overrides(image),
         explicit_memory_model=True,
-        provisional_forms=_PROVISIONAL_FORMS,
         approx_recips=True,
         follow_loaded_calls=True,
         max_call_depth=64,
@@ -251,13 +182,9 @@ class InitResult:
 def run_init(memory, image: str, *, max_steps: int = 200_000) -> InitResult:
     """Attempt FUN_1c15e3 (docs/findings/06: no arguments) to its return.
 
-    Best-effort: see this module's docstring for the systematic decode
-    issue this hits deeper in than the two PCs ``decode_overrides()``
-    covers (a delay-slot ``25c_rframe`` reached other than immediately
-    after a delayed return, at sw 0x1c12bf on the 1.16 bytes, itself
-    consistent with the same wrong-live-decode pattern rather than a real
-    "return frame outside a return" -- not yet isolated to a specific bad
-    PC the way the render path's two were). A caller does not have to
+    Best-effort: on the 1.16 image it runs 1,320 instructions and stops at
+    sw 0x1c128a, a Type9a jump with a control modifier the tracer does not
+    model yet. A caller does not have to
     treat this failing as fatal: every voice-record field
     ``setup_voice()`` writes is set directly from docs/findings/06's own
     contract, not read back from what FUN_1c15e3 would have written.

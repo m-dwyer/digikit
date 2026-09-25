@@ -2,7 +2,7 @@
 
 Two groups: pure-Python helpers (decimate/write_wav/reference_render) need
 no firmware and always run; everything that calls into a real voice-render
-(setup_voice/render_blocks/decode_overrides/check_correctness) needs the
+(setup_voice/render_blocks/check_correctness) needs the
 real DT2 1.16 SHARC+ image bytes (out/sections/dt2-1.16/section_7_BLOB.bin
 -- Elektron's copyright, never committed here) and is skipped without them,
 the same convention tests/test_sharc_contract.py uses.
@@ -94,17 +94,6 @@ class FirmwareBackedTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.memory = h.load_image_memory("dt2-1.16")
-
-    def test_decode_overrides_agree_with_the_database(self):
-        # Regression guard: if out/sharcdb is rebuilt and these PCs no
-        # longer decode as "2c" there (e.g. because the systematic decode
-        # bug this module's docstring describes was fixed upstream), this
-        # should fail loudly rather than silently keep forcing a stale
-        # decode.
-        overrides = h.decode_overrides("dt2-1.16")
-        for pc, insn in overrides.items():
-            self.assertEqual(insn.type_name, "2c", hex(pc))
-            self.assertEqual(insn.kind, "confident", hex(pc))
 
     def test_voice_zero_matches_contract(self):
         self.assertEqual(h.voice_record_address("dt2-1.16", 0), 0x2412CC)
