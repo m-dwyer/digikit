@@ -91,6 +91,21 @@ L1_BLOCK3_NW_BASE = 0x000E0000
 L1_BLOCK3_NW_LIMIT = 0x000E8000
 L1_BLOCK3_SW_BASE = 0x001C0000
 
+# The harness's opt-in explicit-MMR-model (State.explicit_memory_model, see
+# sharc_core/memory.py) carves these two address envelopes out of the
+# general "unwritten internal RAM reads as 0" policy.  Core MMRs
+# (tools/sharcimm.py's CORE_MMR_REGS: CMMR_SYSCTL 0x30024, SHBTB_* 0x31400-
+# 0x31402, SHL1C_CFG* 0x3E000/0x3E002) are named with small, compact
+# addresses distinct in scale from the peripheral/system MMR bus below;
+# 0x30000-0x32000 is the compact envelope most of them sit in (SHL1C_CFG*
+# at 0x3E00x is outside it but is still caught by the CORE_MMR_RESET_VALUES/
+# name_address lookup memory.py already does, independent of this range).
+CORE_MMR_RANGE = (0x30000, 0x32000)
+# tools/sharcimm.py's PERIPHERAL_SPACE is the full ADSP-2156x peripheral bus
+# (0x30000000-0x31ffffff); every named block tools/sharcimm.py's BLOCKS
+# table actually knows about sits inside 0x31000000-0x310fffff.
+SYSTEM_MMR_RANGE = (0x31000000, 0x310FFFFF)
+
 # ASTATX/ASTATY bit positions (SHARC+ PRM ch.4 REGF_ASTATX/REGF_ASTATY).
 AZ_BIT, AV_BIT, AN_BIT, AC_BIT, AS_BIT, AI_BIT = 0, 1, 2, 3, 4, 5
 MN_BIT, MV_BIT, MU_BIT, MI_BIT = 6, 7, 8, 9

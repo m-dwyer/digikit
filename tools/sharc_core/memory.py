@@ -9,10 +9,12 @@ from sharcimm import name_address
 from sharcldr import SW_ALIAS_BASE, sw_to_byte
 
 from .encoding import (
+    CORE_MMR_RANGE,
     CORE_MMR_RESET_VALUES,
     L1_BLOCK3_NW_BASE,
     L1_BLOCK3_NW_LIMIT,
     L1_BLOCK3_SW_BASE,
+    SYSTEM_MMR_RANGE,
     UREG_CODES,
     UREG_NAMES,
 )
@@ -30,6 +32,34 @@ from .values import (
     Value,
     _add,
 )
+
+
+class UnmodeledMMR(Exception):
+    """A core or system MMR (State.explicit_memory_model, opt-in) has no
+    known reset value (State.mmrs, pre-populated from
+    encoding.CORE_MMR_RESET_VALUES) and no harness-set value (a --poke, or
+    any other write through _dm_write()) at the point a form reads it.
+
+    tools/sharc_run.py's Runner catches this and turns it into a named
+    Halt; a caller that has not opted into ``explicit_memory_model`` never
+    triggers it, and sharc_trace.py's symbolic driver does not catch it, so
+    only sharc_run.py's concrete runner is expected to see it today.
+    """
+
+    def __init__(self, address: int, name: str | None) -> None:
+        self.address = address
+        self.name = name
+        super().__init__("unmodeled MMR %#x (%s)" % (address, name or "unnamed"))
+
+
+def _in_core_mmr_range(address: int) -> bool:
+    lo, hi = CORE_MMR_RANGE
+    return lo <= address < hi
+
+
+def _in_system_mmr_range(address: int) -> bool:
+    lo, hi = SYSTEM_MMR_RANGE
+    return lo <= address <= hi
 
 
 def _concrete_address(value: Value | int) -> int | None:
@@ -86,6 +116,22 @@ def _dm_read(
         return mmr_value if isinstance(mmr_value, Const) else None
     if width == 4 and fixed_width_mmr and state.data_memory_tainted:
         return None
+    if state.explicit_memory_model and width == 4:
+        # Broader than fixed_width_mmr: an address inside the core/system
+        # MMR envelope (encoding.CORE_MMR_RANGE/SYSTEM_MMR_RANGE) that
+        # tools/sharcimm.py does not individually name still goes through
+        # this explicit model rather than falling into ordinary DM/RAM
+        # handling below.
+        in_mmr_range = (
+            fixed_width_mmr
+            or _in_core_mmr_range(concrete)
+            or _in_system_mmr_range(concrete)
+        )
+        if in_mmr_range:
+            if concrete in state.mmrs:
+                mmr_value = state.mmrs[concrete]
+                return mmr_value if isinstance(mmr_value, Const) else None
+            raise UnmodeledMMR(concrete, name_address(concrete))
     if (
         width == 4
         and not state.assume_nw32
@@ -95,9 +141,25 @@ def _dm_read(
         # Internal normal-word width depends on runtime IMDWx state.  Reading
         # four loader bytes as one word is opt-in until that state is known.
         return None
-    concrete = _canonical_dm_address(state, concrete, width)
-    if concrete is None:
+    canonical = _canonical_dm_address(state, concrete, width)
+    if canonical is None:
+        if (
+            state.explicit_memory_model
+            and width in (1, 2, 4)
+            and not (
+                fixed_width_mmr
+                or _in_core_mmr_range(concrete)
+                or _in_system_mmr_range(concrete)
+            )
+        ):
+            # Internal RAM (an unaliased low DM pointer, or an address the
+            # loader alias already covers but never wrote) a real boot never
+            # wrote reads as 0, matching SHARC+ SRAM after reset -- opt-in,
+            # since the default run must still fork/stop on it (see
+            # State.explicit_memory_model's docstring).
+            return Const(0)
         return None
+    concrete = canonical
     if state.data_memory_tainted and not all(
         here in state.overlay for here in range(concrete, concrete + width)
     ):

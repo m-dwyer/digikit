@@ -43,6 +43,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import sharc_trace as st  # noqa: E402
+from sharc_core.memory import UnmodeledMMR  # noqa: E402
 from sharc_disasm import Instruction  # noqa: E402
 from sharcldr import LoadedMemory  # noqa: E402
 
@@ -127,10 +128,22 @@ def make_state(
     continue_external_calls: bool = False,
     assume_nw32: bool = True,
     max_call_depth: int = 64,
+    provisional_forms: Sequence[str] = (),
+    explicit_memory_model: bool = False,
+    approx_recips: bool = False,
 ) -> st.State:
     """A fully concrete State ready to step, with sharc_trace's own
     _dm_write() used to apply pokes -- the same canonicalisation (loader
-    alias, MMR routing, width gating) a real store instruction gets."""
+    alias, MMR routing, width gating) a real store instruction gets.
+
+    ``provisional_forms`` and ``explicit_memory_model`` are both opt-in and
+    change nothing when left at their defaults: see sharc_core/state.py's
+    ``State.provisional_forms``/``State.explicit_memory_model`` docstrings.
+    ``approx_recips`` is sharc_trace.py's own pre-existing State field
+    (State.approx_recips), exposed here too: a voice render's pitch/rate
+    math (docs/findings/06's "voice record contract") goes through recips,
+    whose ROM seed is undocumented without it.
+    """
     if not isinstance(data, LoadedMemory):
         raise ValueError(
             "sharc_run needs a LoadedMemory image; concrete execution has "
@@ -153,6 +166,9 @@ def make_state(
         core_reset_state=True,
         mmrs=mmrs,
         record_events=False,
+        provisional_forms=tuple(provisional_forms),
+        explicit_memory_model=explicit_memory_model,
+        approx_recips=approx_recips,
     )
     for address, value in sorted((pokes or {}).items()):
         if not st._dm_write(state, address, 4, st.Const(value & 0xFFFFFFFF)):
@@ -215,6 +231,10 @@ class Runner:
         assume_nw32: bool = True,
         max_call_depth: int = 64,
         breakpoints: Sequence[int] = (),
+        provisional_forms: Sequence[str] = (),
+        explicit_memory_model: bool = False,
+        approx_recips: bool = False,
+        decode_overrides: Mapping[int, Instruction] | None = None,
     ) -> None:
         self.data = data
         self.state = make_state(
@@ -226,17 +246,30 @@ class Runner:
             continue_external_calls=continue_external_calls,
             assume_nw32=assume_nw32,
             max_call_depth=max_call_depth,
+            provisional_forms=provisional_forms,
+            explicit_memory_model=explicit_memory_model,
+            approx_recips=approx_recips,
         )
         self.breakpoints = frozenset(breakpoints)
         self.instructions = 0
         self.form_counts: collections.Counter[str] = collections.Counter()
         self.max_call_depth_reached = 0
-        self._cache: dict[int, Instruction] = {}
+        # A caller-supplied Instruction to use in place of st.decode_at()'s
+        # own decode at that pc_sw, for a pc_sw independently known (e.g.
+        # from out/sharcdb's own sequential-walk decode, tools/sharc.py's
+        # `img.sql("SELECT form, fields FROM insn WHERE ...")`) to decode
+        # differently there than a standalone decode_at() call gets --
+        # see docs/findings/06 (or a HANDOVER) for the pc_sw this was
+        # needed for before relying on it. Not a fix: sharc_disasm.py and
+        # the decode tables are not this module's files.
+        self._overrides: dict[int, Instruction] = dict(decode_overrides or {})
+        self._cache: dict[int, Instruction] = dict(self._overrides)
 
     def invalidate(self, pc_sw: int) -> None:
         """Evict pc_sw from the decode cache. See the class docstring for
         why nothing calls this automatically today."""
-        self._cache.pop(pc_sw, None)
+        if pc_sw not in self._overrides:
+            self._cache.pop(pc_sw, None)
 
     def _decode(self, pc_sw: int) -> Instruction:
         insn = self._cache.get(pc_sw)
@@ -251,7 +284,15 @@ class Runner:
         if state.pc_sw in self.breakpoints:
             raise Halt("breakpoint", state.pc_sw)
         insn = self._decode(state.pc_sw)
-        out = st._execute(state, insn)
+        try:
+            out = st._execute(state, insn)
+        except UnmodeledMMR as exc:
+            raise Halt(
+                "mmr",
+                state.pc_sw,
+                insn.type_name,
+                "unmodeled MMR %#x (%s)" % (exc.address, exc.name or "unnamed"),
+            ) from exc
         if len(out) != 1:
             raise Halt(
                 "fork (%d successors): a predicate or address went Unknown "
@@ -363,6 +404,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=True,
         help="stop at the first call into loaded code instead of entering it",
     )
+    p.add_argument(
+        "--allow-provisional",
+        dest="provisional_forms",
+        action="append",
+        default=[],
+        metavar="FORM",
+        help="execute this decode-table-unconfirmed form instead of "
+        "halting on it (repeatable); sets state.provisional_forms",
+    )
+    p.add_argument(
+        "--explicit-memory-model",
+        action="store_true",
+        default=False,
+        help="internal RAM never written by the loader or this run reads "
+        "as 0 instead of Unknown; a core/system MMR with no known reset "
+        "value and no --poke halts naming the register instead of forking "
+        "(sharc_core.State.explicit_memory_model; off by default)",
+    )
+    p.add_argument(
+        "--approx-recips",
+        action="store_true",
+        default=False,
+        help="substitute a documented-but-unverified numeric model for "
+        "recips's undocumented ROM seed instead of leaving it Unknown "
+        "(sharc_core.State.approx_recips, same as tools/sharc_trace.py's "
+        "own --approx-recips; off by default)",
+    )
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
 
@@ -387,6 +455,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         follow_loaded_calls=a.follow_loaded_calls,
         max_call_depth=a.max_call_depth,
         breakpoints=a.breakpoints,
+        provisional_forms=a.provisional_forms,
+        explicit_memory_model=a.explicit_memory_model,
+        approx_recips=a.approx_recips,
     )
     result = runner.run(a.max_steps)
 

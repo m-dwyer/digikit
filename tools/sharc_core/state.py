@@ -92,6 +92,15 @@ class State:
     # (the predicate-resolved Type3a/etc. idiom) keep working; only the
     # pc_sw/form/_json_value bookkeeping is skipped.
     record_events: bool = True
+    # Opt-in (tools/sharc_harness.py): a DM read that a real boot/init never
+    # wrote reads as 0 (internal RAM only -- see sharc_core/memory.py's
+    # _dm_read) instead of Unknown, and a core/system MMR (see
+    # sharc_core/encoding.py's CORE_MMR_RANGE/SYSTEM_MMR_RANGE) with no
+    # known reset value and no harness-set value raises
+    # sharc_core.memory.UnmodeledMMR instead of also going Unknown. Default
+    # False: this must not change tools/sharc_run.py's default CLI output
+    # or tests/test_sharc_golden.py's hashes.
+    explicit_memory_model: bool = False
 
 
 def _render(value: Value | int) -> str:
