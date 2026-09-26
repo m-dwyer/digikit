@@ -452,8 +452,47 @@ path -- see finding 07's new stall section -- to capture ground truth).
 stall is fixed, `FUN_4015a450` will reject any image this tool builds today,
 because sector `0x5D8000` is all zero (never written). The tool needs to
 also write this superblock, with a byte-exact `hashlittle` implementation,
-for the real mount path to ever set `_DAT_44f2bd68 = 1`. **[O]**, not yet
-implemented.
+for the real mount path to ever set `_DAT_44f2bd68 = 1`.
+
+**Implemented.** `tools/plusdrive.py`'s `hashlittle()`/`build_superblock()`
+now write this sector; `build()` calls it unconditionally. The checksum
+routine was transliterated instruction-for-instruction from
+`FUN_4015aa20`/`FUN_4015a6dc` (not reconstructed from the textbook
+lookup3.c, since this variant's seed step omits the length term the
+textbook one-shot version adds) and checked bit-for-bit against 44 real
+calls to the firmware's own `FUN_4015abb2`, executed via a bounded
+`emu.harness.call` on `snapshots/dt2-1.16/running.snap` -- lengths 0-29,
+508 (the real superblock range), 511, 512, 600, 1199-1201 (either side of
+`FUN_4015aa20`'s 0x4b0-byte streaming-chunk boundary) and 1211, 2401, with
+random content. Every result matched. Two firmware quirks this uncovered,
+both reproduced in the Python: (1) the seed is `initval + 0xDEADBEEF` with
+**no length folded in**, unlike lookup3.c's one-shot `hashlittle`; (2) a
+zero-length input's tail `switch` jumps straight past `final()`, returning
+the raw seed unfinalized -- `tests/test_plusdrive.py` has the golden
+vectors and the finalize-skip test. **[V]**.
+
+Fields at superblock offsets `0x2c`/`0x30` (table above) are now also
+resolved: they are two runtime-allocated physical sector numbers, each the
+start of a 44-page run reserved by two calls to `FUN_40155698(0x2c,...)` in
+the writer. Their consumer, `FUN_4015ae12` (run at both format- and
+mount-time, right after the magic/checksum/version check succeeds), scans
+exactly the sector range `[0x5ee980, 0x5eff80)` -- 88 pages, i.e. the same
+two consecutive 44-page runs -- so the literal values are `0x5ee980` and
+`0x5ef480` (confirmed by exact arithmetic, not just plausible-shaped
+numbers). What that scan is *for* remains open (see below); it doesn't
+block mount or a correct root listing either way, since our image leaves
+that whole range zero (all-zero words read as "nothing cached", not a
+crash -- `FUN_4015ae12` only extracts bit-0-set words into a lookup table).
+Fields `0x24`/`0x28` are writer-side literals, not runtime-derived:
+`0x24 = PAGE / SECTOR` (sectors per 32 KiB page) and `0x28` is the literal
+argument the writer itself passes to one `FUN_40155698` call, kept as-is.
+None of these five fields (`0x24`/`0x28`/`0x2c`/`0x30`, plus the whole
+middle of the sector) are read by the mount path itself
+(`FUN_4015a450`/`FUN_4015a124` only check magic/version/checksum), so
+getting them wrong cannot fail a mount -- they're written for fidelity to
+the real format, not because mount depends on them. **[V]** for what reads
+them and where the values come from; **[O]** still for what the
+`FUN_4015ae12` scan's cached table is actually used for downstream.
 
 ## `SampleManager` holds two `Directory` implementations, not one **[D]**
 
@@ -524,8 +563,59 @@ nothing about mount state; readdir only happens on actual navigation
   allocator (a mount-time consistency check) — not searched for.
 - The sector-`0x5D8000` superblock's fields beyond magic/version, and a
   byte-exact `hashlittle` implementation for `tools/plusdrive.py` to write
-  a valid one — see the new section above. Blocks the real mount path
-  (`FUN_4015a450`) from ever accepting any image this tool builds.
+  a valid one — **answered**, see the new section above: implemented and
+  checked bit-for-bit against 44 real firmware executions. `out/plusdrive/dt2.img`
+  now carries a superblock that self-verifies (`build_superblock()`'s own
+  checksum recomputes to the same value; confirmed against a freshly
+  rebuilt image with `tools/plusdrive.py ls`).
+- **New, and the current blocker: `FUN_4015a450` (mount) is never called
+  at all on a `--card-image` boot, independent of the superblock's
+  correctness.** Traced with the corrected image (`snapshots/dt2-1.16-sb/`):
+  the eSDHC command log stays at exactly the two reads a plain header/pool
+  format-check makes (blocks `0` and `0x800`) through 1,000,056,162
+  instructions -- no third `CMD18` to `0x5D8000` ever happens, reproducing
+  `docs/findings/07-emulator.md`'s existing control-image result byte for
+  byte, now confirmed with a real, byte-correct superblock present too. The
+  reason: `FUN_400cc864` (the boot task that calls `FUN_4015a450`/
+  `FUN_4015a424`) gates that whole call behind `_DAT_42940a48 == 0`, and
+  that variable is set from an eMMC identity check
+  (`FUN_4012dc80`→`FUN_4012dbe0`→`FUN_4012da2c`) that compares the
+  emulated card's `ALL_SEND_CID`/`SEND_CID` response against a 7-entry
+  whitelist of (manufacturer-ID, 6-character product-name) pairs at
+  `0x402b4a24`-`0x402b4b04` (values `0x11`×4/`0x15`/`0x70`×2, names like
+  `"004GE0"`, eMMC part numbers, not SD OIDs) baked into `MAIN_OS`.
+  `emu/esdhc.py`'s `Card.__init__` already sets `self.cid`'s manufacturer
+  byte to `0x11` (`self.cid = [0, 0, 0, 0x00110000]`) — a prior, incomplete
+  attempt at this same fix — but leaves the product-name portion zero,
+  which fails the whitelist's exact-string compare
+  (`FUN_40189ff4`, literally glibc's word-at-a-time `strcmp`) and yields
+  `_DAT_42940a48 = 7` (not 0), skipping the mount/format call. **Confirmed
+  live**: the CID→RAM mapping is `self.cid[0..3]` (R2 response words
+  RSP0-RSP3) → `_DAT_44e3fe90/94/98/9c` respectively (byte-exact, read back
+  from a fresh cold boot with test marker words); `FUN_4012db90` reads the
+  manufacturer byte as `_DAT_44e3fe9c & 0xff` (RSP3's **low** byte, not
+  bits `23:16` as the register's own `RSP3[23:0]` framing might suggest) and
+  the product name from `_DAT_44e3fe98`'s 4 bytes plus `_DAT_44e3fe94`'s top
+  2 bytes. Setting `self.cid = [0, 0x45300000, 0x30303447, 0x00000011]`
+  (manufacturer `0x11` in RSP3's low byte, name `"004GE0"` split across
+  RSP2/RSP1 per that mapping) and rebuilding a cold ladder still produced
+  `_DAT_42940a48 = 6` (eMMC identity check's *first* branch, `-1`: "no
+  manufacturer-ID match at all"), not the expected `0` (success) or even
+  `7` (name mismatch) — i.e. the manufacturer-byte comparison itself did not
+  match this time even though `_DAT_44e3fe9c & 0xff` reads back as `0x11`
+  exactly as intended, which contradicts the straightforward reading of
+  `FUN_4012da2c` above. **[O], unresolved**: either the whitelist-scan
+  function reads a different field than the one this session traced, or an
+  intervening step (not yet found) transforms the value between
+  `FUN_4012db90` and the comparison. This needs one more session with
+  disassembly-level (not decompiled-C-level) register tracing through
+  `FUN_4012dbe0`/`FUN_4012da2c` at the exact call, not another guess-and-
+  rebuild cycle -- each cold-boot iteration costs a multi-minute ladder
+  rebuild, so bound further attempts to reading the raw instructions first.
+  Until this is fixed, no card-image boot -- with or without a valid
+  +Drive superblock -- ever reaches a mounted `FileSystemDirectory`, and
+  item 3 (browser lists `hat.wav`) cannot be demonstrated end-to-end in
+  this emulator.
 - Which `Directory` (`FileSystemDirectory` vs `SamplePoolDirectory`)
   `SampleManager` actually browses — **answered**: a live crash trace
   (see `docs/findings/07-emulator.md`'s corrected section below) found

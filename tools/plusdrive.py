@@ -35,6 +35,21 @@ Open questions the finding doc flags, most relevant to this tool:
 * The 0x10000 (name-hash) and 0x10002 (id-sorted) auxiliary index pages are
   deliberately NOT written -- believed unnecessary for on-device browsing
   and loading (as opposed to by-path MIDI RPC access), unconfirmed.
+
+This tool also writes the real filesystem's superblock at sector 0x5D8000
+(``FUN_4015a450``'s mount check; see docs/findings/14-plus-drive-format.md's
+"undocumented real-FS superblock" section) -- without it the mount always
+fails and ``FileSystemDirectory`` never reports itself valid, which is what
+threw the uncaught ``std::logic_error`` documented in
+docs/findings/07-emulator.md. The checksum is a firmware-specific streaming
+variant of Bob Jenkins' public-domain ``lookup3.c`` ``hashlittle`` (seeded
+``initval + 0xDEADBEEF``, no length folded into the seed, and a
+zero-length-input quirk that skips the finalizer -- see ``hashlittle()``
+below); the Python reimplementation here was checked bit-for-bit against 44
+real calls to the firmware's own ``FUN_4015abb2`` (lengths 0-29, 508, 511,
+512, 600, 1199-1201, 1211, 2401, each with random content), covering every
+tail case of its switch and both the single-block and multi-block streaming
+paths -- see ``tests/test_plusdrive.py``.
 """
 
 import argparse
@@ -65,6 +80,30 @@ PAGE_BITMAP_SECTOR_END = 0x5D8180
 RECORD_AREA_SECTOR = 0x5D8180
 CONTENT_AREA_SECTOR = 0x5EE180
 
+# Region 2's superblock: FUN_4015a450 (mount) and FUN_4015a164 (format
+# writer), see docs/findings/14-plus-drive-format.md. Sector-relative field
+# values (0x14/0x18/0x1c/0x20) are each `<region-start-sector> - SUPERBLOCK_SECTOR`,
+# confirmed by exact arithmetic against the sector constants above. Fields
+# 0x2c/0x30 are two runtime-allocated physical sectors (each the start of a
+# 44-page run reserved by FUN_40155698(0x2c,...), called twice); their
+# consumer, FUN_4015ae12 (run at both format- and mount-time), scans exactly
+# the sector range [0x5ee980, 0x5eff80) -- 88 pages, i.e. two consecutive
+# 44-page runs starting at 0x5ee980 and 0x5ef480 -- so those are the literal
+# values, not free choices; nothing here has confirmed what that scan is for
+# (an RAM-resident record/page cache seed, per finding 14's open questions).
+# Fields 0x24/0x28 are literal constants in the writer, not derived from a
+# call: 0x24 = PAGE/SECTOR (sectors per 32 KiB page); 0x28 is the argument
+# the writer itself passes to one FUN_40155698 call (a page-count request),
+# reused here as-is. None of these five fields are read back by the mount
+# path (FUN_4015a450/FUN_4015a124 only check magic/version/checksum), so
+# they cannot fail a mount; they are written for fidelity, not correctness.
+SUPERBLOCK_SECTOR = 0x5D8000
+SUPERBLOCK_MAGIC = 0x656B4653
+SUPERBLOCK_VERSION = 4  # mount accepts 3 or 4
+SUPERBLOCK_HASH_SEED = 0x31323334
+SUPERBLOCK_HASH_LEN = 0x1FC  # bytes [0x00:0x1FC) are checksummed
+SUPERBLOCK_CHECKSUM_OFFSET = 0x1FC  # last 4 bytes of the 512-byte sector
+
 ROOT_ID = 2
 ROOT_PARENT = 2  # the root is its own parent; nothing reads this for id 2
 
@@ -92,6 +131,128 @@ def _u16(v):
 
 def _u32(v):
     return struct.pack(">I", v & 0xFFFFFFFF)
+
+
+_MASK32 = 0xFFFFFFFF
+
+
+def _rotl(x, n):
+    return ((x << n) | (x >> (32 - n))) & _MASK32
+
+
+def _hashlittle_mix(a, b, c, k0, k1, k2):
+    """One 12-byte mix() round, transliterated instruction-for-instruction
+    from FUN_4015a6dc/FUN_4015aa20's decompiled loop body (rotate constants
+    4, 6, 8, 16, 19, 4) rather than reconstructed from the textbook
+    lookup3.c macro, so it stays bit-exact even though the compiler fused
+    the usual `a+=k0; b+=k1; c+=k2;` pre-step into the first two rounds."""
+    c = (k2 + c) & _MASK32
+    t2 = (k1 + b + c) & _MASK32
+    u1 = (_rotl(c, 4) ^ ((k0 + a - c) & _MASK32)) & _MASK32
+    t3 = (t2 + u1) & _MASK32
+    u2 = (((k1 + b - u1) & _MASK32) ^ _rotl(u1, 6)) & _MASK32
+    t4 = (t3 + u2) & _MASK32
+    u3 = (((t2 - u2) & _MASK32) ^ _rotl(u2, 8)) & _MASK32
+    t2b = (t4 + u3) & _MASK32
+    u4 = (((t3 - u3) & _MASK32) ^ _rotl(u3, 16)) & _MASK32
+    a = (t2b + u4) & _MASK32
+    u5 = (((t4 - u4) & _MASK32) ^ _rotl(u4, 19)) & _MASK32
+    b = (a + u5) & _MASK32
+    c = (((t2b - u5) & _MASK32) ^ _rotl(u5, 4)) & _MASK32
+    return a, b, c
+
+
+def _hashlittle_final(a, b, c):
+    """final(a,b,c) -> c, transliterated from the tail of FUN_4015a6dc
+    (rotate constants 14, 11, 25, 16, 4, 14, 24 -- Jenkins' standard
+    lookup3.c final())."""
+    u1 = ((b ^ c) - _rotl(b, 14)) & _MASK32
+    u2 = ((u1 ^ a) - _rotl(u1, 11)) & _MASK32
+    u3 = ((u2 ^ b) - _rotl(u2, 25)) & _MASK32
+    u4 = ((u3 ^ u1) - _rotl(u3, 16)) & _MASK32
+    a2 = ((u4 ^ u2) - _rotl(u4, 4)) & _MASK32
+    b2 = ((a2 ^ u3) - _rotl(a2, 14)) & _MASK32
+    c2 = ((b2 ^ u4) - _rotl(b2, 24)) & _MASK32
+    return c2
+
+
+def _tail_word(data, off, n):
+    """Read n (<=4) bytes big-endian, left-justified in a 32-bit word with
+    the missing low bytes read as zero -- matches the firmware's own
+    `*puVar8 & 0xff000000`-style masked read of a short, in-bounds-buffer
+    tail word (the mask keeps the top n bytes and zeros the low 4-n)."""
+    buf = data[off : off + n] + b"\0" * (4 - n)
+    return struct.unpack(">I", buf)[0]
+
+
+def hashlittle(data, initval):
+    """The firmware's real-filesystem superblock checksum (FUN_4015abb2 /
+    FUN_4015aa20 / FUN_4015a6dc): a streaming variant of Bob Jenkins'
+    public-domain lookup3.c ``hashlittle`` -- same mix()/final() rotate
+    constants, but seeded ``initval + 0xDEADBEEF`` with no length folded in
+    (unlike the textbook one-shot version), and with a firmware-specific
+    quirk: a zero-length input's tail switch jumps straight past final(),
+    returning the raw seed unfinalized. See docs/findings/14 and this
+    module's docstring. Bit-exact for all 32-bit lengths (verified against
+    44 real firmware calls covering every tail case 0-12 and multi-block
+    streaming; tests/test_plusdrive.py has the golden vectors)."""
+    a = b = c = (initval + 0xDEADBEEF) & _MASK32
+    n = len(data)
+    if n == 0:
+        return c  # the finalize-skipping quirk described above
+    off = 0
+    while n > 12:
+        k0, k1, k2 = struct.unpack_from(">III", data, off)
+        a, b, c = _hashlittle_mix(a, b, c, k0, k1, k2)
+        off += 12
+        n -= 12
+    # n is now the 1..12-byte tail, mirroring FUN_4015a6dc's switch exactly.
+    if n == 1:
+        a = (a + _tail_word(data, off, 1)) & _MASK32
+    elif n == 2:
+        a = (a + _tail_word(data, off, 2)) & _MASK32
+    elif n == 3:
+        a = (a + _tail_word(data, off, 3)) & _MASK32
+    elif n == 4:
+        (k0,) = struct.unpack_from(">I", data, off)
+        a = (a + k0) & _MASK32
+    elif 5 <= n <= 8:
+        (k0,) = struct.unpack_from(">I", data, off)
+        a = (a + k0) & _MASK32
+        b = (b + _tail_word(data, off + 4, n - 4)) & _MASK32
+    elif 9 <= n <= 12:
+        k0, k1 = struct.unpack_from(">II", data, off)
+        a = (a + k0) & _MASK32
+        b = (b + k1) & _MASK32
+        c = (c + _tail_word(data, off + 8, n - 8)) & _MASK32
+    return _hashlittle_final(a, b, c)
+
+
+def build_superblock():
+    """-> the 512-byte real-filesystem superblock FUN_4015a450 mounts.
+
+    All fields except the checksum are literal or derived constants (see the
+    SUPERBLOCK_* comment above); nothing here depends on card content, so
+    this is deterministic and independent of what `build()` writes anywhere
+    else.
+    """
+    buf = bytearray(SECTOR)
+    struct.pack_into(">I", buf, 0x00, SUPERBLOCK_MAGIC)
+    struct.pack_into(">I", buf, 0x04, SUPERBLOCK_VERSION)
+    struct.pack_into(">I", buf, 0x08, PAGE)
+    struct.pack_into(">I", buf, 0x0C, 0x58000)
+    struct.pack_into(">I", buf, 0x10, 0xA0080)
+    struct.pack_into(">I", buf, 0x14, ID_BITMAP_SECTOR - SUPERBLOCK_SECTOR)
+    struct.pack_into(">I", buf, 0x18, PAGE_BITMAP_SECTOR - SUPERBLOCK_SECTOR)
+    struct.pack_into(">I", buf, 0x1C, RECORD_AREA_SECTOR - SUPERBLOCK_SECTOR)
+    struct.pack_into(">I", buf, 0x20, CONTENT_AREA_SECTOR - SUPERBLOCK_SECTOR)
+    struct.pack_into(">I", buf, 0x24, PAGE // SECTOR)  # sectors per page
+    struct.pack_into(">I", buf, 0x28, 0x20)
+    struct.pack_into(">I", buf, 0x2C, 0x5EE980)
+    struct.pack_into(">I", buf, 0x30, 0x5EF480)
+    checksum = hashlittle(bytes(buf[:SUPERBLOCK_HASH_LEN]), SUPERBLOCK_HASH_SEED)
+    struct.pack_into(">I", buf, SUPERBLOCK_CHECKSUM_OFFSET, checksum)
+    return bytes(buf)
 
 
 class Image:
@@ -204,6 +365,11 @@ def build(samples_dir, out_path, capacity_blocks=DEFAULT_CAPACITY_BLOCKS):
         header[0x09] = 1
         img.write(HEADER_SECTOR, bytes(header))
         img.write(POOL_TABLE_SECTOR, bytes(SECTOR))  # all-zero: nothing allocated
+
+        # Region 2's superblock: without this, FUN_4015a450 (mount) always
+        # fails and FileSystemDirectory never reports itself valid -- see
+        # docs/findings/07-emulator.md's std::logic_error section.
+        img.write(SUPERBLOCK_SECTOR, build_superblock())
 
         # Region 2: allocate physical pages up front -- page 0 is the root
         # directory's content (the child listing), page 1 is its 0x10001

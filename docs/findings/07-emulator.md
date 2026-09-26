@@ -1538,6 +1538,28 @@ absolute sector `0x5D8000` that neither this file nor
 `docs/findings/14-plus-drive-format.md` had documented before now -- see
 that file's new section for the full layout and checksum.
 
+**Update, a later session:** that superblock is now implemented
+(`tools/plusdrive.py`'s `hashlittle()`/`build_superblock()`, checked against
+44 real firmware executions) and confirmed self-consistent in a rebuilt
+`out/plusdrive/dt2.img`, but it does not by itself get a card-image boot to
+`FUN_4015a450` at all -- the eSDHC command log still stops at the same two
+reads (blocks `0` and `0x800`) through 1,000,056,162 instructions with the
+corrected image, exactly reproducing the control-image result above.
+`FUN_400cc864` gates the `FUN_4015a450`/`FUN_4015a424` call behind
+`_DAT_42940a48 == 0`, which an eMMC-identity whitelist check
+(`FUN_4012dc80`→`FUN_4012dbe0`→`FUN_4012da2c`, comparing the emulated
+card's CID against `MAIN_OS`'s own 7-entry manufacturer/product-name table)
+sets to a nonzero error code instead -- `emu/esdhc.py`'s existing
+`self.cid = [0, 0, 0, 0x00110000]` is a prior, incomplete attempt at
+satisfying this same check (the manufacturer byte alone, not the
+product-name string). This is upstream of, and independent from, the
+branch-(C) display stall investigated below: fixing one does not fix the
+other. See `docs/findings/14-plus-drive-format.md`'s "Open questions" for
+the confirmed CID→RAM field mapping and why the obvious fix (setting a
+whitelisted manufacturer ID *and* product name) was tried and did not
+resolve it -- left **[O]** for a session with disassembly-level tracing
+through the comparison itself.
+
 ### Follow-up: branch (C) never hands vector 208 to the real display ISR; the six unconditional calls and `FUN_40032eaa` are not it **[V][O]**
 
 Read all six unconditional calls named above (`FUN_400c14dc`, `FUN_400f03e8`,
