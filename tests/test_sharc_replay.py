@@ -63,6 +63,72 @@ class DescribeFrameTest(unittest.TestCase):
                 self.assertEqual(t["machine_type"], 0)
 
 
+class ParseFrameOverrideTest(unittest.TestCase):
+    """No firmware needed: parse_frame_override() is pure string parsing."""
+
+    def test_parses_hex_and_decimal(self):
+        self.assertEqual(
+            replay_mod.parse_frame_override("2:0=0x8045a6c8"),
+            (2, 0, 0x8045A6C8),
+        )
+        self.assertEqual(replay_mod.parse_frame_override("2:4=368"), (2, 4, 368))
+
+    def test_rejects_malformed_spec(self):
+        with self.assertRaises(ValueError):
+            replay_mod.parse_frame_override("not-a-spec")
+        with self.assertRaises(ValueError):
+            replay_mod.parse_frame_override("2=0x1")  # missing ':'
+        with self.assertRaises(ValueError):
+            replay_mod.parse_frame_override("2:0")  # missing '='
+
+    def test_rejects_out_of_range_track(self):
+        with self.assertRaises(ValueError):
+            replay_mod.parse_frame_override("16:0=1")
+        with self.assertRaises(ValueError):
+            replay_mod.parse_frame_override("-1:0=1")
+
+
+class ApplyFrameOverridesTest(unittest.TestCase):
+    """No firmware needed: apply_frame_overrides() only touches a bytes
+    object at the documented per-track parameter-block offset."""
+
+    def test_no_overrides_returns_the_same_object(self):
+        tx = b"\x00" * 0x802
+        self.assertIs(replay_mod.apply_frame_overrides(tx, None), tx)
+        self.assertIs(replay_mod.apply_frame_overrides(tx, []), tx)
+
+    def test_writes_4_byte_big_endian_value_at_the_documented_offset(self):
+        tx = bytes(0x802)
+        out = replay_mod.apply_frame_overrides(tx, [(2, 0, 0x8045A6C8), (2, 4, 368)])
+        base = (
+            replay_mod.PER_TRACK_PARAM_BLOCK_OFFSET
+            + 2 * replay_mod.PER_TRACK_PARAM_BLOCK_STRIDE
+        )
+        self.assertEqual(out[base : base + 4], b"\x80\x45\xa6\xc8")
+        self.assertEqual(out[base + 4 : base + 8], (368).to_bytes(4, "big"))
+        # Original bytes object is untouched (a copy is mutated).
+        self.assertEqual(tx, bytes(0x802))
+
+    def test_does_not_disturb_a_neighbouring_track(self):
+        tx = bytes(0x802)
+        out = replay_mod.apply_frame_overrides(tx, [(2, 0, 0xFFFFFFFF)])
+        base1 = (
+            replay_mod.PER_TRACK_PARAM_BLOCK_OFFSET
+            + 1 * replay_mod.PER_TRACK_PARAM_BLOCK_STRIDE
+        )
+        base3 = (
+            replay_mod.PER_TRACK_PARAM_BLOCK_OFFSET
+            + 3 * replay_mod.PER_TRACK_PARAM_BLOCK_STRIDE
+        )
+        self.assertEqual(out[base1 : base1 + 4], b"\x00\x00\x00\x00")
+        self.assertEqual(out[base3 : base3 + 4], b"\x00\x00\x00\x00")
+
+    def test_raises_past_the_end_of_the_frame(self):
+        tx = bytes(16)
+        with self.assertRaises(ValueError):
+            replay_mod.apply_frame_overrides(tx, [(0, 0, 1)])
+
+
 class MonoTest(unittest.TestCase):
     def test_averages_lr_pairs_across_blocks(self):
         blocks = [[1.0, 3.0, -1.0, -3.0], [0.5, 0.5]]
@@ -151,10 +217,24 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(args.sample_len, 4096)
         self.assertIsNone(args.force_command)
         self.assertEqual(args.provisional, [])
+        self.assertEqual(args.frame_override, [])
 
     def test_force_command_flag(self):
         args = replay_mod.parse_args(["dt2-1.16", "cap.dt2cap", "--force-command", "3"])
         self.assertEqual(args.force_command, 3)
+
+    def test_frame_override_flag_may_repeat(self):
+        args = replay_mod.parse_args(
+            [
+                "dt2-1.16",
+                "cap.dt2cap",
+                "--frame-override",
+                "2:0=0x8045a6c8",
+                "--frame-override",
+                "2:4=368",
+            ]
+        )
+        self.assertEqual(args.frame_override, ["2:0=0x8045a6c8", "2:4=368"])
 
     def test_provisional_flag_may_repeat(self):
         args = replay_mod.parse_args(

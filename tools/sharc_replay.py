@@ -158,6 +158,21 @@ FLAG_A_OFFSET = 0x73C
 FLAG_B_OFFSET = 0x75C
 TRACK_COUNT = 16
 
+# --frame-override's own per-track base: docs/findings/04-coldfire-dsp-link.md
+# ("The mirror index to TX frame map") documents "the four parameter pages in
+# a per-track 0x60-byte block at frame byte 0xda + track*0x60" as the
+# ColdFire's own per-track parameter area -- the best-documented candidate
+# location for a per-track "source field" in the TX payload, even though
+# docs/findings/06 ("No read of the frame's per-track parameter block found
+# yet") records that no SHARC-side reader of it has been found. TRACK:OFFSET
+# in --frame-override addresses a byte inside THIS block (OFFSET=0 is the
+# block's own first byte), not an arbitrary raw TX offset -- see
+# apply_frame_overrides()'s own docstring for why this, and not some other
+# stride, was chosen, and for what this lane's own O1 report found when it
+# used this to carry the built-in sample's pointer/length for track 2.
+PER_TRACK_PARAM_BLOCK_OFFSET = 0xDA
+PER_TRACK_PARAM_BLOCK_STRIDE = 0x60
+
 # docs/findings/06's "Rings": ring A holds 32 L/R-interleaved Q31 sample
 # pairs (64 words) at the final output rate.
 RING_A_WORDS = 64
@@ -228,6 +243,74 @@ def describe_frame(tx: bytes) -> dict:
         "tail_len": len(tail),
         "tail_nonzero": any(tail) if tail else None,
     }
+
+
+def parse_frame_override(spec: str) -> tuple[int, int, int]:
+    """Parse one `--frame-override TRACK:OFFSET=VALUE` spec into
+    `(track, offset, value)` (all ints; TRACK/OFFSET/VALUE accept `0x...`
+    hex or plain decimal). Raises ValueError with the original spec quoted
+    on any malformed input -- `main()` lets this propagate as a usage
+    error rather than silently ignoring a typo'd override."""
+    try:
+        track_offset, value_s = spec.split("=", 1)
+        track_s, offset_s = track_offset.split(":", 1)
+        track = int(track_s, 0)
+        offset = int(offset_s, 0)
+        value = int(value_s, 0)
+    except ValueError as exc:
+        raise ValueError(
+            "--frame-override: expected TRACK:OFFSET=VALUE, got %r" % spec
+        ) from exc
+    if not (0 <= track < TRACK_COUNT):
+        raise ValueError(
+            "--frame-override: track %d out of range [0, %d)" % (track, TRACK_COUNT)
+        )
+    return track, offset, value
+
+
+def apply_frame_overrides(
+    tx: bytes, overrides: list[tuple[int, int, int]] | None
+) -> bytes:
+    """Apply every `(track, offset, value)` from `--frame-override` (see
+    `parse_frame_override()`) to a COPY of `tx`, returning `tx` itself
+    unchanged if `overrides` is empty/None -- the same "mutate a bytearray
+    copy, only if there is something to change" convention `replay()`'s own
+    `--force-command` handling above uses.
+
+    This is a raw TX-payload poke, HAND STEP, not a firmware-native field:
+    it writes `value` as 4 plain big-endian bytes (matching `_u16be()`'s own
+    convention for every other documented per-track field in this module,
+    widened to 4 bytes since a sample pointer or a sample-count length does
+    not fit in the 2-byte fields `MACHINE_TYPE_OFFSET`/`FLAG_A_OFFSET`/
+    `FLAG_B_OFFSET` use) at absolute TX offset `PER_TRACK_PARAM_BLOCK_OFFSET
+    + track*PER_TRACK_PARAM_BLOCK_STRIDE + offset` -- docs/findings/04's own
+    "four parameter pages in a per-track 0x60-byte block at frame byte
+    0xda + track*0x60", the one already-documented per-track block wide
+    enough to hold a 4-byte value without colliding with a neighbouring
+    track's own slot. No SHARC-side reader of this block is established
+    (docs/findings/06, "No read of the frame's per-track parameter block
+    found yet"), and this lane's own O1 report records what happened when
+    it used this override to carry the built-in sample's pointer/length for
+    track 2 -- read that before assuming this reaches any particular voice
+    field. Values are written pre-swap, into the same `tx` bytes `describe_
+    frame()`/`frame_command()` read and `sharc_harness.write_dma_transfer()`
+    delivers (that function's own 16-bit-unit byte swap, if any, applies to
+    this override exactly as it does to every other TX byte)."""
+    if not overrides:
+        return tx
+    out = bytearray(tx)
+    for track, offset, value in overrides:
+        base = (
+            PER_TRACK_PARAM_BLOCK_OFFSET + track * PER_TRACK_PARAM_BLOCK_STRIDE + offset
+        )
+        if base + 4 > len(out):
+            raise ValueError(
+                "--frame-override: track=%d offset=%#x -> TX offset %#x..%#x "
+                "past the end of a %d-byte frame"
+                % (track, offset, base, base + 4, len(out))
+            )
+        out[base : base + 4] = (value & 0xFFFFFFFF).to_bytes(4, "big")
+    return bytes(out)
 
 
 def _write_bytes(state, base: int, data: bytes) -> None:
@@ -1098,6 +1181,7 @@ def replay_armed_voice(
     n_frames: int | None = None,
     start_frame: int = 0,
     inject_real_sample: bool = False,
+    frame_overrides: list[tuple[int, int, int]] | None = None,
 ) -> dict:
     """Replay CAPTURE_PATH continuously from frame 0 by default (no
     `start_frame` shortcut -- lane J1's own open question, see this
@@ -1189,6 +1273,18 @@ def replay_armed_voice(
     fresh after each frame, which this keep-alive is now sustaining for
     longer than the one silent frame K1 found.
 
+    `FRAME_OVERRIDES` (lane O1, 2026-09-26, default None -- no bytes changed
+    when left off): a list of `(track, offset, value)` triples, each applied
+    by `apply_frame_overrides()` to every delivered frame's own TX bytes
+    before `sharc_harness.write_dma_transfer()` -- see that function's own
+    docstring for the exact byte offset and encoding, and this lane's own
+    O1 report for what reached (and did not reach) FUN_1c4e70/FUN_1c7442
+    when it used this to carry the built-in sample's pointer/length for
+    track 2. This is independent of `INJECT_REAL_SAMPLE` above: it changes
+    only the bytes delivered over the (real, DMA) transfer, never a voice
+    record field directly, so combining the two is possible but conflates
+    two different hand steps -- this lane's own report used one at a time.
+
     Returns a dict with `capture`, `frames_replayed`, `voice`,
     `word0_writes`, `active_writes`, `active_by_frame`, `arm_frame`,
     `active_frames`, `deactivate_pc`, `sample_pointer_at_arm`,
@@ -1258,7 +1354,8 @@ def replay_armed_voice(
             ptr_before.value & 0xFFFFFFFF if ptr_before is not None else None
         )
 
-        h.write_dma_transfer(state, image, frame.tx)
+        tx = apply_frame_overrides(frame.tx, frame_overrides)
+        h.write_dma_transfer(state, image, tx)
         runner = h.drive_dma_completion(runner, image)
         state = runner.state
 
@@ -1472,6 +1569,21 @@ def parse_args(argv=None):
         )
         + "\n- ".join(POKE_DESCRIPTIONS),
     )
+    p.add_argument(
+        "--frame-override",
+        action="append",
+        default=[],
+        metavar="TRACK:OFFSET=VALUE",
+        help="--armed-voice-wav only (lane O1): applied to EVERY delivered "
+        "transfer's own TX bytes before write_dma_transfer(), as a raw "
+        "4-byte big-endian poke at TX offset PER_TRACK_PARAM_BLOCK_OFFSET "
+        "(%#x) + TRACK*PER_TRACK_PARAM_BLOCK_STRIDE (%#x) + OFFSET -- see "
+        "apply_frame_overrides()'s own docstring for exactly why this "
+        "offset, and this lane's own O1 report for what it did and did not "
+        "reach. HAND STEP, documented, not a firmware-native field -- may "
+        "be given more than once (repeatable, one per TRACK:OFFSET=VALUE)."
+        % (PER_TRACK_PARAM_BLOCK_OFFSET, PER_TRACK_PARAM_BLOCK_STRIDE),
+    )
     return p.parse_args(argv)
 
 
@@ -1488,6 +1600,7 @@ def _parse_provisional(pairs: list[str]) -> dict[str, str] | None:
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.armed_voice_wav:
+        frame_overrides = [parse_frame_override(spec) for spec in args.frame_override]
         result = replay_armed_voice(
             args.image,
             args.capture,
@@ -1496,6 +1609,7 @@ def main(argv=None) -> int:
             n_frames=args.frames,
             start_frame=args.start_frame,
             inject_real_sample=args.inject_real_sample,
+            frame_overrides=frame_overrides,
         )
         if args.out and result.get("render_left"):
             h.sharc_dac.write_wav_stereo(
