@@ -1537,3 +1537,119 @@ filesystem's mount routine, `FUN_4015a450` (called from this same task,
 absolute sector `0x5D8000` that neither this file nor
 `docs/findings/14-plus-drive-format.md` had documented before now -- see
 that file's new section for the full layout and checksum.
+
+### Follow-up: branch (C) never hands vector 208 to the real display ISR; the six unconditional calls and `FUN_40032eaa` are not it **[V][O]**
+
+Read all six unconditional calls named above (`FUN_400c14dc`, `FUN_400f03e8`,
+`FUN_4002dcb2`, `FUN_401339aa`, `FUN_40133e22`, `FUN_40133ac8`) and
+`FUN_40032eaa`: none of them is display/PIT3-related. `FUN_40032eaa` is a
+generic type-erasure "manager" function (get-default/copy/allocate/free by a
+mode argument) shared by *every* `BgWorker` parameter block in this
+function, branches A/B/C alike -- not specific to "Update MMC Caches". The
+six calls touch internal-flash calibration, a couple of RAM mode flags, and
+LED/knob-grid clearing. **None of them writes vector 208, `PIT3_PMR` or
+`PIT3_BASE`.**
+
+The "Update MMC Caches" job body itself (`LAB_400333e6`, a small trampoline
+at `0x400333e6`-`0x400333fa` between two registered functions -- Ghidra
+does not give it its own symbol; read directly from
+`sections/section_3_MAIN_OS.bin` via `dt2.coldfire.disasm`, per CLAUDE.md's
+warning that Ghidra misses small trampolines) is just:
+
+```
+400333e6  jsr FUN_4019d8fe.l   ; MmcFs singleton accessor
+400333ec  move.l d0,-(sp)
+400333ee  jsr FUN_4012faea.l   ; FUN_4012f184 + FUN_4012fa8c (pool-bitmap
+                                ; rescan) + FUN_401328d2
+400333f4  addq.l #4,sp
+400333f6  clr.l d0
+400333f8  rts
+```
+
+Pure region-1 (`MmcFs` pool) housekeeping, no display/PIT3 code anywhere in
+it either.
+
+**A second PIT3-arming function exists, and it is the real red herring.**
+`data_refs` for vector 208's slot (`0x40000340`) has exactly two writers:
+`FUN_40133586` (branches A/B, writes the real display ISR `0x40133518`) and
+`FUN_400d12e4` (called unconditionally, early, from `FUN_400cc864` at
+`0x400cc82e`/`0x400d133a` -- present on *every* boot, confirmed by
+task-create logs firing at instruction ~47M even on the control-image
+ladder). Reading `FUN_400d12e4`'s raw disassembly (not the decompiled C,
+whose `vector_208_handler` symbol name is reused by Ghidra for both this
+function and `FUN_40133586` even though they load *different* literals):
+
+```
+400d1352  move.l #0x400d0668,d1      ; = profile.intro_pit3_isr, NOT the
+400d1358  move.l d1,(0x40000340).l   ;   real display ISR (0x40133518)
+...
+400d137c  move.w #0x2191,d0w         ; a DIFFERENT PMR than FUN_40133586's 0x4323
+400d1380  move.w d1w,(PIT3_BASE).l   ; EN|PIE set, same as FUN_40133586
+```
+
+So on **every** boot, `FUN_400d12e4` re-arms PIT3 (with the intro's own
+rate, `0x2191`) but re-points vector 208 right back at the intro's own ISR
+(`0x400d0668`) and spawns the dedicated display-refresh task (entry
+`FUN_400d18ae`). Verified live: at `snapshots/dt2-1.16-control/boot400M.snap`
+(400M instructions into the control-image ladder), `PIT3_BASE`
+PCSR=`0x093f` (EN|PIE both set) and `PIT3_PMR`=`0x2191` -- already armed --
+while vector 208's slot is still exactly `0x400d0668`. `emu.pit.intro_running()`
+therefore (correctly, given the real firmware state) returns `True` even at
+400M+ instructions, since its check (`vector 208 == intro's ISR AND PIT3
+enabled`) is genuinely satisfied by this branch-independent early call, not
+by the intro actually still running.
+
+**Net effect on branch (C): PIT3 keeps ticking, into the intro's own
+(harmless, ack-only) handler, forever. The dedicated display task
+(`FUN_400d18ae`) is created but never gets its frame semaphore posted,
+because only the real ISR (`0x40133518`, written solely by `FUN_40133586`,
+branches A/B only) posts it. Two independent exhaustive searches (the
+`calls`+`data_refs` xrefs tables, and a raw 4-byte-literal scan of the whole
+`section_3_MAIN_OS.bin` for `0x40133586`) found no third caller and no
+third reference to either address anywhere in the image.**
+
+**What this session ruled out, with live evidence, as the actual blocker:**
+
+- Live task-profiling (`tools/guirun.py --trace-tasks` on the control-image
+  boot) shows `FUN_400cc864`'s own task (`tcb=0x42944aac`) consuming
+  **70-75% of every instruction budget** sitting in its own designed
+  terminal `bra.b $-2` self-loop at `0x400cccd8` (confirmed against the raw
+  disassembly of `FUN_400cc864`'s tail) -- a real, if independent,
+  inefficiency worth fixing for anyone trying to reach `running` on a
+  larger instruction budget, but not itself the display blocker.
+- `--trace-tasks`'s stack-scan diagnostic showed `FUN_400337ba` (the
+  Main-OS task) apparently blocked via a chain running through the
+  "Update MMC Caches" job body and an async-comm-interface registration
+  callback -- **this turned out to be a false lead**: a follow-up probe
+  hooking `profile.sem_pend`/`profile.pend_b` directly (ground truth, not a
+  stack scan that can pick up stale/leftover stack bytes) and filtering to
+  `FUN_400337ba`'s and `FUN_400cc864`'s own TCBs recorded **zero** pend
+  calls from either task across a full 280M-680M-instruction window on the
+  control-image ladder. Whatever `--trace-tasks` was reporting was not a
+  live call chain. `MainScreenView`'s constructor (`0x4019ab40`), separately
+  hooked live, fires continuously (376 hits in the first 100M instructions
+  after resuming from 400M, still climbing at 800M) -- so the Main-OS task
+  is not stuck at all; it reaches and repeatedly touches the main screen
+  view normally on branch (C). **Corrects this file's own earlier framing above: `FUN_400337ba` is not the blocked task; only the dedicated display task is.**
+- Injecting panel input (`tools/guirun.py --input WHEN:press:2` for SRC,
+  then `:17` for FUNC, at instruction counts well after intro handover and
+  task setup) did not trigger `FUN_40133586` or change vector 208 either --
+  `display_start_real hits=0` and `pit3=0` throughout a 300M-instruction
+  window that included both presses. This doesn't rule out some other
+  input/menu sequence, but a plain key press alone does not wake the real
+  display path.
+
+**Net: this is very likely a genuine property of DT2 1.16's boot code on
+the "existing/already-formatted card" path, not (or not only) an emulator
+peripheral-model gap** -- `unblock` and the eSDHC/PIT/DTIM models are not
+implicated by any of the evidence gathered this session. **[O]**, not
+resolved: either (a) there is a real display-start call for branch (C)
+this session's static search still missed (the exhaustive checks were for
+literal references to `FUN_40133586`'s address and the `0x40133518`
+literal specifically -- a computed/indirect reference, e.g. through a
+vtable slot, would not show up in either), or (b) real DT2 1.16 hardware
+genuinely needs some other trigger (a specific menu navigation, not a bare
+key press) to wake the display on this path, which would need reproducing
+against a real device to confirm. No emulator fix was applied this
+session; applying one without a verified root cause would not be
+trustworthy per this repo's own verification rule.
