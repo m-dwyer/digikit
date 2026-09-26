@@ -1653,3 +1653,144 @@ key press) to wake the display on this path, which would need reproducing
 against a real device to confirm. No emulator fix was applied this
 session; applying one without a verified root cause would not be
 trustworthy per this repo's own verification rule.
+
+## Opening the sample-pool list or the +Drive browser panics the UI task: the resource/glyph decode cache is never seeded **[V][O]**
+
+Reproduced headless with `tools/guirun.py` from `snapshots/dt2-1.16/running.snap`
+(also from `snapshots/dt2-1.16-card/boot400M.snap` with
+`--card-image out/plusdrive/dt2.img`, same result), replaying the panel
+feed for SRC, an encoder press to open the sample-pool list, FUNC, YES:
+
+```
+DT2_SYX=Digitakt_II_OS1.16.syx uv run python tools/guirun.py \
+  snapshots/dt2-1.16/running.snap \
+  --feed 54674406:2508 --feed 63719310:2500 --feed 72770933:2104 \
+  --feed 81815375:2100 --feed 91072796:2104 --feed 100058398:2100 \
+  --feed 109271476:2104 --feed 118324259:2100 --feed 127367540:2104 \
+  --feed 136420786:2100 --feed 145463608:2104 --feed 154720798:2100 \
+  --feed 163706398:2104 --feed 172919707:2100 --feed 181974109:2104 \
+  --feed 191015771:2100 --feed 347640343:2120 --feed 356896798:2100 \
+  --feed 365882397:2102 --feed 375096444:2100 --feed 384155990:2102 \
+  --feed 393192508:2100 --limit 450000000
+```
+
+`mainloop` climbs steadily to 2467 then never advances again; `pc` is
+pinned at `0x4013a8e6` (`bra.b self`, one of the image's generic
+"nothing to do" self-branches shared by dozens of unrelated panic sites) for
+the rest of the run. The owning task holds ~99% of the CPU throughout the
+whole session (confirmed with `--trace-tasks`), so once it lands in this
+spin it never runs again and the whole UI is dead -- not just this screen.
+
+**Call chain (per-instruction trace from a checkpoint saved just before the
+stall):**
+
+```
+FUN_40185f9c (glyph/resource render dispatcher, out/ghidra/dt2-1.16-emac)
+  -> FUN_40184e44 (decode one compressed/tokenized resource by id)
+     -> FUN_40187c5c (resource-cache lookup)
+        both _DAT_44f37030 (a sorted tree of already-decoded resource
+        groups) and _DAT_44f37034 (a queue of not-yet-decoded groups) are
+        NULL -> returns 0 ("nothing registered, nothing to search")
+     <- FUN_40184e44's `(*(int*)(param_1+0x6c) == 0) ||
+        (FUN_40187c5c(...) == NULL)` is only reached because
+        `*(param_1+0x6c)` was already non-zero (a real reused id, not a
+        freshly-zeroed one) -- read `out/ghidra/dt2-1.16-emac/decomp/
+        40184e44_FUN_40184e44.c` lines 34-39 -- and the lookup missing
+        makes it `return 5`
+<- FUN_40185f9c: `if (iVar1 == 0) {...} else { FUN_4013a8e6(); }` --
+   any nonzero decode result is fatal; `FUN_4013a8e6` is a shared
+   panic/halt stub with no `rte`, so the calling task is gone for good.
+```
+
+Confirmed live with `--at 0x40187c5c=cache_lookup --at 0x40185ff6=panic_call`
+across the whole 450M-instruction run: `cache_lookup hits=1`,
+`panic_call hits=1` -- **this is the first and only time in the entire
+boot-to-crash session that the resource-decode path runs at all.**
+Everything else drawn in that session (menus, labels, the pool list itself)
+is literal ASCII compiled directly into `.rodata` (e.g. `s_RECONF___DRIVE_
+402461ea`, `s_PROJECT_RAM_4022957d`, seen in `SampleFSSelectView::vfunc_4`),
+not this dictionary/tokenized-resource system, so its emptiness has never
+mattered until this exact screen needs it.
+
+### The resource cache's "register a group" functions are unreferenced anywhere in the compiled image, not just unreached at runtime **[V][O]**
+
+The cache is a 24-byte (`0x18`) node per registered resource group --
+`node[0]`=sort key, `node[3]`=table pointer, `node[4]`=flags/size bits,
+`node[5]`=next -- linked either into the sorted tree (`_DAT_44f37030`) or
+the pending queue (`_DAT_44f37034`) that `FUN_40187c5c` pops from and
+resolves via `FUN_40187326`. Three functions insert a node:
+`FUN_401879dc` (push a caller-owned node), `FUN_40187a20` and
+`FUN_40187b08` (allocate-and-push). `FUN_40187c38` is the matching
+destructor (calls `FUN_40187b58`, the removal helper, then frees).
+
+Three independent, increasingly strict checks all agree these three
+insert functions, and the two globals themselves, have **no writer or
+caller anywhere in `section_3_MAIN_OS.bin`**, not just "not exercised by
+this session":
+
+1. `xrefs.sqlite`'s `calls` table: zero rows with `to_func` in
+   `{0x401879dc, 0x40187a20, 0x40187b08}`.
+2. `tools/refscan.py` (a from-scratch disassembly sweep, 96.78% byte
+   coverage, independent of Ghidra's own analysis) over the whole image
+   for absolute-address references to any of those three addresses, and
+   separately for `0x44f37030`/`0x44f37034`: **0 hits** beyond the known
+   cluster `0x401879b4`-`0x40187d58` (the six functions that implement the
+   cache itself).
+3. A raw byte-for-byte 4-byte-literal scan of the entire 3.1 MB
+   `section_3_MAIN_OS.bin` (not just disassembled instructions, so it also
+   covers the 3.22% refscan can't decode, and any plain data/vtable/jump
+   table) for the big-endian bytes of `0x401879dc`, `0x40187a20`,
+   `0x40187b08`, `0x44f37030` and `0x44f37034`: **0 hits** outside that
+   same cluster (the same scan correctly finds `FUN_40187c5c`'s two real
+   call sites, confirming the method works).
+
+Point 3 is stronger than "not on any path this project has executed" --
+it means the literal target address does not exist anywhere in the
+compiled binary, on any path, hypothetical or not (a call reached only via
+a vtable slot or a jump table would still need that literal address to
+exist somewhere in the image's bytes). So this is not explained by the
+existing "branch (C) is untested territory" gap above (`FUN_40133586`'s
+address was similarly hard to find live, but a literal reference to it
+does exist in the image); whatever seeds this cache on real hardware, it
+is not one of these three functions being called from code compiled into
+this 1.16 `MAIN_OS` image at all.
+
+### Not an eSDHC/+Drive bug **[V]**
+
+Re-running the identical feed sequence with `--card-image` omitted (a
+blank card) reproduces byte-for-byte the same `mainloop=2467`,
+`pc=0x4013a8e6` result at the same instruction count, and `emu/esdhc.py`'s
+opt-in command log (`--esdhc-log`) records **zero** eSDHC commands across
+the whole run either way. The SD/+Drive driver's `XFERTYP` write is never
+reached before the panic. See `docs/findings/14-plus-drive-format.md` --
+this crash is not a +Drive format/content gap, and no image content would
+avoid it.
+
+### What this rules out as a quick fix
+
+Seeding the queue with a synthetic empty node (e.g. pointing `node[3]` at
+the firmware's own empty-table sentinel, `&DAT_44f37028`, the same
+substitute `FUN_40187326` installs on a real page-read failure) does not
+work: `FUN_40187326` still returns "not found" for an empty table, so
+`FUN_40187c5c`'s pop loop just consumes that one synthetic node and then
+hits the now-empty queue again, still returning 0. A correct fix needs the
+*real* resource-group descriptor and its backing compressed table (the
+actual bytes this id resolves against), not a placeholder -- and nothing
+in this session's static or dynamic evidence identifies where that comes
+from (not `section_3_MAIN_OS.bin`'s own code, not the +Drive card, not any
+address this project's Ghidra project or disassembly covers).
+
+**[O]**, not resolved: no safe fix was applied. The candidates are (a) a
+genuine gap in this project's boot model -- something outside
+`section_3_MAIN_OS.bin` (a different flash region/section, or a
+CPU-side write from outside the emulated address space this project
+models) is expected to populate this cache and nothing here reproduces
+it, or (b) this specific resource id is a latent firmware defect not
+actually reachable this way on real hardware, and the real path to this
+screen supplies the id differently. Confirming either needs either a real
+device capture of what touches `0x44f37030`/`0x44f37034` (or what this
+call's `*(param_1+0x6c)` id actually is) around this exact screen, or
+locating the still-missing branch (C) boot path from the section directly
+above, which may be the same underlying gap. Applying a fix without that
+would not be trustworthy per this repo's own verification rule, and (as
+shown above) a naive seed does not even mask the symptom correctly.

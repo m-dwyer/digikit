@@ -535,3 +535,14 @@ nothing about mount state; readdir only happens on actual navigation
   items 2 and 3 of the +Drive-in-RAM goal (reading the live `Directory` for
   `hat.wav`, saving a running card snapshot, checking the GUI's font-cache
   pointers) until it is fixed.
+- Separately, once `running` is reached, opening the sample-pool list or
+  the SampleManager/+Drive browser screen itself (SRC, encoder, FUNC, YES)
+  panics the UI task — also confirmed unrelated to +Drive content or the
+  eSDHC model (identical crash with `--card-image` omitted). This is a
+  resource/glyph decode-cache miss in the ColdFire UI code, not a +Drive
+  format or content gap; see `docs/findings/07-emulator.md`'s "Opening the
+  sample-pool list or the +Drive browser panics the UI task" section for
+  the full root-cause trace. It still blocks reading the live `Directory`
+  through this screen; a direct RAM read of the mounted `Directory` object
+  (bypassing the browser UI) remains the open path to confirming `hat.wav`
+  is listed.
