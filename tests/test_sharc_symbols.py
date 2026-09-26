@@ -233,6 +233,7 @@ KNOWN_DT2_116 = {
     "ring_flag": 0x25F780,
     "command_word": 0x264220,
     "command_word_shift_src": 0x261CA4,
+    "command_record_table": 0x266220,
     "render_frame": 0x1C2B24,
     "unpack_track": 0x1C24E9,
     "slot_dispatch": 0x1C642A,

@@ -255,47 +255,86 @@ class CollectStopJsonTest(unittest.TestCase):
         )
 
 
+# Fixture for SurveyEndToEndTest/CollectAllEndToEndTest below: FUN_1c2b24
+# (the frame render root) called bare, i.e. with no run_init()/snapshot, so
+# every register and internal-RAM cell starts unwritten. Commit bcc0b9b
+# (the FIX/TRUNC NaN/Inf saturation fix) resolved the fork this fixture used
+# to pin (lane-L7's original survey, docs/findings/06 -- see git history for
+# that version of this file): with explicit_memory_model's default (True,
+# unwritten internal RAM reads as concrete Const(0)) the bare frame render
+# no longer forks at all, and instead runs cleanly to a "return without
+# followed call" at 0x1c3284.
+#
+# --no-explicit-memory-model (an existing sv.survey()/collect_all() option,
+# documented in tools/sharc_survey.py's own --help; not a new tool
+# behaviour) leaves an unwritten cell Unknown instead, which reintroduces a
+# real fork: FUN_1c2b24+0x1e7 (0x1c2d08, "R1 = leftz(R1, R0)") computes its
+# SV (shift overflow) flag from R1 = DM(I4, M0), a read of a cell this bare
+# run never wrote, so the JUMP IF NOT SV at 0x1c2d0b cannot be resolved.
+# Verified live on out/sharcdb/dt2-1.16.sqlite + out/sections/dt2-1.16
+# (2026-09-26, branch work/sharc-emulator @ 34a8d38): deterministic across
+# repeated runs, same pc and instruction count every time.
+_ROOT = 0x1C2B24
+_FIRST_FORK_PC = 0x1C2D0B
+_FIRST_FORK_INSTRUCTIONS = 13895
+# The very next fork downstream, once the first is resolved either way
+# (guessed not-taken, or forced taken): FUN_1c2b24+0x1f4 (0x1c2d18, "IF NOT
+# SV R13 = M6"), the same unresolved SV flag read by a second, nearby
+# instruction.
+_SECOND_FORK_PC = 0x1C2D18
+# A concrete "reg" patch at the instruction that CONSUMES the unresolved
+# read (0x1c2d08 itself, before "R1 = leftz(R1, R0)" executes) rather than
+# at its own upstream write: pins R1 to an arbitrary concrete value, which
+# makes leftz's SV flag concrete too, so the fork at 0x1c2d0b never happens.
+_REG_PATCH_PC = 0x1C2D08
+
+
 @unittest.skipUnless(
     DT2_116_DB.exists() and DT2_116_BLOB.exists(),
     "out/sharcdb/dt2-1.16.sqlite or out/sections/dt2-1.16/section_7_BLOB.bin "
     "is not available",
 )
 class SurveyEndToEndTest(unittest.TestCase):
-    """FUN_1c2b24 (the frame render root) from a bare state: the exact
-    first stop lane-L7's survey found (docs/findings/06, "envelope or gain"
-    reads its own unresolved R8 argument) -- a real, stable, deterministic
-    execution of the actual firmware, not a synthetic fixture."""
+    """FUN_1c2b24 (the frame render root) from a bare state, with unwritten
+    internal RAM left Unknown (--no-explicit-memory-model) so it still
+    forks after commit bcc0b9b -- see the fixture comment above. A real,
+    stable, deterministic execution of the actual firmware, not a synthetic
+    one."""
 
-    START = 0x1C2B24
-    EXPECTED_HALT_PC = 0xB88E4B
-    EXPECTED_INSTRUCTIONS = 15675
+    START = _ROOT
+    EXPECTED_HALT_PC = _FIRST_FORK_PC
+    EXPECTED_INSTRUCTIONS = _FIRST_FORK_INSTRUCTIONS
+
+    def _survey(self, **kwargs):
+        kwargs.setdefault("explicit_memory_model", False)
+        return sv.survey(image="dt2-1.16", root=self.START, **kwargs)
 
     def test_bare_survey_reaches_the_known_first_fork(self):
-        stop = sv.survey(image="dt2-1.16", root=self.START)
+        stop = self._survey()
         self.assertEqual(stop.category, "fork")
         self.assertEqual(stop.halt.pc_sw, self.EXPECTED_HALT_PC)
         self.assertEqual(stop.instructions, self.EXPECTED_INSTRUCTIONS)
-        self.assertIn("cond=EQ", stop.halt.unknowns)
-        self.assertIn("ASTATX.AZ", stop.halt.unknowns)
+        self.assertIn("cond=NOT SV", stop.halt.unknowns)
+        self.assertIn("ASTATX.SV", stop.halt.unknowns)
         self.assertTrue(
             any(u.startswith("last write to ASTATX at ") for u in stop.halt.unknowns)
         )
 
     def test_patch_table_advances_past_the_known_fork(self):
-        patch_table = {0xB88E04: [("reg", "R8", 0x40000000)]}
-        stop = sv.survey(image="dt2-1.16", root=self.START, patch_table=patch_table)
+        patch_table = {_REG_PATCH_PC: [("reg", "R1", 0x40000000)]}
+        stop = self._survey(patch_table=patch_table)
         self.assertGreater(stop.instructions, self.EXPECTED_INSTRUCTIONS)
         self.assertNotEqual(stop.halt.pc_sw, self.EXPECTED_HALT_PC)
 
     def test_report_stop_prints_the_documented_fields(self):
-        stop = sv.survey(image="dt2-1.16", root=self.START)
+        stop = self._survey()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             sv.report_stop(stop)
         text = buf.getvalue()
         self.assertIn("pc=0x%x" % self.EXPECTED_HALT_PC, text)
-        self.assertIn("form=5a_move", text)
-        self.assertIn("ASTATX.AZ", text)
+        self.assertIn("form=8a_rel", text)
+        self.assertIn("ASTATX.SV", text)
         self.assertIn("last flag writer:", text)
         self.assertIn("slice (all inputs):", text)
         self.assertIn("call stack (return addrs, innermost last):", text)
@@ -311,6 +350,7 @@ class SurveyEndToEndTest(unittest.TestCase):
                     hex(self.START),
                     "--max-steps",
                     str(self.EXPECTED_INSTRUCTIONS + 10),
+                    "--no-explicit-memory-model",
                     "--json",
                 ]
             )
@@ -329,38 +369,44 @@ class SurveyEndToEndTest(unittest.TestCase):
 )
 class CollectAllEndToEndTest(unittest.TestCase):
     """--collect-all against the same bare FUN_1c2b24 root SurveyEndToEndTest
-    uses: it must find the exact same first fork survey() does (same pc,
-    same instruction count -- collect_all() is not a different execution,
-    only a different stopping rule), then keep going with a default
-    not-taken guess rather than stopping there."""
+    uses (see the fixture comment above this module's SurveyEndToEndTest):
+    it must find the exact same first fork survey() does (same pc, same
+    instruction count -- collect_all() is not a different execution, only a
+    different stopping rule), then keep going with a default not-taken
+    guess rather than stopping there."""
 
-    START = 0x1C2B24
-    FIRST_FORK_PC = 0xB88E4B
-    FIRST_FORK_INSTRUCTIONS = 15675
-    SECOND_FORK_PC = 0x1C35BD
+    START = _ROOT
+    FIRST_FORK_PC = _FIRST_FORK_PC
+    FIRST_FORK_INSTRUCTIONS = _FIRST_FORK_INSTRUCTIONS
+    SECOND_FORK_PC = _SECOND_FORK_PC
+    # A max_steps that finds exactly the first two forks (guesses == 2) and
+    # nothing past them: the third fork (0x1c2d33) only appears once steps
+    # reach 13913, so 13910 leaves margin on both sides (verified live,
+    # 2026-09-26).
+    TWO_FORKS_MAX_STEPS = _FIRST_FORK_INSTRUCTIONS + 15
+
+    def _collect_all(self, **kwargs):
+        kwargs.setdefault("explicit_memory_model", False)
+        return sv.collect_all(image="dt2-1.16", root=self.START, **kwargs)
 
     def test_continues_past_the_first_fork_with_a_default_guess(self):
-        # Just past the first fork: the second known one (0x1c35bd) sits
+        # Just past the first fork: the second known one (0x1c2d18) sits
         # only a handful of instructions later, so a slightly larger budget
         # would already find it too -- this only pins the FIRST stop.
-        result = sv.collect_all(
-            image="dt2-1.16",
-            root=self.START,
-            max_steps=self.FIRST_FORK_INSTRUCTIONS + 1,
-        )
+        result = self._collect_all(max_steps=self.FIRST_FORK_INSTRUCTIONS + 1)
         first = result.stops[0]
         self.assertEqual(first.category, "fork")
         self.assertEqual(first.pc, self.FIRST_FORK_PC)
         self.assertEqual(first.resolution, "not-taken (default)")
         self.assertEqual(first.guess_number, 1)
         self.assertEqual(first.downstream_of, ())
-        self.assertIn("cond=EQ", first.unknowns)
+        self.assertIn("cond=NOT SV", first.unknowns)
         # The chosen (not-taken) branch keeps running past the fork instead
         # of stopping the whole survey there.
         self.assertGreater(result.instructions, self.FIRST_FORK_INSTRUCTIONS)
 
     def test_finds_a_second_distinct_fork_downstream_of_the_first_guess(self):
-        result = sv.collect_all(image="dt2-1.16", root=self.START, max_steps=60_000)
+        result = self._collect_all(max_steps=self.TWO_FORKS_MAX_STEPS)
         self.assertGreaterEqual(len(result.stops), 2)
         first, second = result.stops[0], result.stops[1]
         self.assertEqual(first.pc, self.FIRST_FORK_PC)
@@ -371,14 +417,8 @@ class CollectAllEndToEndTest(unittest.TestCase):
         self.assertEqual(result.guesses, 2)
 
     def test_a_branch_patch_table_entry_overrides_the_default_and_is_not_a_guess(self):
-        default = sv.collect_all(
-            image="dt2-1.16",
-            root=self.START,
-            max_steps=self.FIRST_FORK_INSTRUCTIONS + 1,
-        )
-        forced = sv.collect_all(
-            image="dt2-1.16",
-            root=self.START,
+        default = self._collect_all(max_steps=self.FIRST_FORK_INSTRUCTIONS + 1)
+        forced = self._collect_all(
             max_steps=self.FIRST_FORK_INSTRUCTIONS + 1,
             patch_table={self.FIRST_FORK_PC: [("branch", None, 1)]},
         )
@@ -392,25 +432,23 @@ class CollectAllEndToEndTest(unittest.TestCase):
         # The existing "reg"/"mem" PatchTable kind (applied unconditionally
         # before the instruction runs, via apply_patches()) still works
         # under collect_all(): a good enough register value means the fork
-        # this lane's docs/findings/06 already explains never happens, so it
+        # this lane's fixture comment already explains never happens, so it
         # is not in the stop list at all.
-        result = sv.collect_all(
-            image="dt2-1.16",
-            root=self.START,
+        result = self._collect_all(
             max_steps=self.FIRST_FORK_INSTRUCTIONS + 1000,
-            patch_table={0xB88E04: [("reg", "R8", 0x40000000)]},
+            patch_table={_REG_PATCH_PC: [("reg", "R1", 0x40000000)]},
         )
         pcs = [s.pc for s in result.stops]
         self.assertNotIn(self.FIRST_FORK_PC, pcs)
 
     def test_max_steps_budget_is_recorded_as_a_terminal_stop(self):
-        result = sv.collect_all(image="dt2-1.16", root=self.START, max_steps=10)
+        result = self._collect_all(max_steps=10)
         self.assertEqual(len(result.stops), 1)
         self.assertEqual(result.stops[0].category, "max-steps")
         self.assertEqual(result.instructions, 10)
 
     def test_report_collect_all_prints_a_row_per_stop(self):
-        result = sv.collect_all(image="dt2-1.16", root=self.START, max_steps=60_000)
+        result = self._collect_all(max_steps=self.TWO_FORKS_MAX_STEPS)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             sv.report_collect_all(result)
@@ -430,6 +468,7 @@ class CollectAllEndToEndTest(unittest.TestCase):
                     hex(self.START),
                     "--max-steps",
                     str(self.FIRST_FORK_INSTRUCTIONS + 1),
+                    "--no-explicit-memory-model",
                     "--collect-all",
                     "--json",
                 ]
