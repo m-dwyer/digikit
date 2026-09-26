@@ -527,22 +527,34 @@ nothing about mount state; readdir only happens on actual navigation
   a valid one — see the new section above. Blocks the real mount path
   (`FUN_4015a450`) from ever accepting any image this tool builds.
 - Which `Directory` (`FileSystemDirectory` vs `SamplePoolDirectory`)
-  `SampleManager` actually browses — see the new section above; needs a
-  live RAM read once boot with a card reaches `running` (finding 07).
+  `SampleManager` actually browses — **answered**: a live crash trace
+  (see `docs/findings/07-emulator.md`'s corrected section below) found
+  `SampleManager`'s "currently selected" item is a `FileSystemDirectory`
+  instance (vtable `0x4022584c`) in both a cardless boot and a
+  `--card-image` boot, and it is not yet `valid()` (its `vfunc_12`, a
+  flag at offset `0x120`, reads false) in either case — i.e. this project
+  has never observed a `FileSystemDirectory` that successfully mounted.
 - Booting with *any* already-formatted card (ours or the firmware's own)
   currently stalls before `running` for a reason unrelated to +Drive
   content — see `docs/findings/07-emulator.md`'s new section. This blocks
   items 2 and 3 of the +Drive-in-RAM goal (reading the live `Directory` for
-  `hat.wav`, saving a running card snapshot, checking the GUI's font-cache
-  pointers) until it is fixed.
+  `hat.wav`, saving a running card snapshot) until it is fixed.
 - Separately, once `running` is reached, opening the sample-pool list or
   the SampleManager/+Drive browser screen itself (SRC, encoder, FUNC, YES)
   panics the UI task — also confirmed unrelated to +Drive content or the
-  eSDHC model (identical crash with `--card-image` omitted). This is a
-  resource/glyph decode-cache miss in the ColdFire UI code, not a +Drive
-  format or content gap; see `docs/findings/07-emulator.md`'s "Opening the
+  eSDHC model (identical crash with `--card-image` omitted). **Corrects
+  an earlier framing in this file and in `docs/findings/07-emulator.md`**:
+  this is not a resource/glyph decode-cache miss. It is an uncaught C++
+  exception (`std::logic_error("basic_string::_S_construct null not
+  valid")`, i.e. `SampleManager::vfunc_40` builds a `std::string` from a
+  null `const char*` with no null check) thrown because the selected
+  `FileSystemDirectory` reports itself invalid (see above) and its
+  "get display name" accessor (`FUN_4015996e`) returns a raw `NULL` for
+  that case instead of the empty-string fallback it already uses for its
+  other failure case. See `docs/findings/07-emulator.md`'s "Opening the
   sample-pool list or the +Drive browser panics the UI task" section for
-  the full root-cause trace. It still blocks reading the live `Directory`
-  through this screen; a direct RAM read of the mounted `Directory` object
+  the full root-cause trace and why this most likely traces back to the
+  mount gap above. It still blocks reading the live `Directory` through
+  this screen; a direct RAM read of the mounted `Directory` object
   (bypassing the browser UI) remains the open path to confirming `hat.wav`
   is listed.

@@ -1654,10 +1654,17 @@ against a real device to confirm. No emulator fix was applied this
 session; applying one without a verified root cause would not be
 trustworthy per this repo's own verification rule.
 
-## Opening the sample-pool list or the +Drive browser panics the UI task: the resource/glyph decode cache is never seeded **[V][O]**
+## Opening the sample-pool list or the +Drive browser panics the UI task: a null `std::string` construction inside `SampleManager::vfunc_40`, not a resource cache **[V][C][O]**
 
-Reproduced headless with `tools/guirun.py` from `snapshots/dt2-1.16/running.snap`
-(also from `snapshots/dt2-1.16-card/boot400M.snap` with
+**Corrects this file's own earlier framing below (originally recorded in
+this session before the mechanism was fully identified): `DAT_44f37030`/
+`DAT_44f37034` are not an application-level "resource/glyph decode cache".
+They are libgcc's DWARF2 unwinder object-registration lists** (the
+`seen_objects` splay tree and `unseen_objects` queue from libgcc's
+`unwind-dw2-fde.c`), and the crash is an uncaught C++ exception, not a
+missing resource archive. Reproduced headless with `tools/guirun.py` from
+`snapshots/dt2-1.16/running.snap` (also from
+`snapshots/dt2-1.16-card/boot400M.snap` with
 `--card-image out/plusdrive/dt2.img`, same result), replaying the panel
 feed for SRC, an encoder press to open the sample-pool list, FUNC, YES:
 
@@ -1674,123 +1681,229 @@ DT2_SYX=Digitakt_II_OS1.16.syx uv run python tools/guirun.py \
   --feed 393192508:2100 --limit 450000000
 ```
 
-`mainloop` climbs steadily to 2467 then never advances again; `pc` is
-pinned at `0x4013a8e6` (`bra.b self`, one of the image's generic
-"nothing to do" self-branches shared by dozens of unrelated panic sites) for
-the rest of the run. The owning task holds ~99% of the CPU throughout the
-whole session (confirmed with `--trace-tasks`), so once it lands in this
-spin it never runs again and the whole UI is dead -- not just this screen.
+### Identification: this is libgcc's unwinder, not a resource cache **[V]**
 
-**Call chain (per-instruction trace from a checkpoint saved just before the
-stall):**
+Re-reading `out/ghidra/dt2-1.16-emac/decomp/40184e44_FUN_40184e44.c` with
+this hypothesis in mind, the "compressed resource decode" is unmistakably
+DWARF CFI parsing: it tests the CIE augmentation string byte-for-byte
+against `'z'`(0x7a)/`'L'`(0x4c)/`'P'`(0x50)/`'R'`(0x52)/`'S'`(0x53), and the
+legacy `"eh"` augmentation (`pcVar22[9]==0x65 && pcVar22[10]==0x68`), and
+decodes fields with the standard ULEB128 loop (`uVar13 = (byte & 0x7f) <<
+shift | uVar13; while (byte < 0)`) -- exactly `extract_cie_info()` in
+libgcc's `unwind-dw2.c`. `FUN_40187c5c` walks a sorted tree
+(`_DAT_44f37030`) then pops from a linked queue (`_DAT_44f37034`),
+classifying each popped entry and inserting it into the tree -- exactly
+`_Unwind_Find_FDE`'s `seen_objects`/`unseen_objects` two-list scheme.
+`FUN_401879dc`/`FUN_40187a20`/`FUN_40187b08` (previously read as "register
+a resource group") are the `__register_frame_info`/`__register_frame`/
+`__register_frame_info_table` family: they allocate or take a caller-owned
+24-byte `struct object` and push it onto `_DAT_44f37034`, guarding on `*fde
+!= 0` exactly as libgcc's real implementations do. `FUN_40184e44`'s
+return value `5` is `_URC_END_OF_STACK` (the standard `_Unwind_Reason_Code`
+enum), returned when the search runs out of registered objects with no
+CIE/FDE covering the target PC.
+
+**Confirmed live**, by resuming a checkpoint saved just before the crash
+(`tools/guirun.py --save-at 440000000:PATH`, then a small script using
+`emu.longrun.build`/`spin` directly with a code hook at `0x40185f9c`) and
+reading guest memory at the hook: the object passed as the exception
+argument begins with the bytes `47 4e 55 43 43 2b 2b 00` = **`"GNUCC++\0"`**,
+the literal, well-known GNU C++ `_Unwind_Exception.exception_class` magic
+value. This is conclusive: `FUN_40185f9c` is (a thin wrapper immediately
+around) `_Unwind_RaiseException`, called from `FUN_401866c2` (== `__cxa_throw`,
+confirmed by its caller `FUN_401e8d20` filling in exactly the
+`__cxa_exception`/`_Unwind_Exception` header fields -- the `"GNUCC++\0"`
+class, a `handlerCount`-style refcount, and an `exceptionDestructor`
+function pointer -- before calling it), and `FUN_40184e44` is
+`_Unwind_RaiseException`'s per-frame search step. `__register_frame_info`
+and friends being unreferenced anywhere in the compiled 1.16 `MAIN_OS`
+image (the three-method dead-code proof kept below, now correctly
+understood) means **this firmware's C++ runtime never registers any unwind
+frame information, so a real DWARF unwind can never find a handler and any
+C++ exception thrown anywhere in this firmware is unconditionally fatal**
+-- consistent with `FUN_4013a8e6` (a bare `bra.b self` reached with no
+`rte`, i.e. `abort()`) having 37 unrelated static callers across the image.
+This is very likely a deliberate embedded-firmware choice (many C++
+embedded builds ship without functional stack unwinding and treat any
+`throw` as a bug that should hard-fault) rather than a boot-model gap, and
+explains why finding "who registers the unwind tables" was a dead end: on
+this firmware, on real hardware too, nobody does.
+
+### What actually throws: `std::string(nullptr)` inside `SampleManager::vfunc_40` **[V]**
+
+With the unwinder correctly identified, the real question is what raises
+the exception. Reading backward from the `_Unwind_Exception` header
+(`unwind_hdr`) at the live crash: the bytes at `unwind_hdr-48..-4`
+(the `__cxa_exception` header fields preceding it) contain `0x402260dc` at
+the `exceptionType` slot, which resolves directly in
+`out/symbols/dt2-1.16-rtti.json`'s `typeinfos` table to **`std::logic_error`**.
+The thrown object's vtable is `0x40225b78`, and its `what()` string (the
+COW `std::string` member right after the vtable pointer, with a
+length/capacity/refcount header at `-12`: `length=41 cap=41 refs=0`) reads:
 
 ```
-FUN_40185f9c (glyph/resource render dispatcher, out/ghidra/dt2-1.16-emac)
-  -> FUN_40184e44 (decode one compressed/tokenized resource by id)
-     -> FUN_40187c5c (resource-cache lookup)
-        both _DAT_44f37030 (a sorted tree of already-decoded resource
-        groups) and _DAT_44f37034 (a queue of not-yet-decoded groups) are
-        NULL -> returns 0 ("nothing registered, nothing to search")
-     <- FUN_40184e44's `(*(int*)(param_1+0x6c) == 0) ||
-        (FUN_40187c5c(...) == NULL)` is only reached because
-        `*(param_1+0x6c)` was already non-zero (a real reused id, not a
-        freshly-zeroed one) -- read `out/ghidra/dt2-1.16-emac/decomp/
-        40184e44_FUN_40184e44.c` lines 34-39 -- and the lookup missing
-        makes it `return 5`
-<- FUN_40185f9c: `if (iVar1 == 0) {...} else { FUN_4013a8e6(); }` --
-   any nonzero decode result is fatal; `FUN_4013a8e6` is a shared
-   panic/halt stub with no `rte`, so the calling task is gone for good.
+basic_string::_S_construct null not valid
 ```
 
-Confirmed live with `--at 0x40187c5c=cache_lookup --at 0x40185ff6=panic_call`
-across the whole 450M-instruction run: `cache_lookup hits=1`,
-`panic_call hits=1` -- **this is the first and only time in the entire
-boot-to-crash session that the resource-decode path runs at all.**
-Everything else drawn in that session (menus, labels, the pool list itself)
-is literal ASCII compiled directly into `.rodata` (e.g. `s_RECONF___DRIVE_
-402461ea`, `s_PROJECT_RAM_4022957d`, seen in `SampleFSSelectView::vfunc_4`),
-not this dictionary/tokenized-resource system, so its emptiness has never
-mattered until this exact screen needs it.
+This is libstdc++'s own diagnostic, verbatim, from `basic_string.tcc`'s
+`_S_construct`, thrown when a `const char*` range constructor is given a
+null `begin` with a non-null `end`. Confirmed in the disassembly:
+`FUN_401e75b6` *is* `_S_construct` (returns the shared empty-string rep at
+`0x44f37244` when `begin==end`; calls
+`FUN_401e44c4(s_basic_string___S_construct_null_n_4025de2f)` -- i.e.
+`std::__throw_logic_error("basic_string::_S_construct null not valid")`,
+the exact same string, at `0x4025de2f` -- when `begin==0 && end!=0`).
+`FUN_401e7a64` *is* the `std::string(const char*)` constructor: if its
+`const char*` argument is null, it deliberately calls
+`FUN_401e75b6(0, 0xffffffff, ...)` (a null begin with a nonzero sentinel
+end, not a real length) purely to trigger this throw -- matching
+libstdc++'s actual `basic_string(const char*)` implementation, which is
+well known to reject a null argument exactly this way.
 
-### The resource cache's "register a group" functions are unreferenced anywhere in the compiled image, not just unreached at runtime **[V][O]**
+The caller supplying that null pointer is `SampleManager::vfunc_40`
+(`out/ghidra/dt2-1.16-emac/decomp/400266bc_SampleManager__vfunc_40.c`):
 
-The cache is a 24-byte (`0x18`) node per registered resource group --
-`node[0]`=sort key, `node[3]`=table pointer, `node[4]`=flags/size bits,
-`node[5]`=next -- linked either into the sorted tree (`_DAT_44f37030`) or
-the pending queue (`_DAT_44f37034`) that `FUN_40187c5c` pops from and
-resolves via `FUN_40187326`. Three functions insert a node:
-`FUN_401879dc` (push a caller-owned node), `FUN_40187a20` and
-`FUN_40187b08` (allocate-and-push). `FUN_40187c38` is the matching
-destructor (calls `FUN_40187b58`, the removal helper, then frees).
+```c
+void SampleManager::vfunc_40(int *param_1)
+{
+  if (param_1[0x7f] != 0) {
+    ...
+    if (param_1[0x81] == param_1[0x7f]) {
+      FUN_4009020e(param_1,1);
+      uVar1 = FUN_4015996e(param_1[0x81]);   // "get display name", may be NULL
+      FUN_401e7a64(auStack_8,uVar1,&uStack_9);  // std::string(uVar1) -- no null check
+      ...
+```
 
-Three independent, increasingly strict checks all agree these three
-insert functions, and the two globals themselves, have **no writer or
-caller anywhere in `section_3_MAIN_OS.bin`**, not just "not exercised by
-this session":
+`FUN_4015996e` (`out/ghidra/dt2-1.16-emac/decomp/4015996e_FUN_4015996e.c`)
+is a "get display name" accessor with **two** failure modes but only
+**one** safe fallback:
 
-1. `xrefs.sqlite`'s `calls` table: zero rows with `to_func` in
-   `{0x401879dc, 0x40187a20, 0x40187b08}`.
-2. `tools/refscan.py` (a from-scratch disassembly sweep, 96.78% byte
-   coverage, independent of Ghidra's own analysis) over the whole image
-   for absolute-address references to any of those three addresses, and
-   separately for `0x44f37030`/`0x44f37034`: **0 hits** beyond the known
-   cluster `0x401879b4`-`0x40187d58` (the six functions that implement the
-   cache itself).
-3. A raw byte-for-byte 4-byte-literal scan of the entire 3.1 MB
-   `section_3_MAIN_OS.bin` (not just disassembled instructions, so it also
-   covers the 3.22% refscan can't decode, and any plain data/vtable/jump
-   table) for the big-endian bytes of `0x401879dc`, `0x40187a20`,
-   `0x40187b08`, `0x44f37030` and `0x44f37034`: **0 hits** outside that
-   same cluster (the same scan correctly finds `FUN_40187c5c`'s two real
-   call sites, confirming the method works).
+```c
+undefined *FUN_4015996e(int *param_1)
+{
+  cVar2 = (**(code **)(*param_1 + 0x30))(param_1);   // vtable+0x30: "is valid"
+  if (cVar2 == '\0') {
+    puVar1 = (undefined *)0x0;              // <-- no fallback: raw NULL
+  } else {
+    puVar1 = FUN_4015778c(param_1[0x44], param_1 + 1);
+    if (puVar1 == (undefined *)0x0) {
+      puVar1 = &DAT_4023f364;               // safe fallback: "" (a bare NUL byte)
+    }
+  }
+  return puVar1;
+}
+```
 
-Point 3 is stronger than "not on any path this project has executed" --
-it means the literal target address does not exist anywhere in the
-compiled binary, on any path, hypothetical or not (a call reached only via
-a vtable slot or a jump table would still need that literal address to
-exist somewhere in the image's bytes). So this is not explained by the
-existing "branch (C) is untested territory" gap above (`FUN_40133586`'s
-address was similarly hard to find live, but a literal reference to it
-does exist in the image); whatever seeds this cache on real hardware, it
-is not one of these three functions being called from code compiled into
-this 1.16 `MAIN_OS` image at all.
+`&DAT_4023f364` is a plain `'\0'` byte sitting just before the
+`"SEND SYSEX\0"` string literal in `.rodata` -- an intentional empty-string
+default the author clearly meant to use whenever a name can't be produced.
+The *first* branch (the object reports itself invalid at all) has no such
+guard and returns a bare `NULL`, and `SampleManager::vfunc_40` passes that
+straight into `std::string`'s constructor with no null check -- the actual
+firmware defect.
 
-### Not an eSDHC/+Drive bug **[V]**
+### Why the object reports itself invalid: an unmounted `FileSystemDirectory` **[V]**
 
-Re-running the identical feed sequence with `--card-image` omitted (a
-blank card) reproduces byte-for-byte the same `mainloop=2467`,
-`pc=0x4013a8e6` result at the same instruction count, and `emu/esdhc.py`'s
-opt-in command log (`--esdhc-log`) records **zero** eSDHC commands across
-the whole run either way. The SD/+Drive driver's `XFERTYP` write is never
-reached before the panic. See `docs/findings/14-plus-drive-format.md` --
-this crash is not a +Drive format/content gap, and no image content would
-avoid it.
+Hooking `SampleManager::vfunc_40`'s entry live (same checkpoint) and
+reading `param_1[0x7f]`/`param_1[0x81]` (both equal, `0x450ef250`) shows the
+"currently selected" object's vtable is `0x40225854`, which is
+`out/symbols/dt2-1.16-rtti.json`'s `FileSystemDirectory` vtable
+(`0x4022584c`) plus 8 -- the standard Itanium offset from a vtable's start
+to the `vptr` value objects actually store. **The item SampleManager has
+selected when this screen opens is a `FileSystemDirectory`** -- the real
+on-card filesystem directory object this project already partially reverse
+engineered in `docs/findings/14-plus-drive-format.md`. Its vtable+0x30
+method (`FileSystemDirectory::vfunc_12`,
+`out/ghidra/dt2-1.16-emac/decomp/401592ac_FileSystemDirectory__vfunc_12.c`)
+is a one-line flag getter: `return *(byte *)(this + 0x120);` -- and that
+flag is false on this object in both reproductions tried
+(`snapshots/dt2-1.16/running.snap`, no card at all, and
+`snapshots/dt2-1.16-card/boot400M.snap` with
+`--card-image out/plusdrive/dt2.img`). No writer of
+`FileSystemDirectory+0x120` was found among `FileSystemDirectory`'s own
+named methods in `out/ghidra/dt2-1.16-emac/decomp/` (only the getter
+references it); it is very likely set once a real mount actually succeeds
+and reads at least one directory entry.
 
-### What this rules out as a quick fix
+**This ties directly to this file's own still-open finding two sections
+below** ("Booting with an already-formatted card stalls before `running`")
+and to `docs/findings/14-plus-drive-format.md`'s undocumented real-FS
+superblock at sector `0x5D8000` required by the mount routine
+`FUN_4015a450`: this project has never gotten a card image through a real,
+successful mount in this emulator, with or without `--card-image`. A
+`FileSystemDirectory` that never became valid is exactly what an
+unsuccessful (or never-attempted) mount would leave behind, and it being
+the object SampleManager selects even with **no card connected at all**
+(`running.snap`) suggests real firmware may gate ever showing/selecting a
+`FileSystemDirectory` on card presence in a way this emulator's eSDHC/card
+model does not yet reproduce (open below).
 
-Seeding the queue with a synthetic empty node (e.g. pointing `node[3]` at
-the firmware's own empty-table sentinel, `&DAT_44f37028`, the same
-substitute `FUN_40187326` installs on a real page-read failure) does not
-work: `FUN_40187326` still returns "not found" for an empty table, so
-`FUN_40187c5c`'s pop loop just consumes that one synthetic node and then
-hits the now-empty queue again, still returning 0. A correct fix needs the
-*real* resource-group descriptor and its backing compressed table (the
-actual bytes this id resolves against), not a placeholder -- and nothing
-in this session's static or dynamic evidence identifies where that comes
-from (not `section_3_MAIN_OS.bin`'s own code, not the +Drive card, not any
-address this project's Ghidra project or disassembly covers).
+### What this rules out, and what remains open **[O]**
 
-**[O]**, not resolved: no safe fix was applied. The candidates are (a) a
-genuine gap in this project's boot model -- something outside
-`section_3_MAIN_OS.bin` (a different flash region/section, or a
-CPU-side write from outside the emulated address space this project
-models) is expected to populate this cache and nothing here reproduces
-it, or (b) this specific resource id is a latent firmware defect not
-actually reachable this way on real hardware, and the real path to this
-screen supplies the id differently. Confirming either needs either a real
-device capture of what touches `0x44f37030`/`0x44f37034` (or what this
-call's `*(param_1+0x6c)` id actually is) around this exact screen, or
-locating the still-missing branch (C) boot path from the section directly
-above, which may be the same underlying gap. Applying a fix without that
-would not be trustworthy per this repo's own verification rule, and (as
-shown above) a naive seed does not even mask the symptom correctly.
+No code change was made to the emulator or a snapshot this session. Two
+real candidates remain, not yet distinguished:
+
+- **(a) Emulator/setup gap, most likely candidate.** The real filesystem
+  mount never succeeds in this emulator (the pre-existing, still-open
+  `FUN_4015a450`/superblock gap), so `FileSystemDirectory+0x120` never
+  becomes true before `SampleManager::vfunc_40` runs. If real hardware
+  either (i) always has a genuinely mounted, valid `FileSystemDirectory`
+  by the time a user can reach this screen, or (ii) gates ever
+  selecting/showing one on a successful card-detect+mount that the
+  emulator's `emu/esdhc.py` model does not perform, then fixing the
+  existing mount gap (or, more narrowly, making card-absence correctly
+  avoid ever selecting an invalid `FileSystemDirectory`) would fix this
+  crash too. Neither was attempted this session: the mount-format side is
+  a separate, larger, already-partially-investigated task
+  (`docs/findings/14-plus-drive-format.md`), and confirming the
+  card-absence-gating hypothesis needs tracing what constructs/selects
+  `param_1[0x7f]`/`param_1[0x81]` in `SampleManager`'s own setup path,
+  which this session did not chase further.
+- **(b) Latent firmware defect.** `SampleManager::vfunc_40`'s missing null
+  guard is a real bug regardless of cause -- `FUN_4015996e` already has a
+  safe empty-string fallback for the *other* null case three lines away,
+  and simply doesn't use it here. If real hardware can ever reach this
+  exact "selected item reports itself invalid" state (e.g. a card that
+  fails to mount, or is removed mid-browse), it would hit the same
+  abort there too. Confirming this needs a real device test (browse
+  SampleManager/+Drive with no card, or a card that fails to mount) that
+  this project cannot run.
+
+Given the repo's own verification rule, no fix was applied without
+distinguishing these. The immediately actionable next step is static: read
+whatever constructs `SampleManager`'s `param_1[0x7f]`/`[0x81]` fields (its
+constructor or the view-open path leading to this screen) to see whether it
+is unconditional (selects a `FileSystemDirectory` regardless of card
+presence -- pointing at (a)) or itself guarded on a card-detect/mount check
+that the emulator's eSDHC model fakes or skips.
+
+### The libgcc-unwinder dead-code proof (unaffected by the correction above) **[V]**
+
+The three-method proof that `FUN_401879dc`/`FUN_40187a20`/`FUN_40187b08`
+(the `__register_frame_info` family) and the two globals
+`_DAT_44f37030`/`_DAT_44f37034` have no writer or caller anywhere in
+`section_3_MAIN_OS.bin` stands unchanged under the corrected identification
+-- it is *why* no unwind ever finds a handler, not evidence of a resource
+cache:
+
+1. `xrefs.sqlite`'s `calls` table: zero rows targeting any of the three.
+2. `tools/refscan.py` (96.78% byte coverage) over the whole image: 0 hits
+   on any of the three function addresses, or on `0x44f37030`/`0x44f37034`,
+   outside the six functions implementing the unwinder itself
+   (`0x401879b4`-`0x40187d58`).
+3. A raw byte-for-byte 4-byte-literal scan of the entire 3.1 MB image
+   (covering data/vtables/jump tables too, not just instructions): 0 hits
+   in the same sense; the identical method correctly finds
+   `_Unwind_Find_FDE`'s (`FUN_40187c5c`'s) two real call sites, confirming
+   the method works.
+
+Also reconfirmed **not an eSDHC/+Drive command bug** in the narrow sense:
+re-running the identical feed sequence with `--card-image` omitted
+reproduces byte-for-byte the same crash at the same instruction count, and
+`emu/esdhc.py`'s opt-in command log (`--esdhc-log`) records zero commands
+issued either way -- the SD driver's `XFERTYP` write is never reached
+before the throw. That is now explained: the `FileSystemDirectory`
+object's invalidity is a state left over from an *earlier*, already
+completed (and already failing) mount attempt or its total absence, not
+something this exact screen's own code tries to read from the card live.
