@@ -445,5 +445,81 @@ class ArmedVoiceReplayTest(unittest.TestCase):
         )
 
 
+@pytest.mark.slow
+@unittest.skipUnless(DT2_116_BLOB.exists(), "DT2 1.16 firmware bytes are not available")
+@unittest.skipUnless(
+    TRIG_CAPTURE.exists(), "dt2-1.16-running-trig.dt2cap capture is not available"
+)
+class ArmedVoiceRealSampleReplayTest(unittest.TestCase):
+    """Lane N2 (2026-09-26): replay_armed_voice(inject_real_sample=True)
+    over out/captures/dt2-1.16-running-trig.dt2cap -- the same real TRIG
+    lane K1 (above) proved arms voice 4 (``arm_frame=304``), now driving
+    the boot-time click/default sample (``replay_mod.BUILTIN_SAMPLE_BASE``/
+    ``BUILTIN_SAMPLE_LEN``) through that same real arm instead of leaving
+    word+0 null, and keeping the voice alive against ``FUN_1c4e70``'s own
+    generic per-frame clear for one full pass through the sample
+    (``active_frames=6``, not K1's own 1 -- the keep-alive window, not a
+    different arm).
+
+    Uses ``start_frame=300`` -- checked against a genuine, continuous,
+    from-frame-0 replay of the FULL 574-frame capture under PyPy (this
+    lane's own report), which reproduces the exact same `arm_frame`/
+    `active_frames`/`deactivate_pc`/`rearm_events` count AND a
+    byte-for-byte-identical rendered WAV (matching SHA-256) as this
+    shortcut -- the same equivalence K1's own class docstring establishes
+    for this exact (capture, voice) pair, since this lane's own keep-alive
+    hook only ever touches voice 4's own record and never reads state any
+    frame before 300 could have built up."""
+
+    def test_start_frame_shortcut_matches_full_replay_and_renders_real_audio(self):
+        result = replay_mod.replay_armed_voice(
+            "dt2-1.16",
+            str(TRIG_CAPTURE),
+            voice=4,
+            extra_frames=20,
+            n_frames=31,
+            start_frame=300,
+            inject_real_sample=True,
+        )
+        self.assertEqual(result["arm_frame"], 304)
+        self.assertEqual(result["active_frames"], 6)
+        self.assertEqual(result["deactivate_pc"], "0x1c4e8a")
+        self.assertEqual(result["sample_pointer_at_arm"], "0x0")
+        self.assertEqual(result["sample_base"], "0x8045a6c8")
+        self.assertEqual(result["sample_len"], 368)
+        self.assertEqual(len(result["pokes"]), len(replay_mod.POKE_DESCRIPTIONS))
+        self.assertEqual(len(result["rearm_events"]), 18)
+        self.assertEqual(len(result["render_left"]), 26 * 32)
+        self.assertEqual(len(result["render_right"]), 26 * 32)
+        # Real audio this time (not K1's own silence): the sample's own
+        # near-full-scale content survives the render/decimate/master-mix
+        # pipeline (see this lane's own report for the cross-correlation
+        # against the source sample).
+        self.assertGreater(max(abs(v) for v in result["render_left"]), 0.3)
+        self.assertGreater(max(abs(v) for v in result["render_right"]), 0.3)
+        # Ring A's own documented L/R negation (sharc_harness.py's module
+        # note): both channels carry the identical mono signal this lane's
+        # inject_master_mix() writes, so L is exactly R's negation.
+        for left_sample, right_sample in zip(
+            result["render_left"], result["render_right"], strict=True
+        ):
+            self.assertAlmostEqual(left_sample, -right_sample, places=9)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            wav_path = os.path.join(tmp_dir, "demo_real_sample.wav")
+            h.sharc_dac.write_wav_stereo(
+                wav_path,
+                result["render_left"],
+                result["render_right"],
+                sample_rate=result["sample_rate_hz"],
+            )
+            with open(wav_path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+        self.assertEqual(
+            digest,
+            "bd0cce7b1e8f9e28c8f44af1ca087d76b872f333d814dfbd4adbab559079ab95",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

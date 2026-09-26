@@ -112,6 +112,7 @@ import json
 import math
 import os
 import sys
+from collections.abc import Callable
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -719,6 +720,375 @@ def _hex_or_none(value: int | None) -> str | None:
     return None if value is None else "%#x" % value
 
 
+# --- Lane N2 (2026-09-26): a real sample through the firmware's own arm,
+# not silence -----------------------------------------------------------
+#
+# Lane K1 (above) proved the firmware genuinely arms voice 4 from a real
+# TRIG (`arm_frame=304`), but that voice's own word+0 (the raw-PCM pointer)
+# was already null by then -- zeroed at frame 1 by `FUN_1c4e70`'s own
+# generic per-voice "clear" utility (`0x1c4e86` for word+0, `0x1c4e8a` for
+# ACTIVE -- see K1's own disassembly), which runs unconditionally, every
+# frame, for every "in-service" voice slot, before that same frame's own
+# arm/render dispatch. This section drives a REAL sample through that same
+# real arm event instead of leaving word+0 null, by reacting to three pcs
+# (two already found by K1, one this lane found by execution when the
+# first two alone measured a ~15x-too-quiet render -- see
+# `_make_voice_rearm_hook()`'s own docstring for that trace):
+#
+# 1. `VOICE_ARM_PC` (`0x1c4ebb`, inside `FUN_1c4eaf`): the firmware's own
+#    real arm write (`ACTIVE=1`). The instant this fires for the voice
+#    this replay is watching, the hook only flags `armed=True` -- it does
+#    NOT poke the record here (see point 3: a real setup_voice() poke
+#    placed here gets clobbered before the render ever sees it).
+#
+# 2. `REARM_CLEAR_PC` (`0x1c4e86`, word+0) and `REARM_ACTIVE_CLEAR_PC`
+#    (`0x1c4e8a`, ACTIVE): K1's own "generic per-frame default-clear"
+#    writes (`FUN_1c4e70`'s own two stores, called for this voice slot at
+#    the *start* of every frame's dispatch, arm or not). Once armed, the
+#    hook re-pokes whichever of these two fields the clear just zeroed,
+#    for as many frames as the sample needs to play once through
+#    (`_frames_for_sample()`) -- and then deliberately stops, letting the
+#    NEXT such clear silence the voice again, so the demo ends in the same
+#    natural silence a real one-shot playback would. A DIFFERENT pc
+#    clearing ACTIVE while armed (docs/findings/06's own past-limit
+#    `0x1c5008` or wrap `0x1c50fe`) is left alone and ends the keep-alive
+#    window early -- a real end-of-sample event, not this hook's target.
+#
+# 3. `profile(image).voice_render`'s own entry (checked against the
+#    incoming `R4` -- the record base -- since this entry point is shared
+#    by all 32 voices' own per-frame dispatch): `sharc_harness.setup_voice()`
+#    (reused as-is, per this project's own convention of not re-deriving a
+#    voice-record poke sequence twice) is (re-)applied here, EVERY frame
+#    the keep-alive window is open, because something in this capture's own
+#    per-voice dispatch -- almost certainly one of docs/findings/06's own
+#    "four position/step setters", fed by this capture's own stale/null
+#    per-track parameter tables -- overwrites STEP/END back to a stale,
+#    near-zero value every single frame, not just once after the arm (this
+#    lane's own finding, by execution: see `_make_voice_rearm_hook()`'s
+#    docstring for the before/after trace). FIELD_PHASE is the one field
+#    `setup_voice()` sets that this hook does NOT let it clobber past the
+#    first application -- saved and restored around every later call, so
+#    the render's own natural advancement through the sample survives.
+#
+# This all happens inside `sharc_harness.call_frame_with_track_injection()`'s
+# own per-instruction step loop (its new `post_step_hook` parameter, this
+# lane's own addition there) -- a poke applied only between
+# `call_frame_with_track_injection()` calls (i.e. once per frame) would be
+# too late: the very same clears/clobbers run again, for the very same
+# voice, before that later frame's own render check, so only a hook that
+# can react between two instructions of the SAME frame can keep the voice
+# alive, and correctly paced, across more than the one frame K1 already
+# found.
+#
+# The one thing this lane's own step-1 check established: the built-in
+# click/default sample at `0x8045a6c8` (every voice's own post-init word+0,
+# per K1's report) is real audio, not silence -- a single-cycle,
+# near-full-scale waveform, 368 samples long (matching `FIELD_SAMPLE_LENGTH`'s
+# own init value, `0x170`) -- so no separate synthetic source or SDRAM
+# write is needed; this replay only ever *points* word+0 at memory the
+# firmware's own boot already filled.
+BUILTIN_SAMPLE_BASE = 0x8045A6C8
+BUILTIN_SAMPLE_LEN = 368
+
+# FUN_1c4f81's own DO 64 interpolation loop (sharc_harness.py's module
+# docstring, "Corrected voice call convention") advances the raw-sample
+# read position by `pitch_step` per iteration, 64 iterations per voice
+# render call, and one voice render call happens once per frame
+# (`sharc_harness.reference_render()`'s own `n_output * 2` = 64, one
+# `call_render()`/frame in `FUN_1c642a`'s per-voice dispatch) -- so at
+# pitch_step=1.0 a frame consumes 64 raw samples.
+RAW_SAMPLES_PER_FRAME = 64
+
+# A sample shorter than this needs FIELD_LOOP=1 to survive more than a
+# handful of frames without hitting FUN_1c4f81's own past-limit/wrap logic
+# (docs/findings/06's `0x1c5008`/`0x1c50fe`) -- matching
+# `sharc_harness.render_blocks()`'s own default `sample_len=4096` as the
+# project's baseline "not short" buffer size.
+SHORT_SAMPLE_THRESHOLD = 4096
+
+VOICE_ARM_PC = 0x1C4EBB
+REARM_CLEAR_PC = 0x1C4E86
+REARM_ACTIVE_CLEAR_PC = 0x1C4E8A
+
+
+def _frames_for_sample(sample_len: int, pitch_step: float) -> int:
+    """How many frames FUN_1c4f81's own DO 64 loop needs to read through
+    SAMPLE_LEN raw samples once, at PITCH_STEP -- see RAW_SAMPLES_PER_FRAME's
+    own docstring. Rounds up: a sample not landing exactly on a frame
+    boundary still gets a whole frame to finish it."""
+    return math.ceil(sample_len / (RAW_SAMPLES_PER_FRAME * pitch_step))
+
+
+def _make_voice_rearm_hook(
+    image: str,
+    voice: int,
+    *,
+    sample_base: int,
+    sample_len: int,
+    pitch_step: float,
+    loop: bool,
+    frames_needed: int,
+    shared: dict,
+    events: list[dict],
+    frame_cell: list[int],
+) -> Callable[[sr.Runner], None]:
+    """A `sharc_harness.call_frame_with_track_injection(post_step_hook=...)`
+    callback (see that function's own docstring) that plays SAMPLE_BASE
+    (SAMPLE_LEN raw samples, at PITCH_STEP) through VOICE the instant the
+    firmware itself arms it (`VOICE_ARM_PC`), and keeps it alive against
+    `FUN_1c4e70`'s own generic per-frame clear (`REARM_CLEAR_PC`/
+    `REARM_ACTIVE_CLEAR_PC`) for FRAMES_NEEDED frames -- see this section's
+    own module note for why this needs to run inside the per-instruction
+    step loop, not between frames.
+
+    SHARED is a caller-owned `{"armed": bool, "remaining": int, "setup_done":
+    bool}` (mutable across every frame's own hook instance -- watch_log
+    itself resets every frame, per `Runner.fresh_call()`'s own docstring,
+    but this dict does not); EVENTS collects one dict per poke this hook
+    applies (or declines to apply), for the caller's own report; FRAME_CELL
+    is a one-element list the caller mutates (`frame_cell[0] = idx`) before
+    each frame's own `call_frame_with_track_injection()` call, so events are
+    logged against the right frame number without this function needing its
+    own frame counter.
+
+    **Why the real `setup_voice()` poke happens at `voice_render` entry,
+    every frame, not once at the arm event (lane N2, found by execution,
+    not predicted).** The first version of this hook applied
+    `setup_voice()` once, immediately on `VOICE_ARM_PC` (the same frame's
+    own `ACTIVE=1` write) -- and measured a rendered amplitude about 15x
+    smaller than `sharc_harness.reference_render()`'s own independent math
+    predicts for this sample. Reading FIELD_STEP/FIELD_END back after that
+    frame's own call showed neither held what `setup_voice()` had just
+    written (`step` read back as `~0.0124`, not `1.0`; `end` as `-1.0`,
+    not `sample_len`) -- something *else* writes those same fields, later
+    in the SAME frame's own per-voice dispatch, after the arm but before
+    the render: almost certainly one of docs/findings/06's own "four
+    position/step setters" (`0x1c4afe`/`0x1c4bf9`/`0x1c4d88`/`0x1c4a31`),
+    from this capture's own stale/null per-track parameter tables (the
+    same "no real kit/mixer configuration is loaded" gap this project's
+    own frame-render lanes already found elsewhere).
+
+    Moving the poke to `voice_render`'s own entry (`profile(image).
+    voice_render`, checked against the incoming `R4` -- the record base,
+    per `sharc_harness.py`'s own "Corrected voice call convention" --
+    since this entry point is shared by all 32 voices' own dispatch, once
+    per frame each) fixed frame 304 alone (the arm frame): its own
+    injected output then matched `reference_render()` almost exactly. But
+    reading STEP/END back after frame 305 showed them clobbered again, to
+    the SAME stale values, and frame 305's own injected output was
+    correspondingly near-flat (PHASE barely advancing) -- so whatever
+    writes these fields runs EVERY frame this voice is active, not just
+    once after the arm (an ordinary per-frame parameter refresh from the
+    same stale tables, not a one-shot "position/step setter" reacting to
+    SEED_PENDING as this lane first assumed). This hook therefore reapplies
+    `setup_voice()`'s own sample-pointer/length/start/end/loop_start/step/
+    loop/reverse fields at `voice_render` entry EVERY frame the keep-alive
+    window is open (`shared["armed"]`) -- but saves and restores
+    FIELD_PHASE around each call after the first: `setup_voice()` always
+    resets PHASE to `start`, and only the very first application should do
+    that (seeding position 0) -- every later frame must instead preserve
+    PHASE at wherever that SAME frame's own upstream clobber-then-fix
+    sequence left it, letting the render actually advance through the
+    sample instead of restarting it every frame."""
+    record = h.voice_record_address(image, voice)
+    voice_render_entry = h.profile(image).voice_render
+    word0_label = "%s%d" % (VOICE_WORD0_LABEL_PREFIX, voice)
+    active_label = "%s%d" % (VOICE_ACTIVE_LABEL_PREFIX, voice)
+    seen = [0]
+
+    def hook(runner: sr.Runner) -> None:
+        if shared["armed"] and runner.state.pc_sw == voice_render_entry:
+            from sharc_core.encoding import UREG_CODES
+
+            r4 = runner.state.uregs.get(UREG_CODES["R4"])
+            if r4 is not None and getattr(r4, "value", None) == record:
+                first = not shared.get("setup_done")
+                saved_phase = (
+                    None
+                    if first
+                    else h._read_q31_pair(runner.state, record + h.FIELD_PHASE)
+                )
+                h.setup_voice(
+                    runner.state,
+                    image,
+                    voice,
+                    sample_len=sample_len,
+                    pitch_step=pitch_step,
+                    start=0,
+                    end=sample_len,
+                    loop_start=0,
+                    loop=loop,
+                    reverse=False,
+                    sample_base=sample_base,
+                )
+                if saved_phase is not None:
+                    h._write_q31_pair(runner.state, record + h.FIELD_PHASE, saved_phase)
+                shared["setup_done"] = True
+                events.append(
+                    {
+                        "frame": frame_cell[0],
+                        "field": "setup_voice" if first else "setup_voice-repeat",
+                        "pc": "%#x" % voice_render_entry,
+                        "value": (
+                            "sample_base=%#x sample_len=%d pitch_step=%s "
+                            "loop=%s%s"
+                            % (
+                                sample_base,
+                                sample_len,
+                                pitch_step,
+                                loop,
+                                "" if first else " (phase preserved)",
+                            )
+                        ),
+                    }
+                )
+        log = runner.watch_log
+        if seen[0] > len(log):
+            seen[0] = 0  # a new frame's own fresh Runner: watch_log reset
+        while seen[0] < len(log):
+            event = log[seen[0]]
+            seen[0] += 1
+            if event.access != "write":
+                continue
+            if event.label == word0_label:
+                if (
+                    event.pc_sw == REARM_CLEAR_PC
+                    and event.new_value == 0
+                    and shared["armed"]
+                    and shared["remaining"] > 0
+                ):
+                    h._poke(runner.state, record + h.FIELD_SAMPLE_PTR, sample_base)
+                    events.append(
+                        {
+                            "frame": frame_cell[0],
+                            "field": "word0",
+                            "pc": "%#x" % event.pc_sw,
+                            "value": "%#x" % sample_base,
+                        }
+                    )
+            elif event.label == active_label:
+                if (
+                    event.pc_sw == VOICE_ARM_PC
+                    and event.new_value == 1
+                    and not shared["armed"]
+                ):
+                    shared["armed"] = True
+                    shared["remaining"] = frames_needed - 1
+                    shared["setup_done"] = False
+                    events.append(
+                        {
+                            "frame": frame_cell[0],
+                            "field": "arm-detected",
+                            "pc": "%#x" % event.pc_sw,
+                            "value": "real firmware arm; setup_voice() applied at "
+                            "voice_render entry, not here (see this function's "
+                            "own docstring)",
+                        }
+                    )
+                elif event.pc_sw == REARM_ACTIVE_CLEAR_PC and event.new_value == 0:
+                    if shared["armed"] and shared["remaining"] > 0:
+                        h._poke(runner.state, record + h.FIELD_ACTIVE, 1, width=1)
+                        shared["remaining"] -= 1
+                        events.append(
+                            {
+                                "frame": frame_cell[0],
+                                "field": "active",
+                                "pc": "%#x" % event.pc_sw,
+                                "value": "1 (remaining=%d)" % shared["remaining"],
+                            }
+                        )
+                    elif shared["armed"]:
+                        # The keep-alive window just closed (`remaining`
+                        # reached 0 on a previous frame's own generic
+                        # clear): let this and every later recurrence of
+                        # the SAME generic clear silence the voice, same as
+                        # a real one-shot playback -- `armed=False` also
+                        # re-arms this hook for a genuinely later real
+                        # trigger, and stops this branch from logging one
+                        # entry per remaining frame of the whole replay.
+                        shared["armed"] = False
+                        events.append(
+                            {
+                                "frame": frame_cell[0],
+                                "field": "active",
+                                "pc": "%#x" % event.pc_sw,
+                                "value": "0 (keep-alive window ended)",
+                            }
+                        )
+                elif shared["armed"] and event.new_value == 0:
+                    # A different pc cleared ACTIVE while armed: a real
+                    # end-of-sample path (0x1c5008/0x1c50fe), not this
+                    # hook's own target -- stop the keep-alive window early
+                    # rather than fight a genuine firmware deactivation.
+                    shared["armed"] = False
+                    shared["remaining"] = 0
+                    events.append(
+                        {
+                            "frame": frame_cell[0],
+                            "field": "active",
+                            "pc": "%#x" % event.pc_sw,
+                            "value": "0 (natural end-of-sample, not counteracted)",
+                        }
+                    )
+
+    return hook
+
+
+#: Every poke `replay_armed_voice(inject_real_sample=True)` applies, in the
+#: order it applies them, for `main()`'s own `--armed-voice-wav` help text
+#: and this function's own report (`result["pokes"]`) -- kept as one static
+#: list so both stay in sync with the constants above instead of drifting
+#: (task brief: "List every poke in the CLI help and in the report").
+POKE_DESCRIPTIONS: tuple[str, ...] = (
+    "record+0x000 (FIELD_SAMPLE_PTR) = %#x (the boot-time click/default "
+    "sample, real audio -- see this section's own module note): via "
+    "sharc_harness.setup_voice(), at profile(image).voice_render's own "
+    "entry (R4==record), EVERY frame the keep-alive window is open (a "
+    "per-frame parameter refresh clobbers this, not just a one-time "
+    "arm-time write); also independently re-applied by REARM_CLEAR_PC=%#x's "
+    "own counteraction whenever FUN_1c4e70's generic per-frame clear "
+    "zeroes it first" % (BUILTIN_SAMPLE_BASE, REARM_CLEAR_PC),
+    "record+0x188/0x18c (FIELD_SAMPLE_LENGTH/_HI) = %d / 0: via "
+    "setup_voice() at voice_render entry, every frame the keep-alive "
+    "window is open" % BUILTIN_SAMPLE_LEN,
+    "record+0x190/0x194 (FIELD_LOOP_START, Q31 pair) = 0: via setup_voice() "
+    "at voice_render entry, every frame the keep-alive window is open",
+    "record+0x198/0x19c (FIELD_START, Q31 pair) = 0: via setup_voice() at "
+    "voice_render entry, every frame the keep-alive window is open",
+    "record+0x1a0/0x1a4 (FIELD_END, Q31 pair) = %d: via setup_voice() at "
+    "voice_render entry, every frame the keep-alive window is open "
+    "(this is the field this lane found being clobbered back to a stale "
+    "value every frame -- see _make_voice_rearm_hook()'s own docstring)"
+    % BUILTIN_SAMPLE_LEN,
+    "record+0x1a8/0x1ac (FIELD_STEP, Q31 pair) = 1.0 (pitch_step): via "
+    "setup_voice() at voice_render entry, every frame the keep-alive "
+    "window is open (same clobber as FIELD_END above)",
+    "record+0x1b0/0x1b4 (FIELD_PHASE, Q31 pair) = 0 (=start): via "
+    "setup_voice() at voice_render entry, ONLY the first frame the voice "
+    "arms -- every later frame's own setup_voice() call has this field "
+    "saved beforehand and restored after, so the render's own natural "
+    "advance through the sample is preserved instead of being rewound",
+    "record+0x17c/0x17d/0x17e (FADE_IN/ZERO_CROSS_MUTE/RESEED) = 0: via "
+    "setup_voice() at voice_render entry, every frame the keep-alive "
+    "window is open (harmless to repeat: these are already 0)",
+    "record+0x180 (FIELD_PREVIOUS_SAMPLE) = 0: via setup_voice() at "
+    "voice_render entry, every frame the keep-alive window is open",
+    "record+0x1bb (FIELD_REVERSE) = 0: via setup_voice() at voice_render "
+    "entry, every frame the keep-alive window is open",
+    "record+0x1bc (FIELD_LOOP) = 1 (sample is short: %d < %d samples): via "
+    "setup_voice() at voice_render entry, every frame the keep-alive "
+    "window is open" % (BUILTIN_SAMPLE_LEN, SHORT_SAMPLE_THRESHOLD),
+    "record+0x1b8 (FIELD_ACTIVE) = 1: via setup_voice() at voice_render "
+    "entry, every frame the keep-alive window is open (redundant with the "
+    "firmware's own %#x write on the arm frame); independently re-applied "
+    "by REARM_ACTIVE_CLEAR_PC=%#x's own counteraction whenever "
+    "FUN_1c4e70's generic per-frame clear zeroes it first"
+    % (VOICE_ARM_PC, REARM_ACTIVE_CLEAR_PC),
+    "record+0x1ba (FIELD_SEED_PENDING) = 0: via setup_voice() at "
+    "voice_render entry, every frame the keep-alive window is open",
+)
+
+
 def replay_armed_voice(
     image: str,
     capture_path: str,
@@ -727,6 +1097,7 @@ def replay_armed_voice(
     extra_frames: int = 20,
     n_frames: int | None = None,
     start_frame: int = 0,
+    inject_real_sample: bool = False,
 ) -> dict:
     """Replay CAPTURE_PATH continuously from frame 0 by default (no
     `start_frame` shortcut -- lane J1's own open question, see this
@@ -800,13 +1171,32 @@ def replay_armed_voice(
     `[arm_frame, arm_frame + active_frames + EXTRA_FRAMES)` -- the demo
     window the task brief asks for -- or `[]` if VOICE was never armed.
 
+    `INJECT_REAL_SAMPLE` (lane N2, 2026-09-26, default False -- the
+    original K1 behaviour is unchanged when this is left off): instead of
+    only watching/logging, drive a real sample (`BUILTIN_SAMPLE_BASE`/
+    `BUILTIN_SAMPLE_LEN`, this lane's own step-1 finding -- see this
+    section's own module note) through VOICE the instant the firmware
+    itself arms it, and keep it alive against `FUN_1c4e70`'s own generic
+    per-frame clear for as long as the sample needs to play once through
+    (`_frames_for_sample()`) -- see `_make_voice_rearm_hook()`'s own
+    docstring for exactly what this pokes and when. Adds `pokes` (the
+    static `POKE_DESCRIPTIONS` list, so a report always documents every
+    poke it could have applied) and `rearm_events` (what actually fired,
+    oldest first: `{"frame", "field", "pc", "value"}`) to the returned
+    dict; `active_by_frame`/`arm_frame`/`active_frames`/`deactivate_pc`/
+    `render_left`/`render_right` above need no code change to reflect the
+    extended, real-audio window -- they already read VOICE's own state
+    fresh after each frame, which this keep-alive is now sustaining for
+    longer than the one silent frame K1 found.
+
     Returns a dict with `capture`, `frames_replayed`, `voice`,
     `word0_writes`, `active_writes`, `active_by_frame`, `arm_frame`,
     `active_frames`, `deactivate_pc`, `sample_pointer_at_arm`,
     `render_left`, `render_right`, `sample_rate_hz`
     (`sharc_dac`'s own ring-A rate, `int(sharc_harness.SOURCE_SAMPLE_RATE //
-    2)` = 48000), and `error` (only present, and everything else absent,
-    if `run_init()` itself failed)."""
+    2)` = 48000), `pokes`/`rearm_events` (only when `inject_real_sample`),
+    and `error` (only present, and everything else absent, if `run_init()`
+    itself failed)."""
     cap = sharc_capture.load(capture_path)
     end = None if n_frames is None else start_frame + n_frames
     frames = cap.dspi2_frames[start_frame:end]
@@ -839,8 +1229,30 @@ def replay_armed_voice(
     ring_left_by_frame: list[list[float]] = []
     ring_right_by_frame: list[list[float]] = []
 
+    rearm_hook = None
+    rearm_events: list[dict] = []
+    frame_cell = [0]
+    if inject_real_sample:
+        pitch_step = 1.0
+        loop = BUILTIN_SAMPLE_LEN < SHORT_SAMPLE_THRESHOLD
+        frames_needed = _frames_for_sample(BUILTIN_SAMPLE_LEN, pitch_step)
+        rearm_shared = {"armed": False, "remaining": 0}
+        rearm_hook = _make_voice_rearm_hook(
+            image,
+            voice,
+            sample_base=BUILTIN_SAMPLE_BASE,
+            sample_len=BUILTIN_SAMPLE_LEN,
+            pitch_step=pitch_step,
+            loop=loop,
+            frames_needed=frames_needed,
+            shared=rearm_shared,
+            events=rearm_events,
+            frame_cell=frame_cell,
+        )
+
     for local_idx, frame in enumerate(frames):
         idx = start_frame + local_idx
+        frame_cell[0] = idx
         ptr_before = st._dm_read(state, record + h.FIELD_SAMPLE_PTR, 4)
         sample_ptr_before_frame.append(
             ptr_before.value & 0xFFFFFFFF if ptr_before is not None else None
@@ -859,6 +1271,7 @@ def replay_armed_voice(
             write_master_mix=True,
             inject_track=False,
             watchpoints=watchpoints,
+            post_step_hook=rearm_hook,
         )
         state = runner.state
 
@@ -915,7 +1328,7 @@ def replay_armed_voice(
             render_left.extend(ring_left_by_frame[i])
             render_right.extend(ring_right_by_frame[i])
 
-    return {
+    result = {
         "capture": capture_path,
         "frames_in_capture": len(cap.dspi2_frames),
         "frames_replayed": len(frames),
@@ -937,6 +1350,18 @@ def replay_armed_voice(
         "render_right": render_right,
         "sample_rate_hz": int(h.SOURCE_SAMPLE_RATE // 2),
     }
+    if inject_real_sample:
+        result["pokes"] = list(POKE_DESCRIPTIONS)
+        result["rearm_events"] = rearm_events
+        result["sample_base"] = "%#x" % BUILTIN_SAMPLE_BASE
+        result["sample_len"] = BUILTIN_SAMPLE_LEN
+        result["cleared_by"] = (
+            "word+0 by %#x, ACTIVE by %#x (both FUN_1c4e70's own generic "
+            "per-frame clear, called once per frame for every 'in-service' "
+            "voice slot -- docs/findings/06 lane K1)"
+            % (REARM_CLEAR_PC, REARM_ACTIVE_CLEAR_PC)
+        )
+    return result
 
 
 def parse_args(argv=None):
@@ -1027,6 +1452,26 @@ def parse_args(argv=None):
         "own docstring for when this is, and is not, safe to use) -- "
         "default 0, a genuinely continuous replay from frame 0",
     )
+    p.add_argument(
+        "--inject-real-sample",
+        action="store_true",
+        default=False,
+        help="--armed-voice-wav only (lane N2): instead of leaving --voice "
+        "silent once the firmware itself arms it (K1's own result), point "
+        "it at the boot-time click/default sample (%#x, %d samples -- real "
+        "audio, this lane's own step-1 finding, not silence) the instant "
+        "the real arm fires, and keep it alive against FUN_1c4e70's own "
+        "generic per-frame clear (%#x word+0 / %#x ACTIVE) for as long as "
+        "the sample needs to play once through, then let it fall silent "
+        "naturally. Every poke this applies, in order:\n- "
+        % (
+            BUILTIN_SAMPLE_BASE,
+            BUILTIN_SAMPLE_LEN,
+            REARM_CLEAR_PC,
+            REARM_ACTIVE_CLEAR_PC,
+        )
+        + "\n- ".join(POKE_DESCRIPTIONS),
+    )
     return p.parse_args(argv)
 
 
@@ -1050,6 +1495,7 @@ def main(argv=None) -> int:
             extra_frames=args.extra_frames,
             n_frames=args.frames,
             start_frame=args.start_frame,
+            inject_real_sample=args.inject_real_sample,
         )
         if args.out and result.get("render_left"):
             h.sharc_dac.write_wav_stereo(
@@ -1075,6 +1521,17 @@ def main(argv=None) -> int:
                 result.get("sample_pointer_at_arm"),
             )
         )
+        if args.inject_real_sample:
+            print(
+                "  real-sample injection: sample=%s (%s samples), "
+                "cleared_by=%s, rearm_events=%d"
+                % (
+                    result.get("sample_base"),
+                    result.get("sample_len"),
+                    result.get("cleared_by"),
+                    len(result.get("rearm_events", [])),
+                )
+            )
         return 0 if "error" not in result else 1
     result = replay(
         args.image,

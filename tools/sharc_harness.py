@@ -136,7 +136,7 @@ import struct
 import sys
 import time
 import wave
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -2362,6 +2362,7 @@ def call_frame_with_track_injection(
     inject_track: bool = True,
     frame_bytes: bytes | None = None,
     watchpoints: Sequence[sr.Watchpoint] = (),
+    post_step_hook: Callable[[sr.Runner], None] | None = None,
 ) -> tuple[sr.Runner, sr.RunResult, list[float]]:
     """Like `call_frame()`, but (when INJECT_TRACK, the default) calls
     `inject_track_buffer()` the instant `MASTER_STAGE_CALL_PC` is about to
@@ -2416,6 +2417,25 @@ def call_frame_with_track_injection(
     function on one continuous Runner can log writes (e.g. a voice
     record's own fields) across the whole run without a second pass.
 
+    `POST_STEP_HOOK` (lane N2, 2026-09-26), if given, is called as
+    `post_step_hook(new_runner)` immediately after every single
+    `new_runner.step()` in this function's own instruction loop (i.e. at
+    genuine per-instruction granularity, the same loop `MASTER_STAGE_CALL_PC`/
+    `MASTER_MIX_INJECT_PC` above already use, not a once-per-frame callback).
+    This exists because `tools/sharc_replay.py`'s own voice keep-alive
+    (`replay_armed_voice(inject_real_sample=True)`) needs to react to a
+    `WATCHPOINTS` hit -- a voice record field the firmware's own per-frame
+    "clear" utility (docs/findings/06 lane K1's `0x1c4e70`) just zeroed --
+    and re-poke it *before* the same frame's own render check runs a few
+    instructions later, which a poke applied only between frames (after
+    `call_frame_with_track_injection` already returned) is too late for:
+    the very same generic clear runs again at the *start* of next frame's
+    dispatch, before this function would get another chance to intervene.
+    This module deliberately does not know what the hook does (voice
+    field semantics belong in `tools/sharc_replay.py`, this function only
+    provides the instruction-granular timing hook) -- see that module's
+    own `_make_voice_rearm_hook()`.
+
     Returns `(new_runner, RunResult, injected)` where `injected` is the 32
     decimated floats (written or not, depending on the flags above), or
     `[]` if `MASTER_STAGE_CALL_PC` was never reached (an earlier stop)."""
@@ -2446,6 +2466,8 @@ def call_frame_with_track_injection(
         except sr.Halt as exc:
             halt = exc
             break
+        if post_step_hook is not None:
+            post_step_hook(new_runner)
         steps += 1
     else:
         halt = sr.Halt("max-steps", new_runner.state.pc_sw)
