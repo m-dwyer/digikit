@@ -2,7 +2,7 @@
 """Create a boot snapshot, and resume from one.
 
 make:   uv run python -m emu.checkpoint make 60000000,400000000 [prefix] [syx]
-        [--no-sdgate --no-esdhc]
+        [--no-sdgate --no-esdhc] [--card-image PATH]
 resume: uv run python -m emu.checkpoint resume snapshots/boot400M.snap 5000000
 """
 
@@ -18,6 +18,17 @@ import emu.dspboot as db
 import emu.longrun as lr
 from emu import config
 from emu.snapshot import save
+
+
+def sha256_file(path, chunk=1 << 20):
+    """-> hex sha256 of a file, streamed (safe for a large sparse card image:
+    reading its zero-filled holes costs memory bandwidth, not disk I/O)."""
+    h = hashlib.sha256()
+    # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def _integer(text, label):
@@ -53,7 +64,7 @@ def save_longrun(machine, ev, timers, path, extra=None):
 
 
 def make(points, prefix="snapshots/boot", syx=None, img_path=None,
-         sdgate=True, esdhc=True):
+         sdgate=True, esdhc=True, card_image=None):
     """Save a LADDER of checkpoints in one pass.
 
     `points` is a list of instruction counts. Saving mid-run is safe because
@@ -77,6 +88,16 @@ def make(points, prefix="snapshots/boot", syx=None, img_path=None,
     reaches MAIN_OS_RUNNING both with and without them, so turning them on
     does not regress the previously-working build. Pass sdgate=False and/or
     esdhc=False to get the old unmodelled-storage behaviour back.
+
+    `card_image`: path to a +Drive image built by tools/plusdrive.py, cold-
+    booted with the card in place from PC=entry (esdhc's continuity check
+    runs before the first rung at 60M, so a ladder built without the image
+    from the start bakes "blank card" into every rung -- see emu.dspboot.run's
+    own docstring). Only meaningful with esdhc=True. Its sha256 is recorded
+    in the ladder's sidecar (see below) so a later run of this same prefix
+    with a different (or no) image is caught as stale by
+    emu.run.need_snapshot rather than silently mixed with rungs built from
+    a different card.
     """
     syx = config.firmware(syx)
     image_path = config.main_image(img_path)
@@ -135,15 +156,17 @@ def make(points, prefix="snapshots/boot", syx=None, img_path=None,
         machine_out=box,
         sdgate=sdgate,
         esdhc=esdhc,
+        card_image=card_image,
     )
     if box["saved"]:
         # A snapshot carries no manifest on the cold-boot path -- save() is
         # called above without one -- so this sidecar is what lets a later
         # run (emu/run.py's need_snapshot) tell a ladder built with these
-        # storage models from one built without them, instead of silently
-        # resuming a mismatched configuration.
+        # storage models (and this card image) from one built without them,
+        # instead of silently resuming a mismatched configuration.
         from emu.run import ladder_config_path
         cfg_path = ladder_config_path(prefix)
+        card_sha256 = sha256_file(card_image) if card_image else None
         # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         os.makedirs(os.path.dirname(cfg_path) or ".", exist_ok=True)
         # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
@@ -154,6 +177,8 @@ def make(points, prefix="snapshots/boot", syx=None, img_path=None,
                 "esdhc": bool(esdhc),
                 "points": points,
                 "main_sha256": hashlib.sha256(img).hexdigest(),
+                "card_image": os.path.basename(card_image) if card_image else None,
+                "card_image_sha256": card_sha256,
             }, fh)
     return box["saved"]
 
@@ -229,13 +254,19 @@ if __name__ == "__main__":
             if a not in ("--sdgate", "--esdhc", "--no-sdgate", "--no-esdhc")]
     want_sdgate = "--no-sdgate" not in sys.argv
     want_esdhc = "--no-esdhc" not in sys.argv
+    card_image = None
+    if "--card-image" in argv:
+        i = argv.index("--card-image")
+        card_image = argv[i + 1]
+        del argv[i:i + 2]
 
     cmd = argv[1]
     if cmd == "make":
         pts = _points(argv[2])
         prefix = argv[3] if len(argv) > 3 else "snapshots/boot"
         syx = argv[4] if len(argv) > 4 else None
-        make(pts, prefix, syx, sdgate=want_sdgate, esdhc=want_esdhc)
+        make(pts, prefix, syx, sdgate=want_sdgate, esdhc=want_esdhc,
+             card_image=card_image)
     elif cmd == "extend":
         snap = argv[2]
         pts = _points(argv[3])

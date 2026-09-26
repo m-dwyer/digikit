@@ -208,7 +208,8 @@ def need_sections(syx):
     config.main_image()          # confirm; raises config.NotFound if not
 
 
-def need_snapshot(snapshot, prefix, syx, sdgate=True, esdhc=True, main_sha256=None):
+def need_snapshot(snapshot, prefix, syx, sdgate=True, esdhc=True, main_sha256=None,
+                   card_image=None, card_image_sha256=None):
     """Build the boot ladder if the snapshot is missing OR stale. -> True if built.
 
     "Stale" covers more than "absent": a ladder built by an older version of
@@ -219,7 +220,19 @@ def need_snapshot(snapshot, prefix, syx, sdgate=True, esdhc=True, main_sha256=No
     what makes that detectable: a snapshot itself carries no manifest on the
     cold-boot path (snapshot.save is called without one there), so without
     the sidecar there would be nothing to compare against.
+
+    `card_image`/`card_image_sha256`: a +Drive image (tools/plusdrive.py) to
+    cold-boot the whole ladder with, and its sha256 (callers that already
+    hashed it -- e.g. to name a firmware-specific prefix -- can pass the
+    digest directly and skip re-hashing a multi-GB sparse file). A ladder
+    whose sidecar records a different image (or none) is stale by the same
+    mechanism as sdgate/esdhc/main_sha256 above: this refuses to silently
+    resume rungs built from one card image as if they were built from
+    another, and instead rebuilds the whole ladder from this one.
     """
+    if card_image is not None and card_image_sha256 is None:
+        import emu.checkpoint as ck
+        card_image_sha256 = ck.sha256_file(card_image)
     if os.path.exists(snapshot):
         cfg_path = ladder_config_path(prefix)
         try:
@@ -242,6 +255,11 @@ def need_snapshot(snapshot, prefix, syx, sdgate=True, esdhc=True, main_sha256=No
             elif main_sha256 is not None and cfg.get('main_sha256') != main_sha256:
                 print('Rebuilding: existing snapshots were built from a '
                       'different MAIN OS image.\n', flush=True)
+            elif cfg.get('card_image_sha256') != card_image_sha256:
+                print('Rebuilding: existing snapshots were built with a '
+                      'different (or no) card image (%s), this run wants %s.\n'
+                      % (cfg.get('card_image_sha256'), card_image_sha256),
+                      flush=True)
             else:
                 return False
     # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
@@ -256,10 +274,13 @@ def need_snapshot(snapshot, prefix, syx, sdgate=True, esdhc=True, main_sha256=No
         print('No %s yet. Building the boot snapshots -- one cold boot from\n'
               'reset, about 400M instructions, so expect a few minutes. This\n'
               'happens once.\n' % snapshot, flush=True)
-    r = subprocess.run([sys.executable, '-m', 'emu.checkpoint', 'make',
-                        LADDER, prefix, syx,
-                        '--sdgate' if sdgate else '--no-sdgate',
-                        '--esdhc' if esdhc else '--no-esdhc'])
+    cmd = [sys.executable, '-m', 'emu.checkpoint', 'make',
+           LADDER, prefix, syx,
+           '--sdgate' if sdgate else '--no-sdgate',
+           '--esdhc' if esdhc else '--no-esdhc']
+    if card_image:
+        cmd += ['--card-image', card_image]
+    r = subprocess.run(cmd)
     if r.returncode != 0 or not os.path.exists(snapshot):
         raise SystemExit('Snapshot build failed; cannot continue.')
     print('\nBuilt %s.\n' % snapshot)

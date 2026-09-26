@@ -50,6 +50,22 @@ from emu.tasks import ready_list  # noqa: E402
 KIT_PTR = 0x80004704
 KIT_LOAD_FN = 0x4002D9C4
 
+# +Drive (docs/findings/14-plus-drive-format.md), watched here so a card-image
+# run's stage log answers "did mounting our image trigger a reformat, and did
+# it mount" without a separate probe: FORMAT_DRIVER is the "INITIALIZING
+# +DRIVE..." header writer, hit only when the firmware decides the card's
+# header is invalid and needs (re)writing; FACTORY_RESET_WORKER is the
+# first-boot worker that calls it. Neither should ever fire against an image
+# whose header this project already wrote correctly. MOUNT_FLAG
+# (`_DAT_44f2bd68`) is the real filesystem's own mounted guard.
+FORMAT_DRIVER = 0x40130F9A
+FACTORY_RESET_WORKER = 0x400334BC
+MOUNT_FLAG = 0x44F2BD68
+CMD18_READ = 0x4012DEDA
+CMD25_WRITE = 0x4012E0C0
+RECORD_RESOLVE = 0x4015B64E  # FUN_4015b64e(id) -- the 128-byte record cache
+READDIR_STEP = 0x40157072  # FUN_40157072 -- FileSystemDirectory's own listing step
+
 
 def u32(m, a):
     try:
@@ -89,6 +105,13 @@ def observe(m, ev, profile, mark, timers):
         "kit_load_fn_hits": mark.get("kit_load_fn", 0),
         "checks": checks,
         "main_os_running": all(checks.values()),
+        "format_driver_hits": mark.get("format_driver", 0),
+        "factory_reset_hits": mark.get("factory_reset_worker", 0),
+        "mount_flag": u32(m, MOUNT_FLAG),
+        "cmd18_hits": mark.get("cmd18_read", 0),
+        "cmd25_hits": mark.get("cmd25_write", 0),
+        "record_resolve_hits": mark.get("record_resolve", 0),
+        "readdir_hits": mark.get("readdir_step", 0),
     }
 
 
@@ -150,6 +173,14 @@ def run(snapshot, out_prefix, stages, syx=None, chunk=200_000, card_image=None):
         if addr is not None:
             at(addr, bump(name))
 
+    # +Drive: see the FORMAT_DRIVER/FACTORY_RESET_WORKER comment above.
+    at(FORMAT_DRIVER, bump("format_driver"))
+    at(FACTORY_RESET_WORKER, bump("factory_reset_worker"))
+    at(CMD18_READ, bump("cmd18_read"))
+    at(CMD25_WRITE, bump("cmd25_write"))
+    at(RECORD_RESOLVE, bump("record_resolve"))
+    at(READDIR_STEP, bump("readdir_step"))
+
     kit_hook = m.uc.hook_add(
         UC_HOOK_CODE, bump("kit_load_fn"), begin=KIT_LOAD_FN, end=KIT_LOAD_FN
     )
@@ -188,7 +219,9 @@ def run(snapshot, out_prefix, stages, syx=None, chunk=200_000, card_image=None):
         results.append(row)
         print(
             "[stage %d] +%d instrs (cum %d) in %.1fs (%.2fM/s) stop=%s "
-            "tasks=%d ready=%d kit_ptr=%s kit_load_hits=%d main_os_running=%s"
+            "tasks=%d ready=%d kit_ptr=%s kit_load_hits=%d main_os_running=%s "
+            "format_driver_hits=%d factory_reset_hits=%d mount_flag=%s "
+            "cmd18=%d cmd25=%d record_resolve=%d readdir=%d"
             % (
                 i,
                 done,
@@ -201,6 +234,13 @@ def run(snapshot, out_prefix, stages, syx=None, chunk=200_000, card_image=None):
                 hex(row["kit_ptr"]) if row["kit_ptr"] else None,
                 row["kit_load_fn_hits"],
                 row["main_os_running"],
+                row["format_driver_hits"],
+                row["factory_reset_hits"],
+                hex(row["mount_flag"]) if row["mount_flag"] else row["mount_flag"],
+                row["cmd18_hits"],
+                row["cmd25_hits"],
+                row["record_resolve_hits"],
+                row["readdir_hits"],
             ),
             flush=True,
         )
