@@ -349,10 +349,15 @@ class Emulator(threading.Thread):
             # sdgate/esdhc are not passed here -- build()'s own defaults
             # (True) supply the SD storage models, so they come along with
             # every call site that does not explicitly override them.
+            # A snapshot saved by tools/dt2_reach_running.py (running.snap)
+            # carries its Pits/Dtims cadence as a deferred 'timers'
+            # component; it is restored below instead of building fresh
+            # timers.
             m, ev, st, pc, inq, at = build(self.snapshot, unblock=True,
                                            softfloat=True, bitmap=True,
                                            dsp=True, on_pixel=on_pixel,
                                            weakptr=self.weakptr, slc=self.slc,
+                                           deferred_components=('timers',),
                                            **extra)
             if self.patch_machine:
                 sys.path.insert(0, os.path.join(os.path.dirname(
@@ -423,9 +428,14 @@ class Emulator(threading.Thread):
         # it that task makes exactly one pass through its message loop and
         # waits forever, which is what this window used to show. See
         # emu/dtim.py.
-        intro = intro_running(m, profile.intro_pit3_isr)
-        pits = Timers(Pits(m, hold=intro),
-                      Dtims(m, channels=(3,), hold=intro))
+        restored = ev['restore_checkpoint_timers']()
+        if restored is not None:
+            pits = restored
+        else:
+            intro = intro_running(m, profile.intro_pit3_isr)
+            pits = Timers(Pits(m, hold=intro),
+                          Dtims(m, channels=(3,), hold=intro))
+            ev['checkpoint_components']['timers'] = pits
         # `pits.held` is exactly "the intro is still running", so a snapshot
         # taken after it already belongs to the OS and the panel buffer is the
         # screen from the first frame.
