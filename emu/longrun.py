@@ -36,13 +36,19 @@ PEND_A, PEND_B = 0x4000141a, 0x400013a6   # sem object is the arg at 4(a7)
 
 
 def register_esdhc_checkpoint_component(machine, events, profile, components,
-                                         card_image=None):
+                                         card_image=None, command_log=False):
     """Install eSDHC and register its host-side card state for snapshots.
 
     card_image: path to a +Drive image built by tools/plusdrive.py. Mmapped
     read-only via emu.esdhc.Card.from_file; writes during the run go to the
     in-RAM overlay (captured by the checkpoint below) and this file is never
     modified. None (default): a blank, all-zero card, as before.
+
+    command_log=True turns on Esdhc's opt-in per-command diagnostic log
+    (see emu/esdhc.py); off by default, since it costs a handful of extra
+    guest reads per command and is meant for tracing a stuck SD/+Drive
+    session, not ordinary runs. profile.current_tcb is passed through so
+    each logged command can also say which task issued it.
     """
     from emu.esdhc import Card, Esdhc
 
@@ -54,6 +60,12 @@ def register_esdhc_checkpoint_component(machine, events, profile, components,
         cmd_sem=profile.sd_cmd_sem,
         data_sem=profile.sd_data_sem,
         dma_sem=profile.sd_dma_sem,
+        command_log=command_log,
+        # getattr, not profile.current_tcb: a test double built as a plain
+        # SimpleNamespace (tests/test_checkpoint_state.py) does not carry
+        # every emu.symbols.Profile field, and this one is optional (used
+        # only to label a command-log entry with its issuing task).
+        current_tcb=getattr(profile, 'current_tcb', None),
     )
     events['esdhc'] = model
     components['esdhc'] = model
@@ -64,7 +76,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
           unblock=False, softfloat=False, bitmap=False, on_pixel=None,
           unblock_except=(), edma=True, real_sleep=False, dsp=False,
           srtrap=False, weakptr=False, slc=False, sdgate=True, esdhc=True,
-          card_image=None,
+          card_image=None, esdhc_command_log=False,
           modeled_vectors=None,
           trace=None, trace_path=None, trace_ranges=(), trace_registers=None,
           deferred_components=(), idle_yield=20000, ssi0_request_hz=None,
@@ -229,6 +241,12 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
     plusdrive.py's own) that's already valid at the point the snapshot was
     taken skips that formatter and its samples should already be visible to
     the SRC browser once running.
+
+    ``esdhc_command_log=True`` turns on Esdhc's opt-in per-command diagnostic
+    log (command index, block address/count, direction, DATPORT-tied eDMA
+    bytes moved, which of cmd_sem/data_sem/dma_sem this command actually
+    posted, and the guest pc/task that issued it); see emu/esdhc.py and
+    tools/guirun.py's --esdhc-log. Off by default.
 
     ``ssi0_request_hz`` opts into the separate SSI0/eDMA48/50 event source.
     The explicit rate is mandatory because the board's external SSI_CLKIN
@@ -607,7 +625,8 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
         # Constructing afterward silently reset in-flight register state on
         # every resume.
         register_esdhc_checkpoint_component(
-            m, ev, profile, checkpoint_components, card_image=card_image
+            m, ev, profile, checkpoint_components, card_image=card_image,
+            command_log=esdhc_command_log,
         )
     deferred_restore = DeferredComponentRestore(deferred_components)
 

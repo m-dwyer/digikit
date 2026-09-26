@@ -77,6 +77,7 @@ from emu.checkpoint import save_longrun
 from emu.dtim import Dtims, Timers
 from emu import config, panel, symbols, taskprof, uitrace
 from emu import device as devices, panelin
+from emu.esdhc import format_command_log_entry
 from emu.pit import INSTR_PER_SEC, Pits, intro_running
 from unicorn import UC_HOOK_BLOCK, UC_HOOK_MEM_WRITE, UcError
 from unicorn.m68k_const import UC_M68K_REG_A7, UC_M68K_REG_PC
@@ -154,6 +155,35 @@ def parse_args(argv):
     p.add_argument('--trace-ui-json')
     # same as emu/gui.py's PANEL_DWELL_CHUNKS
     p.add_argument('--panel-dwell', type=int, default=16)
+    # --card-image PATH serves a +Drive image built by tools/plusdrive.py
+    # behind the eSDHC/eMMC model instead of the default blank, all-zero
+    # card (see emu.esdhc.Card.from_file) -- same as emu/gui.py's flag of
+    # the same name, so a GUI session using it can be reproduced here.
+    p.add_argument('--card-image', default=None,
+                    help='+Drive image (tools/plusdrive.py) behind the '
+                         'eSDHC/eMMC model, as emu/gui.py --card-image')
+    # --esdhc-log turns on Esdhc's opt-in per-command diagnostic log (see
+    # emu/esdhc.py): command index, block address/count, direction,
+    # DATPORT-tied eDMA bytes moved, which completion semaphores actually
+    # posted, and the guest pc/task that issued it. --esdhc-log-from WHEN
+    # only prints entries at or after that instruction count, so a long run
+    # does not drown the rest of the output; the full log is still kept on
+    # ev['esdhc'].command_log regardless of WHEN.
+    p.add_argument('--esdhc-log', action='store_true',
+                    help='print emu/esdhc.py\'s opt-in per-command log')
+    p.add_argument('--esdhc-log-from', type=parse_when, default=0,
+                    help='only print --esdhc-log entries at/after WHEN '
+                         'instructions')
+    # --stall-window N: if the mainloop counter (profile.mainloop) does not
+    # advance for this many instructions, dump a diagnostic at the end of
+    # the run -- pc, current task (current_tcb), and the last --pend-ring
+    # sem_pend/pend_b calls -- instead of just the usual end-of-run summary.
+    # This is the generic "what is the UI task blocked on" answer emu/gui.py
+    # itself cannot give headlessly.
+    p.add_argument('--stall-window', type=parse_when, default=20_000_000)
+    p.add_argument('--pend-ring', type=int, default=32,
+                    help='how many recent sem_pend/pend_b calls to keep '
+                         'for the stall diagnostic')
     return p.parse_args(argv)
 
 
@@ -358,6 +388,11 @@ def main():
     if args.idle_yield is not None:
         extra['idle_yield'] = args.idle_yield
         print('[guirun] idle-yield %d' % args.idle_yield)
+    if args.card_image:
+        extra['card_image'] = args.card_image
+        print('[guirun] card image: %s' % args.card_image)
+    if args.esdhc_log:
+        extra['esdhc_command_log'] = True
     m, ev, st, pc, inq, at = build(args.snapshot, unblock=args.unblock,
                                     softfloat=True,
                                     bitmap=True, dsp=True, on_pixel=None,
@@ -469,10 +504,13 @@ def main():
                 pending_ips.append((state['instrs'], post_intro_ips))
         at(profile.intro_done, handover)
 
-    state = {'instrs': 0, 'mainloop': 0, 'jobs': 0, 'terminal': False, 'seq': 0}
+    state = {'instrs': 0, 'mainloop': 0, 'jobs': 0, 'terminal': False, 'seq': 0,
+             'last_mainloop_change': 0}
     if profile.mainloop is not None:
-        at(profile.mainloop, lambda uc, a, s, d: state.__setitem__(
-            'mainloop', state['mainloop'] + 1))
+        def on_mainloop(uc, a, s, d):
+            state['mainloop'] += 1
+            state['last_mainloop_change'] = state['instrs']
+        at(profile.mainloop, on_mainloop)
     if profile.job_pump is not None:
         at(profile.job_pump, lambda uc, a, s, d: state.__setitem__(
             'jobs', state['jobs'] + 1))
@@ -482,6 +520,70 @@ def main():
             state['terminal'] = True
             print('[guirun] TERMINAL LOOP reached at ~%dM' % (state['instrs'] // 1_000_000))
     at(0x4012d2fa, terminal_hit)
+
+    # Generic "what is the currently-running task blocked on" tracer: every
+    # sem_pend/pend_b call, whether or not `unblock` goes on to fake it (see
+    # emu/longrun.py's own `satisfy` hook on the same address -- Unicorn
+    # allows more than one hook per address, same as emu/esdhc.py/emu/edma.py
+    # sharing SERQ). Named against the handful of semaphores this project has
+    # already resolved, so a hang's last pend reads as a name, not just an
+    # address. Used by --stall-window's end-of-run diagnostic.
+    sem_names = {}
+    for _name in ('sd_cmd_sem', 'sd_data_sem', 'sd_dma_sem', 'worker_done_sem',
+                  'display_sem', 'frame_sem', 'completion_sem', 'bq_free_sem',
+                  'bq_ready_sem'):
+        _addr = profile.get(_name)
+        if _addr is not None:
+            sem_names[_addr] = _name
+
+    def sem_label(addr):
+        return sem_names.get(addr, '0x%08x (unnamed)' % addr) if addr else 'NULL'
+
+    pend_ring = collections.deque(maxlen=args.pend_ring)
+    # The ring alone is useless once the system is idling: the 50 Hz RTOS
+    # tick dispatcher (tick_pend) and the idle/queue_recv pend both call
+    # sem_pend far more often than anything interesting does, so a bounded
+    # ring near the end of a long run is pure tick-dispatcher noise (see
+    # HANDOVER for this exact symptom). This unbounded, per-task map instead
+    # remembers each task's OWN most recently seen pend, so "what was the
+    # stalled task last waiting on" survives however long the tick
+    # dispatcher goes on ticking after it.
+    last_pend_by_task = {}
+
+    def on_pend(uc, a, s, d):
+        try:
+            sp = uc.reg_read(UC_M68K_REG_A7)
+            ret, sem = struct.unpack('>II', uc.mem_read(sp, 8))
+        except Exception:
+            return
+        tcb = None
+        if profile.current_tcb is not None:
+            try:
+                tcb = struct.unpack(
+                    '>I', uc.mem_read(profile.current_tcb, 4))[0]
+            except Exception:
+                pass
+        pend_ring.append((state['instrs'], ret, sem, tcb))
+        last_pend_by_task[tcb] = (state['instrs'], ret, sem)
+
+    at(profile.sem_pend, on_pend)
+    if profile.pend_b is not None:
+        at(profile.pend_b, on_pend)
+
+    esdhc_seen = 0
+
+    def drain_esdhc_log():
+        """Print any --esdhc-log entries recorded since the last drain."""
+        nonlocal esdhc_seen
+        if not args.esdhc_log or ev.get('esdhc') is None:
+            return
+        log = ev['esdhc'].command_log
+        for entry in log[esdhc_seen:]:
+            if state['instrs'] >= args.esdhc_log_from:
+                print('[esdhc] ~%dM %s'
+                      % (state['instrs'] // 1_000_000,
+                         format_command_log_entry(entry)))
+        esdhc_seen = len(log)
 
     def drain_input(pc):
         """Apply queued panel input at a chunk boundary. -> the new PC.
@@ -734,6 +836,7 @@ def main():
             async_events=(ssi0,) if ssi0 is not None else (),
         )
         state['instrs'] += executed
+        drain_esdhc_log()
         due, pending_pngs[:] = (
             [e for e in pending_pngs if e[0] <= state['instrs']],
             [e for e in pending_pngs if e[0] > state['instrs']])
@@ -797,6 +900,7 @@ def main():
                 async_events=(ssi0,) if ssi0 is not None else (),
             )
             state['instrs'] += executed
+            drain_esdhc_log()
             break
 
     print('[guirun] end: instrs=%dM terminal=%s tasks=%d pit0=%d pit2=%d '
@@ -843,6 +947,80 @@ def main():
                               for a, b in runs))
         print('[guirun] esdhc log tail: %s'
               % ' '.join('CMD%d@%#x' % (c, a) for c, a in esdhc.log[-12:]))
+        # CMD18 (READ_MULTIPLE_BLOCK) arguments are starting sectors under
+        # sector addressing (emu/esdhc.py's Card docstring); this is "which
+        # blocks did the browser read", independent of --esdhc-log, since
+        # `esdhc.log` is always kept.
+        read_sectors = sorted({arg for idx, arg in esdhc.log if idx == 18})
+        if read_sectors:
+            runs = []
+            for s in read_sectors:
+                if runs and s == runs[-1][1] + 1:
+                    runs[-1] = (runs[-1][0], s)
+                else:
+                    runs.append((s, s))
+            print('[guirun] esdhc CMD18 sectors read (%d reads): %s'
+                  % (len(read_sectors),
+                     ', '.join(('%d' % a) if a == b else ('%d-%d' % (a, b))
+                               for a, b in runs)))
+    if args.esdhc_log and ev.get('esdhc') is not None:
+        # Print every recorded entry once more, unfiltered by
+        # --esdhc-log-from, so a run's full command history is always
+        # available at the end even if --esdhc-log-from trimmed the live
+        # stream.
+        print('[guirun] esdhc command log (%d entries):'
+              % len(ev['esdhc'].command_log))
+        for entry in ev['esdhc'].command_log:
+            print('  ' + format_command_log_entry(entry))
+    stalled = (state['instrs'] - state['last_mainloop_change']
+               >= args.stall_window)
+    if stalled:
+        print('[guirun] STALL: mainloop has not advanced for %dM '
+              'instructions (last change at %dM, now %dM) -- the UI task '
+              'looks blocked, not just slow'
+              % ((state['instrs'] - state['last_mainloop_change']) // 1_000_000,
+                 state['last_mainloop_change'] // 1_000_000,
+                 state['instrs'] // 1_000_000))
+        try:
+            a7 = m.uc.reg_read(UC_M68K_REG_A7)
+        except Exception:
+            a7 = None
+        tcb = None
+        if profile.current_tcb is not None:
+            try:
+                tcb = struct.unpack(
+                    '>I', m.uc.mem_read(profile.current_tcb, 4))[0]
+            except Exception:
+                pass
+        print('[guirun] blocked at pc=0x%08x a7=%s task(tcb)=%s'
+              % (pc, ('0x%08x' % a7) if a7 is not None else '--------',
+                 ('0x%08x' % tcb) if tcb is not None else '--------'))
+        if pend_ring:
+            print('[guirun] last %d sem_pend/pend_b calls (oldest first; '
+                  'usually dominated by the tick dispatcher once the system '
+                  'is idling -- see the per-task table below for the '
+                  'actually interesting one):' % len(pend_ring))
+            for instrs, ret, sem, tcb in pend_ring:
+                print('  ~%dM ret=0x%08x sem=%s task=%s'
+                      % (instrs // 1_000_000, ret, sem_label(sem),
+                         ('0x%08x' % tcb) if tcb is not None else '--------'))
+        else:
+            print('[guirun] no sem_pend/pend_b call was seen at all -- the '
+                  'block is not an RTOS semaphore wait (a spin loop, a fault, '
+                  'or a wait this build does not hook)')
+        if last_pend_by_task:
+            print('[guirun] last pend PER TASK (the tick dispatcher/idle '
+                  'task tick constantly, so a task whose last pend is far '
+                  'BEFORE the stall is the one that stopped running -- that '
+                  'is what the UI blocked on, and `sem` is what should have '
+                  'posted it):')
+            for tcb, (instrs, ret, sem) in sorted(
+                    last_pend_by_task.items(), key=lambda kv: kv[1][0]):
+                print('  task=%s last pended ~%dM ago (at %dM) ret=0x%08x '
+                      'sem=%s'
+                      % (('0x%08x' % tcb) if tcb is not None else '--------',
+                         (state['instrs'] - instrs) // 1_000_000,
+                         instrs // 1_000_000, ret, sem_label(sem)))
     if args.trace_ui_json:
         with open(args.trace_ui_json, 'w') as f:
             json.dump({

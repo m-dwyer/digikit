@@ -261,10 +261,24 @@ class Card:
 
 
 class Esdhc:
-    """The controller. `log` collects (command index, argument) in order."""
+    """The controller. `log` collects (command index, argument) in order.
+
+    `command_log=True` (opt-in; off by default, and never on in the tests
+    above -- it is a diagnostic, not part of the model's proven behaviour)
+    additionally appends a detailed record per XFERTYP write to
+    `self.command_log`: command index, argument (the block address for a
+    block-addressed command), the BLKATTR block count/size the driver
+    programmed, data direction, the eDMA channel armed (if any) and the
+    bytes it actually moved, which completion semaphores this command
+    posted, and -- best-effort, since a synthetic test double's `uc` may not
+    implement `reg_read`/`mem_read` for these -- the guest PC and current
+    TCB pointer (`current_tcb`, an address, per emu/symbols.py) at the
+    moment the command was issued. See `format_command_log_entry`.
+    """
 
     def __init__(self, m, card=None, trace=False, drv_status=None,
-                 cmd_sem=None, data_sem=None, dma_sem=None):
+                 cmd_sem=None, data_sem=None, dma_sem=None,
+                 command_log=False, current_tcb=None):
         from unicorn import UC_HOOK_MEM_WRITE
         self.m = m
         self.uc = m.uc
@@ -275,6 +289,10 @@ class Esdhc:
         self.data_sem = data_sem
         self.dma_sem = dma_sem
         self.log = []
+        self.command_log_enabled = command_log
+        self.current_tcb = current_tcb
+        self.command_log: list[dict] = []
+        self._command_seq = 0
         self.pattern = 0           # last word the host wrote to DATPORT
         self.armed = None          # eDMA channel armed via SERQ for this cmd
         self.dma_bytes = 0
@@ -365,16 +383,38 @@ class Esdhc:
         this controller owns, so the model is correct on the cold-boot path
         too and does not depend on a global bypass. When `unblock` is also
         active this is simply a no-op, since it only acts on counts <= 0.
+
+        -> True if this call actually wrote the count (a real post), False
+        if `sem` is None, unreadable, or already positive -- the last case
+        means an EARLIER post was never consumed by a pend, which the
+        opt-in command log (see `_post_and_log`) surfaces as a diagnostic:
+        it is the signature of a task that stopped pending, not of this
+        model failing to post.
         """
         if sem is None:
-            return
+            return False
         try:
             self.m.ensure(sem)
             count = struct.unpack('>i', bytes(self.uc.mem_read(sem, 4)))[0]
             if count <= 0:
                 self.uc.mem_write(sem, struct.pack('>i', 1))
+                return True
+            return False
         except Exception:
-            pass
+            return False
+
+    def _post_and_log(self, record, sem, name):
+        """`_post(sem)`, and if `record` (the opt-in command log entry, or
+        None) is not None, note the outcome by name: posted, or -- if `sem`
+        is a real address that was already positive -- flagged as such."""
+        posted = self._post(sem)
+        if record is not None:
+            if posted:
+                record['sems_posted'].append(name)
+            elif sem is not None:
+                record['sems_posted'].append(
+                    '(%s already set, not reposted)' % name)
+        return posted
 
     # -- register access -------------------------------------------------
     def _put(self, off, val):
@@ -402,6 +442,27 @@ class Esdhc:
         if cur & (INITA | RSTA | RSTC | RSTD):
             self._put(SYSCTL, cur & ~(INITA | RSTA | RSTC | RSTD))
 
+    def _current_pc(self):
+        """Best-effort guest PC, for the opt-in command log. None if `uc`
+        (a synthetic test double, in the unit tests) does not support it."""
+        try:
+            from unicorn.m68k_const import UC_M68K_REG_PC
+            return self.uc.reg_read(UC_M68K_REG_PC)
+        except Exception:
+            return None
+
+    def _current_task(self):
+        """Best-effort current TCB pointer (see emu/symbols.py's
+        `current_tcb`), for the opt-in command log. None if this Esdhc was
+        not given one, or the read fails."""
+        if self.current_tcb is None:
+            return None
+        try:
+            return struct.unpack(
+                '>I', bytes(self.uc.mem_read(self.current_tcb, 4)))[0]
+        except Exception:
+            return None
+
     def _on_xfertyp(self, uc, typ, addr, size, val, data):
         """Writing XFERTYP issues the command.
 
@@ -412,11 +473,34 @@ class Esdhc:
         idx = (xfer >> 24) & 0x3F
         arg = self._get(CMDARG)
         self.log.append((idx, arg))
+        record = None
+        if self.command_log_enabled:
+            blkattr = self._get(BLKATTR)
+            record = {
+                'seq': self._command_seq,
+                'cmd': idx,
+                'arg': arg,
+                'blkattr_count': (blkattr >> 16) & 0xFFFF,
+                'blkattr_size': blkattr & 0x1FFF,
+                'direction': ('read' if (xfer & DPSEL) and (xfer & DTDSEL)
+                              else 'write' if xfer & DPSEL else 'none'),
+                'armed': self.armed,
+                'requested_bytes': self._dma_size(),
+                'dma_bytes': 0,
+                'payload_available': None,
+                'truncated': None,
+                'sems_posted': [],
+                'pc': self._current_pc(),
+                'task': self._current_task(),
+            }
+            self._command_seq += 1
         r0, r1, r2, r3 = self.card.command(idx, arg)
         self._put(CMDRSP0, r0)
         self._put(CMDRSP1, r1)
         self._put(CMDRSP2, r2)
         self._put(CMDRSP3, r3)
+        if record is not None:
+            record['resp0'] = r0
         # Command completes instantly: never leave the inhibit bits set, or
         # the driver's `(PRSSTAT & 3) == 0` waits never finish.
         self._clr_bits(PRSSTAT, CIHB | CDIHB | DLA)
@@ -429,31 +513,56 @@ class Esdhc:
                 self._set_bits(PRSSTAT, BREN)
                 self._set_bits(IRQSTAT, BRR)
                 self._put(DATPORT, self.card.read_word(idx, self.pattern))
-                payload = self.card.data_for(idx, arg, self._dma_size())
+                requested = self._dma_size()
+                payload = self.card.data_for(idx, arg, requested)
+                if record is not None:
+                    record['payload_available'] = payload is not None
+                    record['truncated'] = bool(
+                        payload is not None and requested
+                        and len(payload) < requested)
                 if payload is not None and self.armed is not None:
-                    n = self._dma_out(payload)
+                    n = self._dma_out(payload, record)
                     self.armed = None
                     # Channel 59's completion ISR posts this before the
                     # eSDHC transfer-complete ISR posts data_sem.  Model the
                     # two producers separately instead of satisfying every
                     # blocked wait globally.
-                    self._post(self.dma_sem)
+                    self._post_and_log(record, self.dma_sem, 'dma_sem')
+                    if record is not None:
+                        record['dma_bytes'] = n
                     if self.trace:
                         print('[esdhc]   CMD%d -> %d bytes by eDMA' % (idx, n))
+                elif self.armed is None and record is not None:
+                    # DPSEL asked for a data phase but no eDMA channel was
+                    # armed for it -- the SERQ write that should have armed
+                    # channel 59 before this XFERTYP either did not happen or
+                    # named a different channel. dma_sem is never posted in
+                    # this case (there is no transfer to complete), which is
+                    # a real difference from the payload==None case below.
+                    record['sems_posted'].append('(dma_sem NOT posted: no '
+                                                  'channel armed)')
+                elif payload is None and record is not None:
+                    # DPSEL/DTDSEL asked for card data this model does not
+                    # generate for command `idx` (Card.data_for only knows
+                    # 8 and 18) -- dma_sem is skipped for the same reason.
+                    record['sems_posted'].append('(dma_sem NOT posted: no '
+                                                  'payload for CMD%d)' % idx)
                 # The bring-up pends on this one after the EXT_CSD DMA read.
-                self._post(self.data_sem)
+                self._post_and_log(record, self.data_sem, 'data_sem')
             else:                                   # host -> card
                 self._set_bits(PRSSTAT, BWEN)
                 self._set_bits(IRQSTAT, BWR)
                 if self.armed is not None:
-                    payload = self._dma_in()
+                    payload = self._dma_in(record)
                     self.card.write_data(idx, arg, payload)
                     self.armed = None
-                    self._post(self.dma_sem)
+                    self._post_and_log(record, self.dma_sem, 'dma_sem')
+                    if record is not None:
+                        record['dma_bytes'] = len(payload)
                     if self.trace:
                         print('[esdhc]   CMD%d <- %d bytes by eDMA'
                               % (idx, len(payload)))
-                self._post(self.data_sem)
+                self._post_and_log(record, self.data_sem, 'data_sem')
         # The ISR's bookkeeping. 0x4011fe10 pre-sets this to 1 and returns it
         # after the wait; `unblock` satisfies the wait, so without this the
         # caller always sees "still in progress".
@@ -464,22 +573,27 @@ class Esdhc:
         self.uc.mem_write(self.drv_status, struct.pack('>I', 0))
         # The command-completion half of the ISR: this is what lets
         # FUN_4011d5b4 return from its sem_pend on the cold-boot path.
-        self._post(self.cmd_sem)
+        self._post_and_log(record, self.cmd_sem, 'cmd_sem')
         if self.trace:
             print('[esdhc] CMD%-2d arg=%#010x xfertyp=%#010x -> %#010x'
                   % (idx, arg, xfer, r0))
+        if record is not None:
+            self.command_log.append(record)
 
     def _on_serq(self, uc, typ, addr, size, val, data):
         """Remember when the eSDHC's channel is armed. Bit 6 means all."""
         if not (val & 0x40) and (val & 0x3F) == DMA_CHAN:
             self.armed = DMA_CHAN
 
-    def _dma_out(self, payload):
+    def _dma_out(self, payload, record=None):
         """Push `payload` through the armed channel's TCD, as the eDMA would.
 
         SOFF is zero for these transfers -- the source is the DATPORT register
         read over and over -- and DOFF equals NBYTES, so the destination is
-        contiguous and this is a straight copy plus TCD bookkeeping.
+        contiguous and this is a straight copy plus TCD bookkeeping. If
+        `record` (an opt-in command-log entry, or None) is given, the
+        channel and destination address of this DATPORT-tied transfer are
+        recorded onto it.
         """
         if self.armed is None:
             return 0
@@ -493,6 +607,9 @@ class Esdhc:
         if not total:
             return 0
         dst = u32(DADDR)
+        if record is not None:
+            record['dma_channel'] = self.armed
+            record['dma_dst'] = dst
         chunk = payload[:total].ljust(total, b'\x00')
         # Host-side mem_write does not demand-map; see __init__'s note on
         # Machine.ensure. dst is the firmware's EXT_CSD buffer, which the
@@ -528,8 +645,10 @@ class Esdhc:
         )[0]
         return citer * nbytes
 
-    def _dma_in(self):
-        """Pull the armed channel's host buffer into the card."""
+    def _dma_in(self, record=None):
+        """Pull the armed channel's host buffer into the card. If `record`
+        (an opt-in command-log entry, or None) is given, the channel and
+        source address of this DATPORT-tied transfer are recorded onto it."""
         if self.armed is None:
             return b''
         tcd = TCD_BASE + self.armed * 0x20
@@ -548,6 +667,9 @@ class Esdhc:
 
         citer, nbytes = u16(CITER) & 0x7FFF, u32(NBYTES)
         src, soff = u32(SADDR), s16(SOFF)
+        if record is not None:
+            record['dma_channel'] = self.armed
+            record['dma_src'] = src
         payload = bytearray()
         for _ in range(citer):
             payload.extend(self.uc.mem_read(src, nbytes))
@@ -566,3 +688,29 @@ class Esdhc:
     def __repr__(self):
         return 'Esdhc(commands=%d, %s)' % (
             len(self.log), ' '.join('CMD%d' % c for c, _ in self.log[:16]))
+
+
+def format_command_log_entry(entry):
+    """One line for a `command_log` entry (see `Esdhc.__doc__`)."""
+
+    def hx(v):
+        return '--------' if v is None else '0x%08x' % v
+
+    dma = ''
+    if entry.get('dma_channel') is not None:
+        addr = entry.get('dma_dst', entry.get('dma_src'))
+        dma = ' dma=ch%d@%s+%dB' % (entry['dma_channel'], hx(addr),
+                                    entry['dma_bytes'])
+    flags = []
+    if entry['truncated']:
+        flags.append('TRUNCATED')
+    if entry['payload_available'] is False:
+        flags.append('NO-PAYLOAD')
+    return ('#%-4d CMD%-2d arg=%s dir=%-5s blk=%d*%d req=%dB%s resp0=%s '
+            'sems=[%s] pc=%s task=%s%s'
+            % (entry['seq'], entry['cmd'], hx(entry['arg']),
+               entry['direction'], entry['blkattr_count'],
+               entry['blkattr_size'], entry['requested_bytes'], dma,
+               hx(entry.get('resp0')), ', '.join(entry['sems_posted']),
+               hx(entry['pc']), hx(entry['task']),
+               ' ' + '+'.join(flags) if flags else ''))
