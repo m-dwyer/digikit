@@ -92,7 +92,7 @@ def observe(m, ev, profile, mark, timers):
     }
 
 
-def run(snapshot, out_prefix, stages, syx=None, chunk=200_000):
+def run(snapshot, out_prefix, stages, syx=None, chunk=200_000, card_image=None):
     with open(config.main_image(), "rb") as fh:
         main_img = fh.read()
     profile = symbols.resolve(main_img)
@@ -106,6 +106,8 @@ def run(snapshot, out_prefix, stages, syx=None, chunk=200_000):
     )
     if syx:
         build_kwargs["syx"] = syx
+    if card_image:
+        build_kwargs["card_image"] = card_image
     m, ev, st, pc, inq, at = build(snapshot, **build_kwargs)
 
     # A snapshot this tool saved carries its own Pits/Dtims cadence (channels,
@@ -243,12 +245,27 @@ def parse_args(argv=None):
     )
     p.add_argument("--syx")
     p.add_argument("--chunk", type=lambda s: int(s, 0), default=200_000)
+    p.add_argument(
+        "--card-image",
+        dest="card_image",
+        default=None,
+        help="+Drive image built by tools/plusdrive.py to serve behind the "
+        "eSDHC/eMMC model (see emu.esdhc.Card.from_file); default: the "
+        "blank, all-zero card",
+    )
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    run(args.snapshot, args.out, args.stages, syx=args.syx, chunk=args.chunk)
+    run(
+        args.snapshot,
+        args.out,
+        args.stages,
+        syx=args.syx,
+        chunk=args.chunk,
+        card_image=args.card_image,
+    )
     return 0
 
 

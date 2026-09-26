@@ -54,6 +54,8 @@ CLEAN = [
     "tests/test_sharcldr.py",
     "tests/test_types.py",
     "tools/dt2_reach_running.py",
+    "tools/gen_test_samples.py",
+    "tools/plusdrive.py",
     "tools/sharc.py",
     "tools/sharc_armpath.py",
     "tools/sharc_calltrace.py",

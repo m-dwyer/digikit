@@ -144,12 +144,13 @@ class Emulator(threading.Thread):
                  patch_machine: bool | tuple[str, ...] = False,
                  patch_eighth=7, patch_machine_spec=None,
                  panel_dwell=PANEL_DWELL_CHUNKS, ips_at=(),
-                 post_intro_ips=4 * INSTR_PER_SEC):
+                 post_intro_ips=4 * INSTR_PER_SEC, card_image=None):
         super().__init__()
         self.snapshot = snapshot
         self.weakptr = weakptr
         self.slc = slc
         self.syx = syx
+        self.card_image = card_image
         self.patch_machine = patch_machine
         self.patch_eighth = patch_eighth
         self.patch_machine_spec = patch_machine_spec
@@ -343,6 +344,8 @@ class Emulator(threading.Thread):
             # spin at 0x400cf4ec on its very first transfer and none of the
             # five jobs queued at boot ever runs. See emu/dsp.py.
             extra = {'syx': self.syx} if self.syx else {}
+            if self.card_image:
+                extra['card_image'] = self.card_image
             # sdgate/esdhc are not passed here -- build()'s own defaults
             # (True) supply the SD storage models, so they come along with
             # every call site that does not explicitly override them.
@@ -1082,7 +1085,7 @@ class App(tk.Tk):
                  patch_machine: bool | tuple[str, ...] = False,
                  patch_eighth=7, patch_machine_spec=None,
                  panel_dwell=PANEL_DWELL_CHUNKS, ips_at=(),
-                 post_intro_ips=4 * INSTR_PER_SEC):
+                 post_intro_ips=4 * INSTR_PER_SEC, card_image=None):
         super().__init__()
         self.title('Hardware-style emulator')
         self.configure(bg='#15181d')
@@ -1134,6 +1137,7 @@ class App(tk.Tk):
         self.panel_dwell = panel_dwell
         self.ips_at = ips_at
         self.post_intro_ips = post_intro_ips
+        self.card_image = card_image
         self.shown = -1
         self.replay = None          # (frames, index, next_due) while replaying
         self.start()
@@ -1149,7 +1153,8 @@ class App(tk.Tk):
                             patch_machine_spec=self.patch_machine_spec,
                             panel_dwell=self.panel_dwell,
                             ips_at=self.ips_at,
-                            post_intro_ips=self.post_intro_ips)
+                            post_intro_ips=self.post_intro_ips,
+                            card_image=self.card_image)
         self.emu.start()
 
     def send_input(self, kind, code, arg):
@@ -1356,6 +1361,14 @@ if __name__ == '__main__':
         i = argv.index('--syx')
         syx = argv[i + 1]
         del argv[i:i + 2]
+    # --card-image PATH serves a +Drive image built by tools/plusdrive.py
+    # behind the eSDHC/eMMC model instead of the default blank, all-zero
+    # card (see emu.esdhc.Card.from_file).
+    card_image = None
+    if '--card-image' in argv:
+        i = argv.index('--card-image')
+        card_image = argv[i + 1]
+        del argv[i:i + 2]
     # --ips-at WHEN:N (repeatable) changes the timer rate to N instructions
     # per emulated second once instruction count WHEN is reached. WHEN and N
     # both accept a plain integer or an M-suffixed count (80M, 18.72M).
@@ -1393,4 +1406,4 @@ if __name__ == '__main__':
         realtime=realtime, patch_machine=patch_machine,
         patch_eighth=patch_eighth, patch_machine_spec=patch_machine_spec,
         panel_dwell=panel_dwell, ips_at=ips_at,
-        post_intro_ips=post_intro_ips).mainloop()
+        post_intro_ips=post_intro_ips, card_image=card_image).mainloop()

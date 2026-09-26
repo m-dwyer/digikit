@@ -510,6 +510,7 @@ def run(
     poke_track_types: tuple[tuple[int, int], ...] = (),
     watch_mem: tuple[tuple[int, int], ...] = (),
     pre_instrs: int = 0,
+    card_image: str | None = None,
 ) -> dict:
     if kind not in ("idle", "note", "play"):
         raise ValueError("kind must be 'idle', 'note' or 'play', got %r" % (kind,))
@@ -540,6 +541,8 @@ def run(
     )
     if syx:
         build_kwargs["syx"] = syx
+    if card_image:
+        build_kwargs["card_image"] = card_image
     try:
         m, ev, _st, pc, _inq, at = build(snapshot, **build_kwargs)
     except RuntimeError as exc:
@@ -725,6 +728,14 @@ def parse_args(argv=None):
     )
     p.add_argument("--instrs", type=lambda s: int(s, 0), default=2_000_000)
     p.add_argument("--syx")
+    p.add_argument(
+        "--card-image",
+        dest="card_image",
+        default=None,
+        help="+Drive image built by tools/plusdrive.py to serve behind the "
+        "eSDHC/eMMC model (see emu.esdhc.Card.from_file); default: the "
+        "blank, all-zero card",
+    )
     p.add_argument("--ssi0-hz", type=int, default=1000)
     p.add_argument("--trig-at", type=lambda s: int(s, 0), default=None)
     p.add_argument(
@@ -791,6 +802,7 @@ def main(argv=None) -> int:
         kind=args.kind,
         instrs=args.instrs,
         syx=args.syx,
+        card_image=args.card_image,
         ssi0_hz=args.ssi0_hz,
         trig_at=args.trig_at,
         trig_track=args.trig_track,

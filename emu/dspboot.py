@@ -150,7 +150,7 @@ def build_flash(syx_path, size=0x1000000):
 def run(syx_path, main_img, limit=120_000_000, tick_vec=32, tick_every=20000,
         patch_sem=True, patch_depack=True, verbose=False, stall_window=3_000_000,
         extra_hook=None, fast=True, resume_from=None, machine_out=None,
-        pre_start=None, sdgate=True, esdhc=True):
+        pre_start=None, sdgate=True, esdhc=True, card_image=None):
     """resume_from: path to a snapshot (see emu/snapshot.py). Loads registers
     and memory instead of starting at ENTRY, but installs the *same* hooks, so
     a resumed run behaves identically to the equivalent straight run. Without
@@ -170,7 +170,11 @@ def run(syx_path, main_img, limit=120_000_000, tick_vec=32, tick_every=20000,
     Pass sdgate=False and/or esdhc=False for the old unmodelled-storage
     behaviour.
     machine_out: if given, receives 'm' (the Machine) and 'st' (the stats
-    dict) before emu_start is called, so a pre_start hook can see both."""
+    dict) before emu_start is called, so a pre_start hook can see both.
+    card_image: path to a +Drive image built by tools/plusdrive.py. Passed
+    through to emu.esdhc.Card.from_file, which mmaps it read-only; writes
+    during the run go to the in-RAM overlay and the file itself is never
+    modified. Only meaningful when esdhc=True; ignored otherwise."""
     """fast=True (default): FF1/MOVEC and every HOT_ADDRS side effect are
     registered as per-address Unicorn hooks (begin=end=addr) instead of one
     global UC_HOOK_CODE that runs Python on every instruction and then
@@ -362,9 +366,10 @@ def run(syx_path, main_img, limit=120_000_000, tick_vec=32, tick_every=20000,
         from emu.gpio import SdGate
         m.sdgate = SdGate(m)
     if esdhc:
-        from emu.esdhc import Esdhc
+        from emu.esdhc import Card, Esdhc
+        card = Card.from_file(card_image) if card_image else None
         # cmd_sem/data_sem are per-image for the same reason drv_status is.
-        m.esdhc = Esdhc(m, drv_status=profile.sd_status,
+        m.esdhc = Esdhc(m, card=card, drv_status=profile.sd_status,
                         cmd_sem=profile.sd_cmd_sem, data_sem=profile.sd_data_sem)
 
     m.install_mmio()

@@ -35,12 +35,21 @@ USR8, UDR8         = 0xEC070004, 0xEC07000C
 PEND_A, PEND_B = 0x4000141a, 0x400013a6   # sem object is the arg at 4(a7)
 
 
-def register_esdhc_checkpoint_component(machine, events, profile, components):
-    """Install eSDHC and register its host-side card state for snapshots."""
-    from emu.esdhc import Esdhc
+def register_esdhc_checkpoint_component(machine, events, profile, components,
+                                         card_image=None):
+    """Install eSDHC and register its host-side card state for snapshots.
 
+    card_image: path to a +Drive image built by tools/plusdrive.py. Mmapped
+    read-only via emu.esdhc.Card.from_file; writes during the run go to the
+    in-RAM overlay (captured by the checkpoint below) and this file is never
+    modified. None (default): a blank, all-zero card, as before.
+    """
+    from emu.esdhc import Card, Esdhc
+
+    card = Card.from_file(card_image) if card_image else None
     model = Esdhc(
         machine,
+        card=card,
         drv_status=profile.sd_status,
         cmd_sem=profile.sd_cmd_sem,
         data_sem=profile.sd_data_sem,
@@ -55,6 +64,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
           unblock=False, softfloat=False, bitmap=False, on_pixel=None,
           unblock_except=(), edma=True, real_sleep=False, dsp=False,
           srtrap=False, weakptr=False, slc=False, sdgate=True, esdhc=True,
+          card_image=None,
           modeled_vectors=None,
           trace=None, trace_path=None, trace_ranges=(), trace_registers=None,
           deferred_components=(), idle_yield=20000, ssi0_request_hz=None,
@@ -210,6 +220,15 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
     reaches MAIN_OS_RUNNING both with and without them, so turning them on
     does not regress the previously-working build. Pass sdgate=False and/or
     esdhc=False to get the old unmodelled-storage behaviour back.
+
+    ``card_image`` points at a +Drive image built by tools/plusdrive.py
+    (docs/findings/14-plus-drive-format.md); only meaningful with
+    esdhc=True. None (default): the blank, all-zero card from before this
+    parameter existed -- first boot then runs the firmware's own "Factory
+    reset" formatter, same as always. A firmware-formatted image (real or
+    plusdrive.py's own) that's already valid at the point the snapshot was
+    taken skips that formatter and its samples should already be visible to
+    the SRC browser once running.
 
     ``ssi0_request_hz`` opts into the separate SSI0/eDMA48/50 event source.
     The explicit rate is mandatory because the board's external SSI_CLKIN
@@ -588,7 +607,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
         # Constructing afterward silently reset in-flight register state on
         # every resume.
         register_esdhc_checkpoint_component(
-            m, ev, profile, checkpoint_components
+            m, ev, profile, checkpoint_components, card_image=card_image
         )
     deferred_restore = DeferredComponentRestore(deferred_components)
 
@@ -990,7 +1009,7 @@ def spin(m, pc, instrs, chunk=500_000, on_chunk=None, tick=False, pits=None,
 def main(snapshot, instrs, chunk=500_000, send=b'', unblock=False, fast=False,
          sharc_process=False, sharc_backend='stub', sharc_audio_mode='silence',
          sharc_python='pypy', sharc_advance_every=None, ssi0_request_hz=None,
-         ssi0_legacy_upgrade=False):
+         ssi0_legacy_upgrade=False, card_image=None):
     """Resume `snapshot` and run `instrs` instructions. -> (m, ev, done, dt, stop).
 
     ``sharc_process=True`` wires an `emu.sharc_peer.SharcServerPeer` (see that
@@ -1030,7 +1049,8 @@ def main(snapshot, instrs, chunk=500_000, send=b'', unblock=False, fast=False,
         }
 
     m, ev, st, pc, inq, at = build(snapshot, send, unblock=unblock,
-                                   softfloat=fast, bitmap=fast, **build_kwargs)
+                                   softfloat=fast, bitmap=fast,
+                                   card_image=card_image, **build_kwargs)
     if peer is not None:
         ev['sharc_peer'] = peer
     t0 = time.time()
@@ -1087,6 +1107,9 @@ def parse_args(argv=None):
     p.add_argument('--ssi0-legacy-upgrade', action='store_true',
                     help='claim a pre-existing snapshot\'s already-programmed '
                          'SSI0 TCDs (see emu.longrun.build\'s docstring)')
+    p.add_argument('--card-image', default=None,
+                    help='+Drive image built by tools/plusdrive.py to serve '
+                         'behind the eSDHC/eMMC model (see emu.esdhc.Card.from_file)')
     return p.parse_args(argv)
 
 
@@ -1099,7 +1122,8 @@ if __name__ == '__main__':
         sharc_backend=args.sharc_backend, sharc_audio_mode=args.sharc_audio_mode,
         sharc_python=args.sharc_python, sharc_advance_every=args.sharc_advance_every,
         ssi0_request_hz=args.ssi0_request_hz,
-        ssi0_legacy_upgrade=args.ssi0_legacy_upgrade)
+        ssi0_legacy_upgrade=args.ssi0_legacy_upgrade,
+        card_image=args.card_image)
     print('\n=== %d instrs in %.0fs (%.2fM/s) stop=%s ===' % (done, dt, done/dt/1e6, stop))
     print('new tasks : %d' % len(ev['tasks']))
     print('prints    : %d' % len(ev['prints']))

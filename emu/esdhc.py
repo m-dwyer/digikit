@@ -45,6 +45,8 @@ sends 80 init clocks and clears itself; bits 24-26 RSTA/RSTC/RSTD are software
 resets that do the same. Backed by plain RAM they read back whatever was
 written, and `0x4012001e` spins forever -- measured at 36,988,467 reads.
 """
+import mmap
+import os
 import struct
 
 from emu.edma import (
@@ -171,6 +173,7 @@ class Card:
     def __init__(self, image=None, capacity_blocks=0x00760000, slc=True):
         self.image = image
         self.blocks = capacity_blocks
+        self._image_file = None  # keeps the fd/mmap alive; see from_file()
         self.ext_csd = ext_csd(capacity_blocks, slc)
         self.rca = 0
         self.selected = False
@@ -180,6 +183,23 @@ class Card:
         # CID/CSD as four longwords each, R2 order {RSP3[23:0],RSP2,RSP1,RSP0}.
         self.cid = [0x00000000, 0x00000000, 0x00000000, 0x00110000]
         self.csd = [0x00000000, 0x00000000, 0x00000000, 0x00000000]
+
+    @classmethod
+    def from_file(cls, path, slc=True):
+        """A card backed by a real +Drive image file (tools/plusdrive.py),
+        read via mmap so the file's own size (not its content) never has to
+        be loaded into RAM. capacity_blocks is derived from the file's size,
+        so an image built with a non-default --capacity-blocks still reports
+        the right EXT_CSD SEC_COUNT. The file is opened read-only here; all
+        writes during emulation go to the in-RAM overlay (see
+        checkpoint_state), and this file itself is never modified.
+        """
+        f = open(path, "rb")
+        size = os.fstat(f.fileno()).st_size
+        image = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        card = cls(image=image, capacity_blocks=size // 512, slc=slc)
+        card._image_file = f
+        return card
 
     def command(self, idx, arg):
         """-> (resp0, resp1, resp2, resp3). R1 is a card-status word."""

@@ -35,3 +35,8 @@ tools/sharcspec/ghidra/SHARC_VISA/
 
 # Session scratch: probe scripts and large intermediate dumps.
 scratch/
+
+# samples/: WAV files that become the emulated +Drive (tools/plusdrive.py).
+# Never commit real recordings; the two test WAVs are also excluded and
+# regenerated on demand instead (tools/gen_test_samples.py, samples/README.md).
+samples/*.wav
