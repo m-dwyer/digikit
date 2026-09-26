@@ -376,6 +376,125 @@ attribute-byte values for "regular file" vs "directory" at record offsets
 misclassifies our sample entries, trace `FileSystemDirectory::vfunc_7/9/14`
 (`0x40159380`/`0x40159466`/`0x401594ce`) against a value sweep.
 
+## Region 2 has a third, undocumented on-disk structure: a superblock at sector 0x5D8000 **[V]**
+
+Neither this document nor `tools/plusdrive.py` accounted for this before now.
+The real filesystem's mount routine, `FUN_4015a450`
+(`out/ghidra/dt2-1.16-emac/decomp/4015a450_FUN_4015a450.c`, called from the
+boot task `FUN_400cc864` at call site `0x400ccc00`, guarded by
+`DAT_4029e9b0 & 0x10`), is the actual "is this card already mounted, real
+filesystem" check (as opposed to `FUN_4015a424`/`FUN_4015a164(1)`, the
+unconditional (re)format path, called instead when that bit is set):
+
+```c
+undefined4 FUN_4015a450(undefined4 param_1) {
+  _DAT_44f2bd68 = 0;                                    // mount flag
+  FUN_4012deda(0x5d8000, 0x200, &DAT_46f4dcb0);         // CMD18 read, 512 B
+  if (_DAT_46f4dcb0 == 0x656b4653                        // magic
+      && FUN_4015abb2(&DAT_46f4dcb0,0x1fc,0x31323334) == _DAT_46f4deac  // checksum
+      && _DAT_46f4dcb4 - 3U < 2                          // version byte in {3,4}
+      && FUN_4015a124(param_1) >= 0) {
+    _DAT_44f2bd68 = 1;                                   // mount flag = mounted
+    ...
+    return 0;
+  }
+  return 0xffffffff;
+}
+```
+
+The corresponding writer, `FUN_4015a164` (called via `FUN_4015a424`,
+`docs`/finding-07's branch (A)/(B) format path), builds this exact 512-byte
+buffer in RAM at `&DAT_46f4dcb0` and writes it to sector `0x5D8000` with the
+CMD25 primitive (`FUN_4012e0c0`) at the very end of formatting:
+
+| offset | value | meaning |
+|---|---|---|
+| 0x00 | `0x656B4653` | magic |
+| 0x04 | `4` | version (mount accepts 3 or 4) |
+| 0x08 | `0x8000` | = `PAGE` (32 KiB) |
+| 0x0c | `0x58000` | |
+| 0x10 | `0xA0080` | |
+| 0x14 | `0x40` | |
+| 0x18 | `0xC0` | |
+| 0x1c | `0x180` | |
+| 0x20 | `0x16180` | |
+| 0x24 | `0x40` | |
+| 0x28 | `0x20` | |
+| 0x2c | value from `FUN_40155698(0x2c,...)` | |
+| 0x30 | value from `FUN_40155698(0x2c,...)` (called twice; second call's value) | |
+| 0x1fc-0x1ff | not covered by the checksum | reserved/unused by the check |
+
+Fields at 0x2c/0x30 were not independently re-derived (they come from a
+runtime call, not a literal); the rest are literals confirmed directly in
+`FUN_4015a164`'s decompilation. **[O]**: exact meaning of most fields beyond
+0x00/0x04/0x08 is inferred from context (block/page-count-shaped values),
+not proven field-by-field.
+
+**The checksum at 0x2c (RAM-cached as `_DAT_46f4deac`, computed over bytes
+`[0x00:0x1FC]` of the buffer, seed `0x31323334`) is Bob Jenkins' public-domain
+`lookup3.c` `hashlittle` (see `docs/sharc/SOURCES.md`-style citation: Bob
+Jenkins, "lookup3.c", public domain, <https://burtleburtle.net/bob/c/lookup3.c>)
+-- not a vendor algorithm.** Confirmed by matching, instruction-for-
+instruction, the exact rotate constants of Jenkins' `mix()` macro (4, 6, 8,
+16, 19, 4) in the streaming/block path (`FUN_4015aa20`) and `final()` (14,
+11, 25, 16, 4, 14, 24) in the finalizer (`FUN_4015a6dc`), and the classic
+seed pattern `a=b=c=seed+0xDEADBEEF` (`-0x21524111 == 0xDEADBEEF`) in
+`FUN_4015abb2`'s init. For our fixed 508-byte (`0x1FC`) input this is the
+"aligned, length%4==0" path: 42 full 12-byte `mix()` rounds, one trailing
+4-byte word folded into `c` (case 4 of `FUN_4015a6dc`'s switch), then
+`final()`. **[V]**: the algorithm identification is solid (the constants are
+exact and too specific to be coincidence); a byte-exact Python
+reimplementation has not yet been written or round-tripped against a real
+firmware-computed checksum (needs a card that actually reaches this code
+path -- see finding 07's new stall section -- to capture ground truth).
+
+**Consequence for `tools/plusdrive.py`:** even once the finding-07 boot
+stall is fixed, `FUN_4015a450` will reject any image this tool builds today,
+because sector `0x5D8000` is all zero (never written). The tool needs to
+also write this superblock, with a byte-exact `hashlittle` implementation,
+for the real mount path to ever set `_DAT_44f2bd68 = 1`. **[O]**, not yet
+implemented.
+
+## `SampleManager` holds two `Directory` implementations, not one **[D]**
+
+`SampleManager`'s real constructor is Ghidra-mislabeled as
+`std::_Sp_counted_ptr_inplace<SamplePoolDirectory,...>::ctor_dtor`
+(`out/ghidra/dt2-1.16-emac/decomp/40029e7a_...ctor_dtor.c`; its own leading
+comment says it "loads the vtables of SampleManager,
+`_Sp_counted_ptr_inplace<FileSystemDirectory,...>`,
+`_Sp_counted_ptr_inplace<SamplePoolDirectory,...>`" -- i.e. this function
+*is* `SampleManager::SampleManager`, not `SamplePoolDirectory`'s). It
+constructs **both**:
+
+- a `FileSystemDirectory` (the real, path-addressable filesystem this
+  document and `tools/plusdrive.py` target -- region 2), stored at
+  `this+0x81`/`+0x82` (a `shared_ptr` pair), and
+- a `SamplePoolDirectory` (a *different* class from the `MmcFs` pools --
+  region 1), stored at `this+0x83`/`+0x84`,
+
+then picks **one** of the two as "active" (`this+0x7f`) based on a boolean
+(`param_5` in the deepest constructor signature) that could not be pinned
+to a concrete literal by static reading alone: the intermediate forwarding
+layer, `std::_Sp_counted_ptr_inplace<SampleManager,...>::ctor_dtor`
+(`0x4019baa6`), reads its own extra arguments via `in_stack_...`
+pseudo-variables that Ghidra's decompiled C does not show being passed by
+its only caller, `FUN_4019bb28` -- confirmed by reading
+`out/ghidra/dt2-1.16-emac/disasm/4019bb28_FUN_4019bb28.s` directly: the
+decompiled C shows one literal `0` argument where the raw disassembly pushes
+several more stack words. **This mismatch means the decompiled call-argument
+counts for this whole `_Sp_counted_ptr_inplace<X>::ctor_dtor` family cannot
+be trusted without checking the disassembly.** [O]: which `Directory` is
+actually active for the sample browser -- static reading was inconclusive;
+needs a live read of `this+0x7f` against `+0x81`/`+0x83` in a booted
+snapshot (blocked on finding 07's boot stall).
+
+`FileSystemDirectory::ctor_dtor` itself
+(`out/ghidra/dt2-1.16-emac/decomp/40159ca0_FileSystemDirectory__ctor_dtor.c`)
+does no disk I/O -- it just sets the directory's current id (via
+`FUN_401598ec`, presumably `2`, the root) -- so construction alone proves
+nothing about mount state; readdir only happens on actual navigation
+(`FUN_40157072`, already in this document).
+
 ## Open questions
 
 - Exact semantics of record offsets 0x00 bit0, 0x01 bit0, 0x0c bit0
@@ -403,3 +522,16 @@ misclassifies our sample entries, trace `FileSystemDirectory::vfunc_7/9/14`
 - Whether firmware ever re-validates the two filesystem bitmaps
   (`0x5d8040`, `0x5d80c0`-`0x5d8180`) against record/extent data outside the
   allocator (a mount-time consistency check) — not searched for.
+- The sector-`0x5D8000` superblock's fields beyond magic/version, and a
+  byte-exact `hashlittle` implementation for `tools/plusdrive.py` to write
+  a valid one — see the new section above. Blocks the real mount path
+  (`FUN_4015a450`) from ever accepting any image this tool builds.
+- Which `Directory` (`FileSystemDirectory` vs `SamplePoolDirectory`)
+  `SampleManager` actually browses — see the new section above; needs a
+  live RAM read once boot with a card reaches `running` (finding 07).
+- Booting with *any* already-formatted card (ours or the firmware's own)
+  currently stalls before `running` for a reason unrelated to +Drive
+  content — see `docs/findings/07-emulator.md`'s new section. This blocks
+  items 2 and 3 of the +Drive-in-RAM goal (reading the live `Directory` for
+  `hat.wav`, saving a running card snapshot, checking the GUI's font-cache
+  pointers) until it is fixed.

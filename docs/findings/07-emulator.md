@@ -1445,3 +1445,95 @@ graph, static call graph, def/use chains and a backward slice for a
 register at an address, used here to trace the record fields and the
 past-limit `R12` doubling back to their writers before trusting the
 execution numbers.
+
+## Booting with an already-formatted card stalls before `running` **[V][O]**
+
+Every prior 1.16 boot result in this file (the "reaches the main screen"
+section above, `tools/bootcheck.py`, `tools/dt2_reach_running.py`'s existing
+ladders) was run with **no card image** (`emu.esdhc.Card()`, blank/all-zero
+backing) or a card the firmware itself formats fresh during that same boot.
+That path is DT2 1.16's **factory-reset branch**; it is not the only boot
+path, and it turns out to be the *easy* one.
+
+**Discriminator.** A control image was built containing *only* the two
+blocks the firmware itself writes when formatting a blank card -- block 0
+(the `0xBEEFBACE` header) and block `0x800` (the pool-occupancy table, all
+zero on an empty card) -- extracted byte-for-byte from
+`snapshots/dt2-1.16/running.snap`'s `esdhc` card overlay (`emu/snapshot.py`
+`_load_blob`, `components['esdhc']['card_overlay']`; see
+`docs/findings/14-plus-drive-format.md` for the exact bytes). No +Drive
+sample filesystem content at all. Cold-booted with
+`emu.checkpoint.make(..., card_image=...)` (`snapshots/dt2-1.16-control/`)
+and continued with `tools/dt2_reach_running.py` to **1,000,051,798**
+instructions -- 27% past the 785,113,600 instructions a blank-card boot
+needs to reach `running.snap`. Result: `PIT3 firing: False`, `vector 208
+handed to display: False`, `main_os_running: False` throughout;
+`format_driver_hits`, `factory_reset_hits`, `record_resolve_hits`,
+`readdir_hits` all stayed 0, and the eSDHC command log never grew past the
+two initial CMD18 reads (blocks 0 and `0x800`) the whole run. **This proves
+the stall is not specific to +Drive sample content** (task item 1's
+discriminator): a card with nothing but a *valid, already-formatted* header
+stalls identically to one with a full `tools/plusdrive.py` image.
+
+**Root cause, traced statically to a specific branch.** The Main-OS task
+(`FUN_400337ba`, `out/ghidra/dt2-1.16-emac/decomp/400337ba_FUN_400337ba.c`,
+spawned at instruction ~32.4M as the priority-6 task, entry `0x400337ba`)
+decides among three first-run actions right after its own start:
+
+```c
+iVar6 = FUN_4012eb08(mmcfs);              // header state: 0=unread, 1=INVALID, 2=valid
+if ((iVar6 == 1) || (DAT_4029e9b0 & 0x10)) {          // (A) blank/invalid header
+    FUN_40133586();                                    // <-- starts PIT3 + the display task
+    ...spawn "Factory reset" BgWorker (FUN_400334bc)...
+} else {
+    iVar6 = FUN_4012eae4(mmcfs);          // header flags: byte[8]/[9], see finding 14
+    if (iVar6 == 0) {                                   // (B) needs preset migration
+        FUN_40133586();                                 // <-- starts PIT3 + the display task
+        ...spawn "Migrate presets" BgWorker...
+    }
+    // (C) neither -- falls through unconditionally:
+    ...spawn "Update MMC Caches" BgWorker (completion FUN_40032eaa)...
+    // FUN_40133586() is NEVER called on this path.
+}
+```
+
+`FUN_4012eb08` (`out/ghidra/dt2-1.16-emac/decomp/4012eb08_FUN_4012eb08.c`)
+reads the header buffer at `ctx+0x1de70` (finding 14's block-0 layout) and
+returns 1 iff the magic is *not* `0xBEEFBACE`. `FUN_4012eae4`
+(`.../4012eae4_FUN_4012eae4.c`) reads header bytes `+0x08`/`+0x09` (finding
+14's two format flags, both `01` on any correctly-formatted header,
+including ours) and returns nonzero when both are set. **A valid header
+(byte[8]=1, byte[9]=1, magic correct) makes both checks fail, so branch (C)
+is always taken** -- and `FUN_40133586`
+(`out/ghidra/dt2-1.16-emac/decomp/40133586_FUN_40133586.c`) is the *only*
+place in the whole 1.16 image found to write vector 208, arm `PIT3_PMR`/
+`PIT3_BASE` and spawn the priority-6 display task
+(`profile.display_start` = `0x401335e0`, inside this function, confirmed
+against the live vector-208 check). It is confirmed as `FUN_40133586`'s
+sole caller via `out/ghidra/dt2-1.16-emac/xrefs.sqlite`'s `calls` table.
+
+This can't be the whole story for a shipping device -- branch (C) ("Update
+MMC Caches") is what an **ordinary second boot** takes on real hardware, and
+the screen obviously does come on then. So either the display starts from a
+different, not-yet-located path specific to branch (C) (most likely inside
+or after the "Update MMC Caches" `BgWorker`'s own completion callback,
+`FUN_40032eaa`, or one of the unconditional calls right after the
+if/else -- `FUN_400c14dc`/`FUN_400f03e8`/`FUN_4002dcb2`/`FUN_401339aa`/
+`FUN_40133e22`/`FUN_40133ac8`, none read yet), or that path depends on a
+semaphore `unblock`'s narrowing (the "Four harness bugs" list earlier in
+this file) doesn't yet cover, the same way `bq_free_sem`/`bq_ready_sem` had
+to be excluded to stop `unblock` from faking the factory-reset worker's own
+follow-up job. **Every 1.16 boot validated in this project to date has
+exercised only branch (A); branch (C) -- the normal, non-first-boot path,
+which is what any +Drive image needs -- is untested territory and its
+display-start mechanism is not yet found.** **[O]**: locate branch (C)'s
+real display-start call and confirm whether the gap is a missing/miswired
+completion semaphore in the emulator or a genuinely slow (not stuck) path
+needing a larger instruction budget.
+
+Also confirmed while tracing this (item 1(b) of the +Drive task): the real
+filesystem's mount routine, `FUN_4015a450` (called from this same task,
+`FUN_400cc864`, not `FUN_400337ba`), requires an on-disk superblock at
+absolute sector `0x5D8000` that neither this file nor
+`docs/findings/14-plus-drive-format.md` had documented before now -- see
+that file's new section for the full layout and checksum.
