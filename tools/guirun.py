@@ -116,6 +116,14 @@ def parse_args(argv):
                          'machine (see machinepatch.MachineSpec); default '
                          'is Placeholder/PLC cloned from type 6')
     p.add_argument('--at', action='append', default=[])
+    p.add_argument('--frame-at', action='append', default=[],
+                   help='ADDR[=NAME]: print a6, d2 and the words around the frame pointer')
+    p.add_argument('--regs-at', action='append', default=[],
+                   help='ADDR[=NAME]: print d0-d7/a0-a7 and the longs at (a3)/(a4)')
+    p.add_argument('--rwatch', action='append', default=[],
+                   help='ADDR:LEN[=NAME]: print the PC of the first --watch-max reads of a range')
+    p.add_argument('--free-dtcn', action='append', default=[], type=int,
+                   help='serve DTCN<ch> as a free-running counter (Syntakt: 2); see emu/dtcn.py')
     p.add_argument('--stack-at', action='append', default=[],
                     type=lambda s: int(s, 0))
     p.add_argument('--stack-depth', type=int, default=128)
@@ -583,6 +591,69 @@ def main():
     for addr, name in at_targets:
         at(addr, make_at_hook(addr, name))
 
+    # --rwatch ADDR:LEN[=NAME]: the PC (and a few return-address-looking stack
+    # words) of the first --watch-max reads of a range -- for finding who
+    # consumes a data block.
+    from unicorn import UC_HOOK_MEM_READ
+    rwatch_counts = collections.Counter()
+    for addr, length, name in (parse_watch(s) for s in args.rwatch):
+        def rhook(uc, typ, a, size, val, data, name=name, addr=addr):
+            rwatch_counts[name] += 1
+            if rwatch_counts[name] <= args.watch_max:
+                pc = uc.reg_read(UC_M68K_REG_PC)
+                a7 = uc.reg_read(UC_M68K_REG_A7)
+                words = []
+                try:
+                    stk = uc.mem_read(a7, 0x60)
+                    for i in range(0, len(stk) - 3, 4):
+                        w = struct.unpack('>I', stk[i:i + 4])[0]
+                        if 0x40000400 <= w < 0x40400000:
+                            words.append('+%02x:%08x' % (i, w))
+                except Exception:
+                    pass
+                print('[rwatch] %s read %d @0x%08x pc=0x%08x a7=0x%08x  %s'
+                      % (name, size, a, pc, a7, ' '.join(words[:8])), flush=True)
+        m.uc.hook_add(UC_HOOK_MEM_READ, rhook, begin=addr, end=addr + length - 1)
+
+    # --frame-at ADDR[=NAME]: a6 and the frame words around it (saved fp,
+    # return address) plus d2, for checking a suspected stack-frame overrun.
+    from unicorn.m68k_const import UC_M68K_REG_A6, UC_M68K_REG_D2
+    for addr, name in (parse_at(s) for s in args.frame_at):
+        def frame_hook(uc, a, s_, d, name=name):
+            a6 = uc.reg_read(UC_M68K_REG_A6)
+            try:
+                words = struct.unpack('>8I', uc.mem_read(a6 - 0x1c, 32))
+            except Exception:
+                words = ()
+            print('[frame] %s a6=0x%08x d2=0x%08x  [a6-0x1c..a6+4]=%s'
+                  % (name, a6, uc.reg_read(UC_M68K_REG_D2),
+                     ' '.join('%08x' % w for w in words)), flush=True)
+        at(addr, frame_hook)
+
+    # --regs-at ADDR[=NAME]: d0-d7/a0-a7 and the long at (a3) / (a4) (the
+    # vtable of an object held there), for mapping virtual calls.
+    from unicorn.m68k_const import (UC_M68K_REG_D0, UC_M68K_REG_D1, UC_M68K_REG_D3, UC_M68K_REG_D4,
+                                    UC_M68K_REG_D5, UC_M68K_REG_D6, UC_M68K_REG_D7, UC_M68K_REG_A0,
+                                    UC_M68K_REG_A1, UC_M68K_REG_A2, UC_M68K_REG_A3, UC_M68K_REG_A4,
+                                    UC_M68K_REG_A5)
+    _DREGS = (UC_M68K_REG_D0, UC_M68K_REG_D1, UC_M68K_REG_D2, UC_M68K_REG_D3, UC_M68K_REG_D4,
+              UC_M68K_REG_D5, UC_M68K_REG_D6, UC_M68K_REG_D7)
+    _AREGS = (UC_M68K_REG_A0, UC_M68K_REG_A1, UC_M68K_REG_A2, UC_M68K_REG_A3, UC_M68K_REG_A4,
+              UC_M68K_REG_A5, UC_M68K_REG_A6, UC_M68K_REG_A7)
+    for addr, name in (parse_at(s_) for s_ in args.regs_at):
+        def regs_hook(uc, a, s_, d, name=name):
+            dr = [uc.reg_read(r) for r in _DREGS]
+            ar = [uc.reg_read(r) for r in _AREGS]
+
+            def deref(v):
+                try:
+                    return '%08x' % struct.unpack('>I', uc.mem_read(v, 4))[0]
+                except Exception:
+                    return '--------'
+            print('[regs] %s d=%s a=%s (a3)=%s (a4)=%s' % (name, ' '.join('%08x' % v for v in dr),
+                  ' '.join('%08x' % v for v in ar), deref(ar[3]), deref(ar[4])), flush=True)
+        at(addr, regs_hook)
+
     stack_scans = {}
 
     def make_stack_at_hook(addr):
@@ -657,6 +728,11 @@ def main():
         if fast and stepper is not None:
             return pits.now + int(stepper.blocks * stepper.PER_BLOCK)
         return pits.now
+
+    dtcn_state = {}
+    if args.free_dtcn:
+        from emu.dtcn import install_free_counters
+        dtcn_state = install_free_counters(m, clock, channels=tuple(args.free_dtcn))
 
     button_names = {}
 
@@ -843,6 +919,8 @@ def main():
                               for a, b in runs))
         print('[guirun] esdhc log tail: %s'
               % ' '.join('CMD%d@%#x' % (c, a) for c, a in esdhc.log[-12:]))
+    if dtcn_state:
+        print('[guirun] dtcn: %s' % {ch: (s['reads'], '%#x' % s['last']) for ch, s in dtcn_state.items()})
     if args.trace_ui_json:
         with open(args.trace_ui_json, 'w') as f:
             json.dump({

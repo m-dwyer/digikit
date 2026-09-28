@@ -43,7 +43,8 @@ for _name, _label in _FAULT_KIND_NAMES.items():
         FAULT_KINDS[_const] = _label
 del _name, _label, _const, _unicorn_mod
 from unicorn.m68k_const import (UC_CPU_M68K_CFV4E, UC_M68K_REG_A7,
-                                UC_M68K_REG_PC, UC_M68K_REG_SR, UC_M68K_REG_D0)
+                                UC_M68K_REG_PC, UC_M68K_REG_SR, UC_M68K_REG_D0,
+                                UC_M68K_REG_A0, UC_M68K_REG_A1, UC_M68K_REG_D1)
 
 PAGE = 0x100000
 EXCP_RTE = 0x100
@@ -352,6 +353,20 @@ class Machine:
                 uc.reg_write(UC_M68K_REG_PC, pc)
                 uc.reg_write(UC_M68K_REG_A7, sp + 8)
                 return
+            # A CPU fault (access error, address error, illegal, privilege,
+            # trace, line-A/F, format error) is dispatched into the firmware's
+            # own handler and was otherwise invisible; say so, with the
+            # registers a handler would report.
+            if 2 <= vec <= 14:
+                try:
+                    regs = [uc.reg_read(r) for r in (UC_M68K_REG_PC, UC_M68K_REG_A7,
+                                                     UC_M68K_REG_A0, UC_M68K_REG_A1,
+                                                     UC_M68K_REG_D0, UC_M68K_REG_D1)]
+                    print('[harness] CPU EXCEPTION vector %d pc=0x%08x a7=0x%08x '
+                          'a0=0x%08x a1=0x%08x d0=0x%08x d1=0x%08x'
+                          % (vec, *regs), flush=True)
+                except Exception:
+                    print('[harness] CPU EXCEPTION vector %d' % vec, flush=True)
             # A synchronous `trap #N` must resume *after* the trap, so let
             # raise_vector advance the pushed PC past it. Asynchronous
             # injections (the timer tick) keep the interrupted PC.

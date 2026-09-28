@@ -1,0 +1,106 @@
+# Syntakt (OS 1.41 boots to its main screen; see docs/SYNTAKT.md).
+#
+# The panel section below is copied from the Digitakt II layout as a
+# placeholder: Syntakt's wire mapping has not been measured with
+# tools/panelsweep.py, so treat any GUI button as unverified until it has.
+# Known from use: channel 0 bits 0-7 = tracks 1-8, channel 1 bits 0-3 =
+# tracks 9-12, channel 2 bit 7 = LFO page, channel 3 bit 3 = NO; encoders
+# A-H = channels 0-7.
+
+[device]
+name = "Syntakt"
+short = "st"
+
+[[firmware]]
+version = "1.41"
+sha256 = "8e2488f462c4a5656396a895f113bcd415e9900fa8709340dccf45d4cb9ed19e"
+filename = "Syntakt_OS1.41.syx"
+
+[panel]
+linear_channels = 6
+encoders = 9
+
+[panel.exceptions]
+49 = [6, 1]
+50 = [6, 0]
+
+[[panel.group]]
+name = "pages"
+kind = "button"
+codes = [1, 2, 3, 4, 5, 6]
+layout = "row"
+
+[[panel.group]]
+name = "modes"
+kind = "button"
+codes = [7, 8, 9]
+layout = "row"
+
+[[panel.group]]
+name = "confirm"
+kind = "button"
+codes = [10, 12]
+layout = "row"
+
+[[panel.group]]
+name = "arrows"
+kind = "button"
+codes = [11, 13, 14, 15]
+layout = "dpad"
+
+[[panel.group]]
+name = "modifiers"
+kind = "button"
+codes = [16, 17, 18]
+layout = "row"
+
+[[panel.group]]
+name = "transport"
+kind = "button"
+codes = [19, 20, 21]
+layout = "row"
+
+[[panel.group]]
+name = "select"
+kind = "button"
+codes = [22, 23, 24]
+layout = "row"
+
+[[panel.group]]
+name = "trigs"
+kind = "button"
+codes = [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+layout = "grid"
+columns = 8
+
+[[panel.group]]
+name = "encoder_push"
+kind = "button"
+codes = [41, 42, 43, 44, 45, 46, 47, 48]
+layout = "grid"
+columns = 4
+
+[[panel.group]]
+name = "level_push"
+kind = "button"
+codes = [49]
+layout = "single"
+
+[[panel.group]]
+name = "product"
+kind = "button"
+codes = [50]
+layout = "single"
+
+[[panel.group]]
+name = "encoders"
+kind = "encoder"
+codes = [1, 2, 3, 4, 5, 6, 7, 8]
+layout = "grid"
+columns = 4
+
+[[panel.group]]
+name = "level"
+kind = "encoder"
+codes = [9]
+layout = "single"

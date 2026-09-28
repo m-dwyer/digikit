@@ -112,9 +112,49 @@ class Fixed:
             n = len(self.verify)
             actual = img[off:off + n]
             if actual != self.verify:
-                return None, ('bytes at 0x%08x are %s, expected %s'
-                               % (self.addr, actual.hex(), self.verify.hex()))
+                return self._relocated(img, load_addr, got, actual)
         return self.addr, 'fixed 0x%08x (RTOS base, byte-identical across builds)' % self.addr
+
+    # The RTOS block can be byte-identical on another product but linked at a
+    # different base, so a Fixed anchor whose verify bytes miss is looked for
+    # elsewhere: first at the shift the previous relocated Fixed symbol showed
+    # (a whole linked block moves as one), then as a unique hit of the verify
+    # bytes anywhere in the image. Ambiguous or absent stays unresolved, as
+    # before. On the two products the resolver already knows, nothing moves
+    # and this is never reached.
+    def _relocated(self, img, load_addr, got, actual):
+        shift = got.get('_fixed_shift')
+        if shift is not None:
+            cand = self.addr + shift
+            o = cand - load_addr
+            if 0 <= o < len(img) and img[o:o + len(self.verify)] == self.verify:
+                return cand, ('fixed 0x%08x relocated by %+#x to 0x%08x (same shift as the previous anchor)'
+                              % (self.addr, shift, cand))
+        # The verify bytes may themselves embed absolute addresses into a
+        # relocated block (tick_dispatch's three `lea` operands), and that
+        # block may have moved by a different amount than this one: try every
+        # shift seen so far.
+        for inner in sorted(got.get('_fixed_shifts', ())):
+            shifted = _shift_abs32(self.verify, inner)
+            if shifted == self.verify:
+                continue
+            hits = _find_all(img, shifted)
+            if len(hits) == 1:
+                cand = load_addr + hits[0]
+                got['_fixed_shift'] = cand - self.addr
+                got.setdefault('_fixed_shifts', set()).add(cand - self.addr)
+                return cand, ('fixed 0x%08x relocated by %+#x to 0x%08x (unique match of its verify '
+                              'bytes with embedded addresses shifted by %+#x)'
+                              % (self.addr, cand - self.addr, cand, inner))
+        hits = _find_all(img, self.verify)
+        if len(hits) == 1:
+            cand = load_addr + hits[0]
+            got['_fixed_shift'] = cand - self.addr
+            got.setdefault('_fixed_shifts', set()).add(cand - self.addr)
+            return cand, ('fixed 0x%08x relocated by %+#x to 0x%08x (unique match of its verify bytes)'
+                          % (self.addr, cand - self.addr, cand))
+        return None, ('bytes at 0x%08x are %s, expected %s; verify bytes found %d time(s) elsewhere'
+                      % (self.addr, actual.hex(), self.verify.hex(), len(hits)))
 
 
 class Xrefs:
@@ -199,6 +239,23 @@ class Offset:
         if base is None:
             return None, "'%s' unresolved" % self.symbol
         return base + self.delta, '%s%+d' % (self.symbol, self.delta)
+
+
+class First:
+    """The first rule that resolves wins; the detail says which one it was.
+    For a symbol whose usual rule fails on some build but has a safe fallback."""
+
+    def __init__(self, *rules):
+        self.rules = rules
+
+    def resolve(self, img, load_addr, got):
+        details = []
+        for k, rule in enumerate(self.rules):
+            val, why = rule.resolve(img, load_addr, got)
+            if val is not None:
+                return val, 'alternative %d: %s' % (k, why)
+            details.append(why)
+        return None, 'no alternative resolved: ' + ' | '.join(details)
 
 
 class Opcode:
@@ -429,6 +486,17 @@ class StringTable:
         return base, 'char* table at 0x%08x' % base
 
 
+def _shift_abs32(raw, shift, lo=0x40000000, hi=0x40400000):
+    """Copy of `raw` with every big-endian 32-bit value in [lo, hi) at an
+    even offset replaced by value + shift."""
+    out = bytearray(raw)
+    for i in range(0, len(raw) - 3, 2):
+        v = struct.unpack_from('>I', raw, i)[0]
+        if lo <= v < hi:
+            struct.pack_into('>I', out, i, (v + shift) & 0xFFFFFFFF)
+    return bytes(out)
+
+
 def _find_all(img, needle):
     out, start = [], 0
     while True:
@@ -458,7 +526,12 @@ def _mask_pattern(raw, lo, hi, wild=()):
         if lo <= val < hi:
             for k in range(4):
                 mask[i + k] = 1
-            i += 4
+            # Keep scanning the overlapping windows: `45f9 4000 141a` (lea +
+            # operand) used to mask only its first four bytes, leaving the
+            # operand's low half literal -- invisible on DT2/DN2, where that
+            # operand (sem_pend) sits at the same address, fatal on a build
+            # where it moved.
+            i += 1
         else:
             i += 1
     for k in wild:
@@ -628,8 +701,13 @@ SYMBOLS = [
     # the return address of the very `jsr sem_pend` that pend_call names.
     # ----------------------------------------------------------------
     ('queue_recv', Fixed(0x40001946, verify='588f60f240c246fc2700'), False),
-    ('intro_park', Sig('588f60f42f0a2f3c40490fdb45f9401752042f2f000c4e92'
-                       '588f2ebc3f000000'), False),
+    # On Syntakt 1.41 the intro's park loop is the `pea sem; jsr (a2);
+    # addq.l #4,a7; bra.b` right after intro_done's exit sequence; the pend
+    # returns to intro_done+0x2c. The byte layout there is the same as DT2's,
+    # so the offset is a valid fallback wherever intro_done is.
+    ('intro_park', First(Sig('588f60f42f0a2f3c40490fdb45f9401752042f2f000c4e92'
+                             '588f2ebc3f000000'),
+                         Offset('intro_done', 0x2c)), False),
     ('display_wait', Sig('588f60ec48794029e1f82a3c000000804879'
                          '4029e274487800144878001f486e'), False),
 
@@ -689,6 +767,33 @@ SYMBOLS = [
     ('pump_wait', Sig('42002f43002849f94018c0a41f40002c2f034e96'
                       '7001266a002c1f4000304200'), False),
     ('sleep_pend', Offset('pend_call', 6), False),
+
+    # Syntakt 1.41 only (optional elsewhere): a second worker pump. The
+    # prio-7 task pends a job semaphore (`jsr (a6)`, a6 = sem_pend) and then
+    # drains its queues, re-checking their counts -- the same shape as
+    # pump_wait, on another pool. Anchored on the register setup right before
+    # the pend; the pend returns 0x1a bytes after the anchor.
+    ('_pump2_anchor', Sig('4df94000179245f94024216c48794449052c283c40102470'
+                          '4e96588f4879444905744e93', hi=DATA_HI), False),
+    ('pump_wait2', Offset('_pump2_anchor', 0x1a), False),
+
+    # Syntakt 1.41 only: three prio-5 hardware worker tasks (SPI NOR via GPIO
+    # 0xEC0940xx; a FlexBus device at 0x10000000; a copy worker) each pend an
+    # ISR-posted semaphore at the top of their loop. Faking those pends made
+    # them run jobs that were never posted and starve everything below prio 5.
+    # Each anchor is `pea sem; jsr (aN)` plus the first instruction after the
+    # pend; the pend returns at anchor+8. The display task's per-frame pend_b
+    # on display_sem right before it blits the 128x64 frame is posted by the
+    # display PIT3 ISR; faking it spins the task at 100% CPU.
+    ('_display_frame_anchor',
+     Sig('4879444b9d584eb94000171e4879444b9d682f39444ba1684878004048780080', hi=DATA_HI), False),
+    ('display_frame_wait', Offset('_display_frame_anchor', 0xc), False),
+    ('_hw1_anchor', Sig('487941bbe4384e9370ef42b941bb22b4', hi=DATA_HI), False),
+    ('hw1_wait', Offset('_hw1_anchor', 8), False),
+    ('_hw2_anchor', Sig('487941bbe4284e93720224394d84f2c1', hi=DATA_HI), False),
+    ('hw2_wait', Offset('_hw2_anchor', 8), False),
+    ('_hw3_anchor', Sig('487941bbe4304e94203caaaaaaaa23c010000000', hi=DATA_HI), False),
+    ('hw3_wait', Offset('_hw3_anchor', 8), False),
 
     # tick_dispatch is the RTOS tick-paced dispatcher loop: pend_b(tick_sem);
     # mutex_lock(m); run every due callback; mutex_unlock(m); repeat. The

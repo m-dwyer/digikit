@@ -157,9 +157,9 @@ class ShippedDeviceFilesTest(unittest.TestCase):
     def setUp(self):
         self.devices = device.load_all(DEVICES)
 
-    def test_both_products_are_present(self):
+    def test_all_products_are_present(self):
         names = sorted(d.name for d in self.devices)
-        self.assertEqual(names, ['Digitakt II', 'Digitone II'])
+        self.assertEqual(names, ['Digitakt II', 'Digitone II', 'Syntakt'])
 
     def test_every_button_code_round_trips(self):
         for dev in self.devices:
