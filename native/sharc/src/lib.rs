@@ -113,6 +113,20 @@ pub fn tick_hz() -> u64 {
     }
 }
 
+/// Whether the generated blocks call other regions' blocks directly
+/// (tools/sharc_rsgen.py --chain): then a changed range cannot retire only
+/// its own regions (`blocks_code_ok`).
+fn generated_chained() -> bool {
+    #[cfg(all(sharc_gen, sharc_image))]
+    {
+        generated::image::CHAINED
+    }
+    #[cfg(not(all(sharc_gen, sharc_image)))]
+    {
+        false
+    }
+}
+
 /// A chained block that was not generated: back to the dispatcher.
 pub fn no_block(_s: &mut St) -> u32 {
     EXIT_NEXT
@@ -256,6 +270,10 @@ pub struct Engine {
     code_checked: u64,
     code_known: bool,
     code_ok: bool,
+    /// When it is not: the block functions with an entry inside a range that
+    /// no longer hashes to what it was generated from (sorted addresses).
+    /// Only these fall back to the interpreter; every other block runs.
+    stale_blocks: Vec<usize>,
 }
 
 /// What the run-time model gate decided (diagnostic counters).
@@ -530,6 +548,7 @@ impl Engine {
             code_checked: 0,
             code_known: false,
             code_ok: false,
+            stale_blocks: Vec::new(),
         }
     }
 
@@ -872,22 +891,48 @@ impl Engine {
     /// it, the generator's per-range SHA-256 of the short words (and the words
     /// the decoder looks ahead at) is compared with the engine's memory,
     /// again whenever a store touches a watched page.
-    fn blocks_code_ok(&mut self) -> bool {
+    ///
+    /// Per range: a range that no longer matches (a patched image, code
+    /// written at run time) retires only the block functions entered inside
+    /// it, and those run in the interpreter. A function serves one region
+    /// and a block lies inside one merged range (tools/sharc_rsgen.py
+    /// code_ranges), so a function with no entry in a changed range never
+    /// executes changed code. Cross-region chaining would break that; it is
+    /// handled by retiring every block when the build chained (`CHAINED`).
+    fn blocks_code_ok(&mut self, entry: &Entry) -> bool {
         if !self.s.runtime_decode {
             return true;
         }
-        if self.code_known && self.code_checked == self.s.mem.code_gen {
-            return self.code_ok;
+        if !(self.code_known && self.code_checked == self.s.mem.code_gen) {
+            self.code_checked = self.s.mem.code_gen;
+            self.code_known = true;
+            let changed = self.changed_ranges();
+            self.code_ok = changed.is_empty();
+            self.stale_blocks = self.blocks_in(&changed);
         }
-        self.code_checked = self.s.mem.code_gen;
-        self.code_known = true;
-        self.code_ok = self.verify_code();
-        self.code_ok
+        // A chained build calls other regions' blocks without this gate: any
+        // change then retires every block, as before.
+        self.code_ok || (!generated_chained() && self.stale_blocks.binary_search(&(entry.f as usize)).is_err())
     }
 
-    fn verify_code(&self) -> bool {
+    /// The block functions with an entry PC inside CHANGED ranges.
+    fn blocks_in(&self, changed: &[(u32, u32)]) -> Vec<usize> {
+        let mut out: Vec<usize> = changed
+            .iter()
+            .flat_map(|&(start, len)| start..start + len)
+            .filter_map(|pc| self.dispatch.get(pc as Int).map(|f| f as usize))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The generated code ranges whose loaded words no longer hash to what
+    /// the blocks were generated from: (start, length) in short words.
+    fn changed_ranges(&self) -> Vec<(u32, u32)> {
         #[cfg(all(sharc_gen, sharc_image))]
         {
+            let mut changed = Vec::new();
             for &(start, len, want) in generated::image::CODE_RANGES {
                 let mut bytes = Vec::with_capacity(len as usize * 2);
                 for k in 0..len {
@@ -899,15 +944,15 @@ impl Engine {
                 let mut h = sha256::Sha256::new();
                 h.update(&bytes);
                 if frames::hex(&h.finish()) != want {
-                    return false;
+                    changed.push((start, len));
                 }
             }
-            true
+            changed
         }
         #[cfg(not(all(sharc_gen, sharc_image)))]
         {
             // No generated image: there is no block code to protect.
-            true
+            Vec::new()
         }
     }
 
@@ -1042,13 +1087,13 @@ impl Engine {
                     plan.timer_count = Some(count.b);
                 }
             }
-            if !self.blocks_code_ok() {
+            if !self.blocks_code_ok(&entry) {
                 self.model_stats.code_mismatch += 1;
                 return None;
             }
             plan.models = true;
             self.model_stats.gated += 1;
-        } else if !self.blocks_code_ok() {
+        } else if !self.blocks_code_ok(&entry) {
             self.model_stats.code_mismatch += 1;
             return None;
         }
