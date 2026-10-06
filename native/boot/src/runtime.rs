@@ -28,6 +28,9 @@ const RX_VECTOR: u8 = 154;
 pub struct Status {
     pub device: String,
     pub version: String,
+    /// The image is not the stock release `version` but derived from it
+    /// (unknown SHA-256, the release's build stamp; see `boot_for_derived`).
+    pub modified: bool,
     pub icount: u64,
     pub pc: u32,
     pub ready: bool,
@@ -60,6 +63,63 @@ pub struct Snapshot {
     pub frame: Option<Vec<u8>>,
 }
 
+/// The registers at one execution of a PC `record_regs_at` names.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RegHit {
+    pub pc: u32,
+    pub icount: u64,
+    pub d: [u32; 8],
+    pub a: [u32; 8],
+    /// The four longwords at A7: on a function's first instruction, the
+    /// first is the return address, so it names the caller.
+    pub stack: [u32; 4],
+}
+
+/// How many executions `record_regs_at` keeps; later ones are counted only.
+pub const REG_LOG_MAX: usize = 4096;
+
+/// A routine the host asks the guest to run: when the guest itself next reaches
+/// `at`, the registers are saved, each `data` block is written, `args` are pushed
+/// (C order, the first nearest the return address) with `at` as the return
+/// address, and the CPU jumps to `func`. When it returns to `at` with the stack
+/// back where the call left it, every register is restored and the guest carries
+/// on as if nothing ran. Choose `at` in the task whose context the routine needs.
+///
+/// A data block at `GuestCall::STACK` goes on the guest's own stack, below the
+/// arguments, which is mapped wherever the guest runs; any argument equal to
+/// `STACK` is then replaced by the block's address.
+#[derive(Clone, Debug)]
+pub struct GuestCall {
+    pub at: u32,
+    pub func: u32,
+    pub args: Vec<u32>,
+    pub data: Vec<(u32, Vec<u8>)>,
+}
+
+impl GuestCall {
+    pub const STACK: u32 = 0xFFFF_FFF0;
+}
+
+/// The bytes a guest routine was handed, captured on its first instruction: the
+/// first four stack arguments, and `len` bytes from the pointer in argument `buf`.
+#[derive(Clone, Debug, Serialize)]
+pub struct Capture {
+    pub pc: u32,
+    pub icount: u64,
+    pub args: [u32; 4],
+    pub bytes: Vec<u8>,
+}
+
+/// The most bytes one capture copies; a longer length is cut and flagged.
+pub const CAPTURE_MAX: usize = 1 << 16;
+
+struct ActiveCall {
+    at: u32,
+    sp_after: u32,
+    d: [u32; 8],
+    a: [u32; 8],
+}
+
 /// Persistent, bounded Oracle diagnostic state. It has no host I/O and does
 /// not claim a hardware or interrupt-device model.
 pub struct Emulator {
@@ -71,6 +131,13 @@ pub struct Emulator {
     dspi_frames_observed: u64,
     device: String,
     version: String,
+    modified: bool,
+    /// Where a modified image's own code runs, from its `DNFW` area (empty
+    /// when it has none): the only places outside MAIN it may execute.
+    code_ranges: Vec<(u32, u32)>,
+    /// Ranges a developer declares executable (`set_exec_ranges`), on top of
+    /// MAIN and the image's own declaration: an override for experiments.
+    declared_ranges: Vec<(u32, u32)>,
     contract: device_profile::ReadinessContract,
     task_create: u32,
     mainloop: u32,
@@ -91,6 +158,20 @@ pub struct Emulator {
     /// every PC the per-instruction observers compare against; a miss lets
     /// `step_once` skip all of those exact comparisons.
     watch: Vec<u64>,
+    /// PCs a host asked to count (`watch_pcs`): (pc, hits, icount of the first).
+    pc_watch: Vec<(u32, u64, u64)>,
+    /// PCs whose registers a host asked to record (`record_regs_at`), and the
+    /// record: every execution, up to `REG_LOG_MAX`, then the count only.
+    reg_watch: Vec<u32>,
+    reg_log: Vec<RegHit>,
+    reg_log_dropped: u64,
+    /// Host calls not yet started, oldest first, the one running, and how many returned.
+    calls: std::collections::VecDeque<GuestCall>,
+    call_active: Option<ActiveCall>,
+    calls_done: u64,
+    /// (pc, argument holding the buffer, argument holding the length).
+    capture_at: Vec<(u32, usize, usize)>,
+    captures: Vec<Capture>,
     idle_passes: u64,
     task_create_hits: u64,
     mainloop_hits: u64,
@@ -247,9 +328,27 @@ impl Emulator {
         }
         let registry = device_profile::Registry::embedded().map_err(|e| e.to_string())?;
         let syx_sha = digest(syx);
-        let (device, profile, _) = registry
-            .boot_for_main(&syx_sha, &main)
-            .map_err(|e| e.to_string())?;
+        let (device, profile, modified) = match registry.boot_for_main(&syx_sha, &main) {
+            Ok((device, profile, _)) => (device, profile, false),
+            // A modified image: no profile knows its hash, but its meta section
+            // still carries its release's build stamp. Run it on that release's
+            // contract (all else is found by signature) and say it is modified.
+            Err(device_profile::RegistryError::UnknownFirmware { .. }) => {
+                let meta = firmware
+                    .sections
+                    .iter()
+                    .find(|section| section.id == 5)
+                    .map(|section| String::from_utf8_lossy(&section.bytes).into_owned())
+                    .ok_or(format!(
+                        "no device profile recognizes firmware SHA-256 {syx_sha}, and it has no meta section (5) naming its release"
+                    ))?;
+                let (device, profile, _) = registry
+                    .boot_for_derived(&meta)
+                    .map_err(|e| format!("firmware SHA-256 {syx_sha} is not a known release: {e}"))?;
+                (device, profile, true)
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         let contract = profile
             .readiness_contract
             .ok_or("firmware has no readiness contract")?;
@@ -354,6 +453,7 @@ impl Emulator {
         cpu.pc = ENTRY;
         cpu.sr = 0x2700;
         cpu.a[7] = STACK;
+        let code_ranges = if modified { dnfw_code_ranges(&main) } else { Vec::new() };
         let mut emulator = Self {
             main,
             cpu,
@@ -363,6 +463,9 @@ impl Emulator {
             dspi_frames_observed: 0,
             device: device.short.clone(),
             version: profile.version.clone(),
+            modified,
+            code_ranges,
+            declared_ranges: Vec::new(),
             contract,
             task_create,
             mainloop,
@@ -380,6 +483,15 @@ impl Emulator {
             current_tcb_addr,
             idle_spins,
             watch: Vec::new(),
+            pc_watch: Vec::new(),
+            reg_watch: Vec::new(),
+            reg_log: Vec::new(),
+            reg_log_dropped: 0,
+            calls: std::collections::VecDeque::new(),
+            call_active: None,
+            calls_done: 0,
+            capture_at: Vec::new(),
+            captures: Vec::new(),
             idle_passes: 0,
             task_create_hits: 0,
             mainloop_hits: 0,
@@ -491,6 +603,195 @@ impl Emulator {
             self.replay_restored_frame = false;
         }
         Snapshot { status, frame }
+    }
+
+    /// Counts every execution of PCS inside MAIN (replacing an earlier list):
+    /// a host's breakpoint without a hook, e.g. a firmware's own fault reporter,
+    /// read back with `pc_hits`. Watched PCs leave the fast path, so they are
+    /// never skipped.
+    pub fn watch_pcs(&mut self, pcs: &[u32]) {
+        self.pc_watch = pcs.iter().map(|&pc| (pc, 0, 0)).collect();
+        self.rebuild_watch();
+    }
+
+    /// (pc, executions, instruction count at the first) for each `watch_pcs` PC.
+    pub fn pc_hits(&self) -> &[(u32, u64, u64)] {
+        &self.pc_watch
+    }
+
+    /// Reads `len` bytes of guest memory for a host tool, as a debugger's peek:
+    /// straight from the board, so no instruction runs and no bus trace,
+    /// timer or peripheral observer sees it. Meant for RAM and the image; a
+    /// peripheral register's read side effects are the board's.
+    pub fn peek(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, String> {
+        (0..len)
+            .map(|i| {
+                let at = addr.wrapping_add(i as u32);
+                self.bus
+                    .board
+                    .read8(at)
+                    .map_err(|e| format!("peek {at:#010x}: {e:?}"))
+            })
+            .collect()
+    }
+
+    /// Writes guest memory for a host tool, as a debugger's poke: straight to
+    /// the board, then drops any decoded instructions over the written bytes,
+    /// so a poke over code runs as written.
+    pub fn poke(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
+        for (i, &value) in bytes.iter().enumerate() {
+            let at = addr.wrapping_add(i as u32);
+            self.bus
+                .board
+                .write8(at, value)
+                .map_err(|e| format!("poke {at:#010x}: {e:?}"))?;
+        }
+        self.cpu.invalidate_external_write(addr, bytes.len());
+        Ok(())
+    }
+
+    /// Records D0-D7 and A0-A7 each time one of PCS is about to execute (replacing
+    /// any PCs asked for before, and the record): a debugger's breakpoint that
+    /// logs and goes on. See `reg_log`.
+    pub fn record_regs_at(&mut self, pcs: &[u32]) {
+        self.reg_watch = pcs.to_vec();
+        self.reg_log.clear();
+        self.reg_log_dropped = 0;
+        self.rebuild_watch();
+    }
+
+    /// What `record_regs_at` recorded, oldest first, and how many executions past
+    /// `REG_LOG_MAX` were only counted.
+    pub fn reg_log(&self) -> (&[RegHit], u64) {
+        (&self.reg_log, self.reg_log_dropped)
+    }
+
+    /// Queues a routine for the guest to run from a PC it reaches itself. See
+    /// `GuestCall`.
+    pub fn queue_call(&mut self, call: GuestCall) {
+        self.calls.push_back(call);
+        self.rebuild_watch();
+    }
+
+    /// Calls queued and not yet returned (running included), and calls returned.
+    pub fn calls_pending(&self) -> (usize, u64) {
+        (
+            self.calls.len() + usize::from(self.call_active.is_some()),
+            self.calls_done,
+        )
+    }
+
+    /// Captures `len` bytes at the pointer in stack argument `buf` each time PC
+    /// runs; `buf` and `len` count arguments from 0. Replaces any asked for before.
+    pub fn capture_at(&mut self, at: &[(u32, usize, usize)]) {
+        self.capture_at = at.to_vec();
+        self.captures.clear();
+        self.rebuild_watch();
+    }
+
+    /// The captures so far, oldest first; taking them empties the list.
+    pub fn take_captures(&mut self) -> Vec<Capture> {
+        std::mem::take(&mut self.captures)
+    }
+
+    fn stack_long(&mut self, at: u32) -> u32 {
+        (0..4).fold(0u32, |word, j| {
+            let byte = self.bus.board.read8(at.wrapping_add(j)).unwrap_or(0);
+            (word << 8) | u32::from(byte)
+        })
+    }
+
+    /// The host-call and capture observers, on a watched PC before it executes:
+    /// -> true when the PC was redirected, so this step executes nothing.
+    fn guest_call_step(&mut self, pc: u32) -> bool {
+        for k in 0..self.capture_at.len() {
+            let (at, buf, len) = self.capture_at[k];
+            if at != pc {
+                continue;
+            }
+            let sp = self.cpu.a[7];
+            let mut args = [0u32; 4];
+            for (i, arg) in args.iter_mut().enumerate() {
+                *arg = self.stack_long(sp.wrapping_add(4 + 4 * i as u32));
+            }
+            let (ptr, n) = (
+                args.get(buf).copied().unwrap_or(0),
+                args.get(len).copied().unwrap_or(0) as usize,
+            );
+            let bytes = (0..n.min(CAPTURE_MAX))
+                .map(|i| self.bus.board.read8(ptr.wrapping_add(i as u32)).unwrap_or(0))
+                .collect();
+            self.captures.push(Capture { pc, icount: self.cpu.icount, args, bytes });
+        }
+        if let Some(active) = &self.call_active {
+            if pc == active.at && self.cpu.a[7] == active.sp_after {
+                self.cpu.d = active.d;
+                self.cpu.a = active.a;
+                self.cpu.pc = active.at;
+                self.call_active = None;
+                self.calls_done += 1;
+                self.rebuild_watch();
+                return true;
+            }
+            return false;
+        }
+        if self.calls.front().is_none_or(|c| c.at != pc) {
+            return false;
+        }
+        let mut call = self.calls.pop_front().expect("checked");
+        let mut sp0 = self.cpu.a[7];
+        let saved_a = self.cpu.a;
+        for block in &mut call.data {
+            if block.0 == GuestCall::STACK {
+                let at = (sp0.wrapping_sub(block.1.len() as u32 + 64)) & !3;
+                block.0 = at;
+                for arg in &mut call.args {
+                    if *arg == GuestCall::STACK {
+                        *arg = at;
+                    }
+                }
+                sp0 = at;
+            }
+        }
+        for (at, bytes) in &call.data {
+            for (i, &b) in bytes.iter().enumerate() {
+                if let Err(e) = self.bus.board.write8(at.wrapping_add(i as u32), b) {
+                    self.set_error(format!("guest call data {at:#010x}: {e:?}"));
+                    return true;
+                }
+            }
+            self.cpu.invalidate_external_write(*at, bytes.len());
+        }
+        let n = call.args.len() as u32;
+        let sp = sp0.wrapping_sub(4 * (n + 1));
+        let words = std::iter::once(pc).chain(call.args.iter().copied());
+        for (i, word) in words.enumerate() {
+            for j in 0..4u32 {
+                let byte = (word >> (24 - 8 * j)) as u8;
+                let at = sp.wrapping_add(4 * i as u32 + j);
+                if let Err(e) = self.bus.board.write8(at, byte) {
+                    self.set_error(format!("guest call stack {at:#010x}: {e:?}"));
+                    return true;
+                }
+            }
+        }
+        self.call_active = Some(ActiveCall {
+            at: pc,
+            sp_after: sp0.wrapping_sub(4 * n),
+            d: self.cpu.d,
+            a: saved_a,
+        });
+        self.cpu.a[7] = sp;
+        self.cpu.pc = call.func;
+        self.rebuild_watch();
+        true
+    }
+
+    /// Declares extra executable ranges for the runaway check (replacing any
+    /// declared before), for any image: code a developer placed by other means
+    /// than an image declaration. `parse_exec_ranges` reads the text form.
+    pub fn set_exec_ranges(&mut self, ranges: Vec<(u32, u32)>) {
+        self.declared_ranges = ranges;
     }
 
     /// Export observations without stepping, reading guest memory, or consuming a frame.
@@ -619,6 +920,7 @@ impl Emulator {
         Status {
             device: self.device.clone(),
             version: self.version.clone(),
+            modified: self.modified,
             icount: self.cpu.icount,
             pc: self.cpu.pc,
             ready,
@@ -844,6 +1146,11 @@ impl Emulator {
         observed.dedup();
         self.observed_pcs = observed;
         pcs.extend(self.fused_loops.iter().map(|(head, _, _)| *head));
+        pcs.extend(self.pc_watch.iter().map(|&(pc, _, _)| pc));
+        pcs.extend(self.reg_watch.iter().copied());
+        pcs.extend(self.calls.iter().map(|c| c.at));
+        pcs.extend(self.call_active.iter().map(|c| c.at));
+        pcs.extend(self.capture_at.iter().map(|&(pc, _, _)| pc));
         for pc in pcs {
             if let Some(off) = pc.checked_sub(MAIN_LOAD) {
                 let i = (off >> 1) as usize;
@@ -1024,11 +1331,23 @@ impl Emulator {
                 return;
             }
         }
-        let Some(offset) = pc.checked_sub(MAIN_LOAD).map(|value| value as usize) else {
-            self.set_error(format!("UnsupportedGuestPc({pc:#010x})"));
-            return;
-        };
-        if self.main.get(offset..offset + 6).is_none() {
+        let in_main = pc
+            .checked_sub(MAIN_LOAD)
+            .map(|value| value as usize)
+            .is_some_and(|offset| self.main.get(offset..offset + 6).is_some());
+        // Stock firmware only executes its MAIN image, so a PC outside it is a
+        // runaway. A modified image may run code it copied into RAM (a mod
+        // platform's loader places its routines above MAIN at boot): the CPU
+        // fetches through the bus. With a `DNFW` area (dnfw's mod platform) only
+        // its CODE chunks may run; without one, anywhere in RAM.
+        let in_mod_code = self.modified
+            && if self.code_ranges.is_empty() {
+                (0x4000_0000..0x4800_0000).contains(&pc)
+            } else {
+                self.code_ranges.iter().any(|&(lo, hi)| (lo..hi).contains(&pc))
+            };
+        let in_declared = self.declared_ranges.iter().any(|&(lo, hi)| (lo..hi).contains(&pc));
+        if !in_main && !in_mod_code && !in_declared {
             self.set_error(format!("UnsupportedGuestPc({pc:#010x})"));
             return;
         }
@@ -1052,6 +1371,39 @@ impl Emulator {
         let watched = self.watched(pc);
         if watched {
             self.observe_marks(pc);
+            for (at, hits, first) in &mut self.pc_watch {
+                if *at == pc {
+                    if *hits == 0 {
+                        *first = self.cpu.icount;
+                    }
+                    *hits += 1;
+                }
+            }
+            if self.reg_watch.contains(&pc) {
+                if self.reg_log.len() < REG_LOG_MAX {
+                    let sp = self.cpu.a[7];
+                    let mut stack = [0u32; 4];
+                    for (i, word) in stack.iter_mut().enumerate() {
+                        for j in 0..4 {
+                            let at = sp.wrapping_add((4 * i + j) as u32);
+                            let byte = self.bus.board.read8(at).unwrap_or(0);
+                            *word = (*word << 8) | u32::from(byte);
+                        }
+                    }
+                    self.reg_log.push(RegHit {
+                        pc,
+                        icount: self.cpu.icount,
+                        d: self.cpu.d,
+                        a: self.cpu.a,
+                        stack,
+                    });
+                } else {
+                    self.reg_log_dropped += 1;
+                }
+            }
+        }
+        if watched && self.guest_call_step(pc) {
+            return;
         }
         self.frames.complete_at_return(
             &mut self.bus.board,
@@ -2658,5 +3010,124 @@ mod tests {
         assert_eq!(runtime.input_packets, before);
         assert!(runtime.turn(1, i32::MAX).is_err());
         assert_eq!(runtime.input_packets, before);
+    }
+}
+
+/// The `CODE` chunks of a `DNFW` area appended to MAIN (the mod platform of
+/// angellinares/dn2_firmware_explore, `src/dnfw/patch/area.py`): `'DNFW'`, u32
+/// total length, u32 chunk count, then per chunk a 4-byte id, u32 offset from
+/// the area's start and u32 length, all big-endian. A `CODE` chunk begins with
+/// its u32 load address and u32 image length; the loader copies the image
+/// there at boot. Returns each image's `[load, load + length)`.
+fn dnfw_code_ranges(main: &[u8]) -> Vec<(u32, u32)> {
+    let be32 = |at: usize| -> Option<u32> {
+        main.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    // the area runs to the end of MAIN: the last aligned 'DNFW' whose length fits
+    let Some(start) = (0..main.len().saturating_sub(12)).step_by(4).rev().find(|&at| {
+        &main[at..at + 4] == b"DNFW"
+            && be32(at + 4).is_some_and(|total| at + total as usize <= main.len())
+    }) else {
+        return Vec::new();
+    };
+    let count = be32(start + 8).unwrap_or(0) as usize;
+    let mut ranges = Vec::new();
+    for k in 0..count.min(256) {
+        let entry = start + 12 + 12 * k;
+        let (Some(id), Some(offset), Some(length)) =
+            (main.get(entry..entry + 4), be32(entry + 4), be32(entry + 8))
+        else {
+            break;
+        };
+        if id != b"CODE" || length < 16 {
+            continue;
+        }
+        let chunk = start + offset as usize;
+        if let (Some(load), Some(image)) = (be32(chunk), be32(chunk + 4)) {
+            ranges.push((load, load.saturating_add(image)));
+        }
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod dnfw_area_tests {
+    use super::dnfw_code_ranges;
+
+    fn area(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let head = 12 + 12 * chunks.len();
+        let mut body = Vec::new();
+        let mut table = Vec::new();
+        for (id, data) in chunks {
+            table.extend_from_slice(*id);
+            table.extend_from_slice(&((head + body.len()) as u32).to_be_bytes());
+            table.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            body.extend_from_slice(data);
+        }
+        let mut out = b"DNFW".to_vec();
+        out.extend_from_slice(&((head + body.len()) as u32).to_be_bytes());
+        out.extend_from_slice(&(chunks.len() as u32).to_be_bytes());
+        out.extend(table);
+        out.extend(body);
+        out
+    }
+
+    #[test]
+    fn only_code_chunk_images_are_executable() {
+        let mut code = Vec::new();
+        for word in [0x4670_c000u32, 0x100, 0x40, 0] {
+            code.extend_from_slice(&word.to_be_bytes());
+        }
+        code.extend(vec![0x4e; 0x100]);
+        let mut main = vec![0u8; 0x1000]; // stands in for the stock MAIN bytes
+        main.extend(area(&[(b"BOOT", vec![1; 24]), (b"CODE", code)]));
+        assert_eq!(dnfw_code_ranges(&main), vec![(0x4670_c000, 0x4670_c100)]);
+        assert!(dnfw_code_ranges(&vec![0u8; 0x1000]).is_empty());
+    }
+}
+
+/// "0x4670c000-0x4670ef48, 0x46720000-0x46721000" -> `[lo, hi)` pairs. Each
+/// range is `LO-HI` or `LO:HI` (hex with `0x`, or decimal), separated by
+/// commas, semicolons or whitespace; empty text declares none.
+pub fn parse_exec_ranges(text: &str) -> Result<Vec<(u32, u32)>, String> {
+    let number = |word: &str| -> Result<u32, String> {
+        let word = word.trim();
+        let parsed = match word.strip_prefix("0x").or_else(|| word.strip_prefix("0X")) {
+            Some(hex) => u32::from_str_radix(&hex.replace('_', ""), 16),
+            None => word.replace('_', "").parse::<u32>(),
+        };
+        parsed.map_err(|_| format!("{word:?} is not an address"))
+    };
+    text.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let (lo, hi) = item
+                .split_once('-')
+                .or_else(|| item.split_once(':'))
+                .ok_or(format!("{item:?} is not LO-HI"))?;
+            let (lo, hi) = (number(lo)?, number(hi)?);
+            if lo >= hi {
+                return Err(format!("{item:?} is empty or reversed"));
+            }
+            Ok((lo, hi))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod exec_range_tests {
+    use super::parse_exec_ranges;
+
+    #[test]
+    fn reads_the_text_form() {
+        assert_eq!(
+            parse_exec_ranges("0x4670c000-0x4670ef48, 0x46720000:0x46721000;16-32").unwrap(),
+            vec![(0x4670_c000, 0x4670_ef48), (0x4672_0000, 0x4672_1000), (16, 32)]
+        );
+        assert_eq!(parse_exec_ranges("  ").unwrap(), vec![]);
+        assert!(parse_exec_ranges("0x10-0x10").is_err());
+        assert!(parse_exec_ranges("0x20-0x10").is_err());
+        assert!(parse_exec_ranges("0x4670c000").is_err());
+        assert!(parse_exec_ranges("0xzz-0x10").is_err());
     }
 }
