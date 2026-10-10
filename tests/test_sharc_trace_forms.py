@@ -19,7 +19,11 @@ from importlib import import_module
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools"))
 T = import_module("sharc_trace")
 Instruction = import_module("sharc_disasm").Instruction
-from test_sharc_trace import loader_memory  # noqa: E402  (shared fixture)
+decode_isa48 = import_module("sharc_disasm").decode_isa48
+decode_confident = import_module("sharc_disasm").decode_confident
+L = import_module("sharcldr")
+normal_word_to_byte = import_module("sharc_core.addressing").normal_word_to_byte
+from test_sharc_trace import loader_block, loader_memory  # noqa: E402  (shared fixture)
 
 
 def insn(name, fields, length=4, kind="confident"):
@@ -962,6 +966,217 @@ class Type19aScaledCircularFixTest(unittest.TestCase):
         [result] = T._execute(state, insn("19a_scaled", fields, length=4))
         self.assertIsNone(result.stopped)
         self.assertIsInstance(result.uregs[T.UREG_CODES["I0"]], T.Unknown)
+
+
+class Type19aScaledAddressSpaceTest(unittest.TestCase):
+    """Enhanced immediate MODIFY scales by the source's address space (PRM
+    p.6-9, Table 6-2): (nw)/(sw) immediates are scaled by 4/2 in byte space
+    and not at all when I already holds a normal-word address (ADSP-2156x
+    datasheet Rev. D Tables 2-3, sharc_core.addressing). It used to scale
+    (nw) by 4 whenever assume_nw32 was set."""
+
+    def modify(self, index, delta, w=1, assume_nw32=True, extra=None):
+        fields = {
+            "g": 0,
+            "is": 7,
+            "idis": 0,
+            "data[31:16]": (delta >> 16) & 0xFFFF,
+            "data[15:0]": delta & 0xFFFF,
+            "w": w,
+        }
+        state = T.State(
+            0x10,
+            {
+                T.UREG_CODES["I7"]: T.Const(index),
+                T.UREG_CODES["L7"]: T.Const(0),
+                **(extra or {}),
+            },
+            assume_nw32=assume_nw32,
+        )
+        [result] = T._execute(state, insn("19a_scaled", fields, length=6))
+        self.assertIsNone(result.stopped)
+        return result.uregs[T.UREG_CODES["I7"]]
+
+    def test_normal_word_pointer_steps_in_words(self):
+        for delta, expected in ((-4, 0x903FA), (4, 0x90402), (-16, 0x903EE)):
+            with self.subTest(delta=delta):
+                self.assertEqual(self.modify(0x903FE, delta), T.Const(expected))
+
+    def test_byte_space_pointer_scales_nw_by_four(self):
+        for delta, expected in ((-4, 0x23FF0), (4, 0x24010)):
+            with self.subTest(delta=delta):
+                self.assertEqual(self.modify(0x24000, delta), T.Const(expected))
+
+    def test_byte_space_pointer_scales_sw_by_two(self):
+        for delta, expected in ((-3, 0x23FFA), (3, 0x24006)):
+            with self.subTest(delta=delta):
+                self.assertEqual(self.modify(0x24000, delta, w=0), T.Const(expected))
+
+    def test_without_assume_nw32_the_immediate_is_unscaled(self):
+        for index in (0x903FE, 0x24000):
+            with self.subTest(index=hex(index)):
+                self.assertEqual(
+                    self.modify(index, -4, assume_nw32=False), T.Const(index - 4)
+                )
+
+    def test_symbolic_pointer_keeps_the_byte_space_scale(self):
+        fields = {"g": 0, "is": 7, "idis": 0, "data[31:16]": 0xFFFF}
+        fields.update({"data[15:0]": 0xFFFC, "w": 1})
+        state = T.State(
+            0x10,
+            {T.UREG_CODES["I7"]: T.symbol("sp"), T.UREG_CODES["L7"]: T.Const(0)},
+            assume_nw32=True,
+        )
+        [result] = T._execute(state, insn("19a_scaled", fields, length=6))
+        self.assertEqual(result.trace[-1]["offset"], -16)
+
+    def test_normal_word_circular_buffer_wraps_in_words(self):
+        # B7 = 0x90000, L7 = 4 words: I7 and L7 share the word unit.
+        circ = {
+            T.UREG_CODES["B7"]: T.Const(0x90000),
+            T.UREG_CODES["L7"]: T.Const(4),
+        }
+        for index, delta, expected in (
+            (0x90002, 3, 0x90001),
+            (0x90000, -1, 0x90003),
+            (0x90001, 2, 0x90003),
+            (0x90001, -4, 0x90001),
+        ):
+            with self.subTest(index=hex(index), delta=delta):
+                self.assertEqual(
+                    self.modify(index, delta, extra=circ), T.Const(expected)
+                )
+        # |delta| > L is out of the single-correction model.
+        self.assertIsInstance(self.modify(0x90001, 5, extra=circ), T.Unknown)
+
+    def test_compiled_c_prologue_encodings(self):
+        # Words emitted for C functions on an ADSP-2156x normal-word stack
+        # (LemonAid smoke fixture v0.4); the Type19a_scaled decode and
+        # execution are generic. (raw, I register, before, after)
+        for raw, reg, before, after in (
+            (0x1587FFFFFFFC, "I7", 0x903FE, 0x903FA),  # modify(i7,-4) (nw)
+            (0x1587FFFFFFF0, "I7", 0x903FE, 0x903EE),  # modify(i7,-16) (nw)
+            (0x1587FFFFFFB0, "I7", 0x903FE, 0x903AE),  # modify(i7,-80) (nw)
+            (0x158400000005, "I4", 0x90080, 0x90085),  # i4=modify(i4,5) (nw)
+        ):
+            with self.subTest(raw=hex(raw)):
+                decoded = decode_isa48(raw.to_bytes(6, "little"))
+                self.assertEqual(decoded.type_name, "19a_scaled")
+                state = T.State(
+                    0x1C0131,
+                    {
+                        T.UREG_CODES[reg]: T.Const(before),
+                        T.UREG_CODES["L" + reg[1:]]: T.Const(0),
+                    },
+                    assume_nw32=True,
+                )
+                [result] = T._execute(state, decoded)
+                self.assertIsNone(result.stopped)
+                self.assertEqual(result.uregs[T.UREG_CODES[reg]], T.Const(after))
+                self.assertEqual(result.pc_sw, 0x1C0134)
+
+
+class RframeAddressSpaceTest(unittest.TestCase):
+    """Type25c RFRAME (I7 = I6, I6 = DM(0, I6)) reads its unqualified 32-bit
+    word with normal-word context, as other unqualified loads do: a
+    normal-word I6 reads the byte alias (ADSP-2156x datasheet Rev. D Tables
+    2-3, sharc_core.addressing), a byte-space I6 is read as is. Each fixture
+    also stores a different word at the address the old read used
+    (SW_ALIAS_BASE + I6), so a wrong address cannot pass by accident."""
+
+    NW_FRAME = 0x90400  # normal-word block 0 -> byte 0x28241000
+    SAVED_I6 = 0x90500
+    RETURN_SW = 0x1C0200
+
+    @staticmethod
+    def word(address, value):
+        return loader_block(0, address, 4, payload=value.to_bytes(4, "little"))
+
+    @staticmethod
+    def rframe():
+        decoded = decode_confident(bytes.fromhex("0119"), 0)  # raw 0x1901
+        assert decoded.type_name == "25c_rframe"
+        return decoded
+
+    def nw_memory(self):
+        frame_byte = normal_word_to_byte(self.NW_FRAME)
+        self.assertEqual(frame_byte, 0x28241000)
+        return loader_memory(
+            self.word(frame_byte, self.SAVED_I6),
+            # DM(I6 - 1): the return linkage the epilogue loads into I12.
+            self.word(frame_byte - 4, self.RETURN_SW - 1),
+            self.word(L.SW_ALIAS_BASE + self.NW_FRAME, 0xDEAD0001),
+        )
+
+    def test_normal_word_frame_reads_the_byte_alias(self):
+        state = T.State(
+            0x10,
+            {
+                T.UREG_CODES["I6"]: T.Const(self.NW_FRAME),
+                T.UREG_CODES["I7"]: T.Const(0x903EE),
+            },
+            concrete=self.nw_memory(),
+            assume_nw32=True,
+        )
+        [result] = T._execute(state, self.rframe())
+        self.assertIsNone(result.stopped)
+        self.assertEqual(result.uregs[T.UREG_CODES["I7"]], T.Const(self.NW_FRAME))
+        self.assertEqual(result.uregs[T.UREG_CODES["I6"]], T.Const(self.SAVED_I6))
+        self.assertEqual(result.trace[-1]["action"], "rframe")
+        self.assertEqual(result.trace[-1]["restored_i6"], self.SAVED_I6)
+
+    def test_byte_space_frame_is_read_unchanged(self):
+        frame = 0x24400
+        self.assertIsNone(normal_word_to_byte(frame))
+        for address in (frame, L.SW_ALIAS_BASE + frame):
+            with self.subTest(stored_at=hex(address)):
+                state = T.State(
+                    0x10,
+                    {
+                        T.UREG_CODES["I6"]: T.Const(frame),
+                        T.UREG_CODES["I7"]: T.Const(frame - 0x40),
+                    },
+                    concrete=loader_memory(
+                        self.word(address, 0x24800),
+                        self.word(L.SW_ALIAS_BASE + frame * 4, 0xDEAD0002),
+                    ),
+                    assume_nw32=True,
+                )
+                [result] = T._execute(state, self.rframe())
+                self.assertEqual(result.uregs[T.UREG_CODES["I7"]], T.Const(frame))
+                self.assertEqual(result.uregs[T.UREG_CODES["I6"]], T.Const(0x24800))
+
+    def test_compiled_epilogue_restores_frame_and_returns_to_caller(self):
+        # i12=dm(m7,i6); jump (m14,i12) (db); nop; rframe -- the compiler's
+        # return idiom with RFRAME in the second delay slot.
+        state = T.State(
+            0x1C0300,
+            {
+                T.UREG_CODES["I6"]: T.Const(self.NW_FRAME),
+                T.UREG_CODES["I7"]: T.Const(0x903EE),
+                T.UREG_CODES["M7"]: T.Const(0xFFFFFFFF),
+                T.UREG_CODES["M14"]: T.Const(1),
+            },
+            concrete=self.nw_memory(),
+            assume_nw32=True,
+            call_stack=[self.RETURN_SW],
+        )
+        for raw, form in (
+            ("fe4d3f0e", "3b"),  # i12=dm(m7,i6), raw 0x4dfe0e3f
+            ("3f083f34", "9b_abs"),  # jump (m14,i12) (db), raw 0x083f343f
+        ):
+            decoded = decode_confident(bytes.fromhex(raw), 0)
+            self.assertEqual(decoded.type_name, form)
+            [state] = T._execute(state, decoded)
+            self.assertIsNone(state.stopped)
+        self.assertEqual(state.uregs[T.UREG_CODES["I12"]], T.Const(self.RETURN_SW - 1))
+        [state] = T._execute(state, insn("21c", {}, 2))
+        [state] = T._execute(state, self.rframe())
+        self.assertIsNone(state.stopped)
+        self.assertEqual(state.pc_sw, self.RETURN_SW)
+        self.assertEqual(state.call_stack, [])
+        self.assertEqual(state.uregs[T.UREG_CODES["I7"]], T.Const(self.NW_FRAME))
+        self.assertEqual(state.uregs[T.UREG_CODES["I6"]], T.Const(self.SAVED_I6))
 
 
 class Type7aCircularModifyTest(unittest.TestCase):
