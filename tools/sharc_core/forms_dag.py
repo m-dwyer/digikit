@@ -393,10 +393,15 @@ def _type_19a(
     if name == "19a_scaled":
         scaled_width = "normal-word" if _field(f, "w") else "short-word"
         # The opt-in normal-word model represents the loaded program's
-        # internal pointers in byte space. Enhanced MODIFY therefore
-        # scales NW/SW immediates by four/two bytes respectively.
+        # internal pointers in byte space. Enhanced MODIFY scales NW/SW
+        # immediates by four/two bytes there, and not at all when the
+        # source already holds a normal-word address (PRM p.6-9/Table
+        # 6-2; _modify_scale, as Type7a's (nw)/(sw) MODIFY): a C stack
+        # pointer I7 = 0x903fe with modify(i7,-4) (nw) gives 0x903fa.
+        # The circular length below takes the same scale, so a
+        # normal-word buffer wraps in words.
         if state.assume_nw32:
-            scale = 4 if _field(f, "w") else 2
+            scale = _modify_scale(scaled_width, state.assume_nw32, v)
             delta *= scale
 
     result = _add(v, Const(delta), "I%d + %d" % (src, delta))

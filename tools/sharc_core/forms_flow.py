@@ -342,11 +342,13 @@ def _type_25c_rframe(
     """25c_rframe: I7 = I6, I6 = DM(0, I6) (SHARC+ PRM pp.17-17/17-18, Type 25c
     RFRAME; no context restriction). The
     firmware uses it in the delay slot of a return and of a tail-call jump;
-    the operation is the same in both."""
+    the operation is the same in both. DM(0, I6) is an unqualified 32-bit
+    load, so it takes the normal-word context of _load_normal_ureg: a
+    normal-word I6 reads its byte alias, a byte-space I6 is read as is."""
     frame = _ureg(state.uregs, UREG_CODES["I6"])
     state.uregs[UREG_CODES["I7"]] = frame
     if isinstance(frame, Const):
-        restored = _dm_read(state, frame.value, 4)
+        restored = _dm_read(state, frame.value, 4, normal_word=True)
         if restored is None:
             state.uregs[UREG_CODES["I6"]] = Unknown(
                 "RFRAME load from unavailable memory"

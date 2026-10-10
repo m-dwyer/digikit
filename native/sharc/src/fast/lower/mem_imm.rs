@@ -137,20 +137,27 @@ impl Lower {
     }
 
     /// 19a / 19a_scaled: `Ia = MODIFY(Ib, imm32)`, scaled by the access
-    /// size for 19a_scaled.
+    /// size for 19a_scaled. An (nw) modify scales by 4 only in byte space,
+    /// so Ib must not hold a mapped normal-word address (`Req::NwPlain`),
+    /// as for the core's `_modify_scale`.
     pub fn form_19a(&mut self, d: &Dec) -> LR<()> {
         let bank = if d.field("g") == Some(1) { 8 } else { 0 };
         let src_low = d.field("is").ok_or(Refuse("19a is".into()))? as u32;
         let dst_low = src_low ^ d.field("idis").ok_or(Refuse("19a idis".into()))? as u32;
         let (src, dst) = (src_low + bank, dst_low + bank);
         let mut delta = d.wide("data").ok_or(Refuse("19a data".into()))? as i32 as i64;
+        let iv = self.rd_i(16 + src)?;
         if d.form == "19a_scaled" {
             if !self.env.assume_nw32 {
                 return refuse("assume_nw32 off");
             }
-            delta *= if d.field("w") == Some(1) { 4 } else { 2 };
+            if d.field("w") == Some(1) {
+                self.require_plain(iv, 1)?;
+                delta *= 4;
+            } else {
+                delta *= 2;
+            }
         }
-        let iv = self.rd_i(16 + src)?;
         let k = self.ci(delta as u32);
         let new = self.bin(Bin::Add, iv, k);
         self.require_linear(16 + src)?;
